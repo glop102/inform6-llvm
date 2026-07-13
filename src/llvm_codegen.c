@@ -399,13 +399,14 @@ static void lift_condbranch(const assembly_instruction *ai,
 
 static void lift_instruction(const assembly_instruction *ai)
 {
-    int flags = glulx_opcode_flags(ai->internal_number);
-    int opno = glulx_opcode_operand_count(ai->internal_number);
+    int flags, opno;
 
     if (ai->internal_number == -1) {
         bail("custom @\"...\" opcode");
         return;
     }
+    flags = glulx_opcode_flags(ai->internal_number);
+    opno = glulx_opcode_operand_count(ai->internal_number);
     if (ai->operand_count != opno) {
         bail("operand count mismatch (source error)");
         return;

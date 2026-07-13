@@ -978,6 +978,13 @@ typedef struct llvm_event_s
     int exec_state;         /* execution_never_reaches_here at capture time  */
     int seq_point;          /* sequence_point_follows at capture time        */
     assembly_instruction ai;
+    /* Snapshot of the custom @"..." opcode (ai.internal_number == -1).
+       The assembler keeps only the most recently parsed custom opcode in
+       a static, so it must be restored before this event is replayed. */
+    int32 custom_code;
+    int custom_flags;
+    int custom_op_rules;
+    int custom_no;
 } llvm_event;
 
 /* Glulx opcode flag bits, as reported by glulx_opcode_flags(). These match

@@ -1079,6 +1079,14 @@ static void llvm_capture_instruction(const assembly_instruction *AI)
     /* Glulx instructions never use the text field, and token_text is a
        transient buffer; don't keep the pointer around. */
     ev->ai.text = NULL;
+    /* Custom @"..." opcodes live only in the custom_opcode_g static, which
+       a later custom opcode overwrites; snapshot it for replay. */
+    if (AI->internal_number == -1) {
+        ev->custom_code = opco.code;
+        ev->custom_flags = opco.flags;
+        ev->custom_op_rules = opco.op_rules;
+        ev->custom_no = opco.no;
+    }
 
     sequence_point_follows = FALSE;
     execution_never_reaches_here =
@@ -1126,6 +1134,13 @@ static void llvm_replay_routine(void)
             labels[ev->label].symbol = sym;
         }
         else {
+            if (ev->ai.internal_number == -1) {
+                custom_opcode_g.name = (uchar *) "@custom";
+                custom_opcode_g.code = ev->custom_code;
+                custom_opcode_g.flags = ev->custom_flags;
+                custom_opcode_g.op_rules = ev->custom_op_rules;
+                custom_opcode_g.no = ev->custom_no;
+            }
             sequence_point_follows = ev->seq_point;
             assembleg_instruction(&ev->ai);
         }
