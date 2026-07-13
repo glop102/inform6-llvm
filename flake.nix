@@ -6,75 +6,35 @@
     flake-utils.url = "github:numtide/flake-utils";
     # Headless Glulx interpreter for transcript-comparison tests (M3+):
     # glulxe (the reference interpreter) linked against CheapGlk (stdio Glk).
-    cheapglk-src = {
+    cheapglk = {
       url = "github:erkyrath/cheapglk";
       flake = false;
     };
-    glulxe-src = {
+    glulxe = {
       url = "github:erkyrath/glulxe";
       flake = false;
     };
     # Inform 6 standard library, for tests that compile full library games.
-    inform6lib-src = {
+    inform6lib = {
       url = "gitlab:DavidGriffith/inform6lib";
       flake = false;
     };
   };
 
-  outputs = { self, nixpkgs, flake-utils, cheapglk-src, glulxe-src, inform6lib-src }:
+  outputs = inputs@{ self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
-      let
-        pkgs = nixpkgs.legacyPackages.${system};
-        llvmPackages = pkgs.llvmPackages_21;
-
-        cheapglk = pkgs.stdenv.mkDerivation {
-          pname = "cheapglk";
-          version = cheapglk-src.shortRev or "unstable";
-          src = cheapglk-src;
-          dontConfigure = true;
-          installPhase = ''
-            runHook preInstall
-            install -Dm644 libcheapglk.a "$out/lib/libcheapglk.a"
-            mkdir -p "$out/include"
-            cp *.h "$out/include/"
-            runHook postInstall
-          '';
-        };
-
-        glulxe = pkgs.stdenv.mkDerivation {
-          pname = "glulxe-cheapglk";
-          version = glulxe-src.shortRev or "unstable";
-          src = glulxe-src;
-          dontConfigure = true;
-          buildPhase = ''
-            runHook preBuild
-            $CC -O2 -DOS_UNIX -I${cheapglk}/include \
-              main.c files.c vm.c exec.c float.c funcs.c gestalt.c heap.c \
-              operand.c osdepend.c profile.c search.c serial.c string.c \
-              glkop.c accel.c unixstrt.c unixautosave.c \
-              -L${cheapglk}/lib -lcheapglk -lm \
-              -o glulxe
-            runHook postBuild
-          '';
-          installPhase = ''
-            runHook preInstall
-            install -Dm755 glulxe "$out/bin/glulxe"
-            runHook postInstall
-          '';
-        };
-      in
-      {
+      (pkgs: {
         packages = {
-          inherit cheapglk glulxe;
+          inherit (pkgs) cheapglk glulxe;
         };
 
         devShells.default = pkgs.mkShell {
           packages = [
             # LLVM libraries, headers, and llvm-config
-            llvmPackages.llvm.dev
-            llvmPackages.llvm
-            llvmPackages.clang
-            llvmPackages.lldb
+            pkgs.llvmPackages_21.llvm.dev
+            pkgs.llvmPackages_21.llvm
+            pkgs.llvmPackages_21.clang
+            pkgs.llvmPackages_21.lldb
 
             # Build tools
             pkgs.gnumake
@@ -86,15 +46,16 @@
             pkgs.valgrind
 
             # Glulx interpreter for running compiled story files in tests
-            glulxe
+            pkgs.glulxe
           ];
 
           shellHook = ''
             export PS1="(dev) $PS1"
             # Inform 6 standard library for the test scripts (+include_path)
-            export INFORM6_LIB=${inform6lib-src}
+            export INFORM6_LIB=${inputs.inform6lib}
             echo "inform6-llvm devshell: $(llvm-config --version) at $(llvm-config --prefix)"
+            echo "inform6lib: ${inputs.inform6lib}"
           '';
         };
-      });
+      }) (nixpkgs.legacyPackages.${system}.extend (import ./overlay.nix inputs)));
 }

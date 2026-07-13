@@ -1,6 +1,6 @@
 {
   "nodes": {
-    "cheapglk-src": {
+    "cheapglk": {
       "flake": false,
       "locked": {
         "lastModified": 1749143350,
@@ -34,7 +34,7 @@
         "type": "github"
       }
     },
-    "glulxe-src": {
+    "glulxe": {
       "flake": false,
       "locked": {
         "lastModified": 1778019147,
@@ -50,7 +50,7 @@
         "type": "github"
       }
     },
-    "inform6lib-src": {
+    "inform6lib": {
       "flake": false,
       "locked": {
         "lastModified": 1766782116,
@@ -84,10 +84,10 @@
     },
     "root": {
       "inputs": {
-        "cheapglk-src": "cheapglk-src",
+        "cheapglk": "cheapglk",
         "flake-utils": "flake-utils",
-        "glulxe-src": "glulxe-src",
-        "inform6lib-src": "inform6lib-src",
+        "glulxe": "glulxe",
+        "inform6lib": "inform6lib",
         "nixpkgs": "nixpkgs"
       }
     },
