@@ -18,6 +18,14 @@ nix develop
 make
 ```
 
+LLVM is optional: the Makefile detects it via `llvm-config` and, when it
+isn't found (or with `make WITH_LLVM=0`), builds `src/llvm_stub.c` in
+place of the pipeline. A stub build compiles everything classically —
+output is byte-identical to `$LLVM=0` — and prints a note when
+optimization is requested. The Visual Studio project
+(`visual_studio/inform6.vcxproj`, built by the Windows CI workflow)
+always uses the stub.
+
 ## Usage
 
 Same as upstream Inform 6. The LLVM pipeline is controlled by the `$LLVM`
