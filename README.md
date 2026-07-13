@@ -70,6 +70,20 @@ byte-identical to classic output. `run-m3.sh` compiles each test both
 ways, runs both story files under glulxe (provided by the devshell), and
 requires identical transcripts.
 
+Two compliance tests exercise the API surface beyond ordinary game code:
+
+- `veneer.inf` calls every veneer routine the Glulx compiler can emit
+  (property/class machinery, strict-mode checks, print rules, class
+  messages, `glk()`, dynamic strings, actions) with layout-independent
+  output, compared transcript-for-transcript.
+- `glulxercise.inf` is Andrew Plotkin's Glulx interpreter unit test
+  (public domain, from <https://eblong.com/zarf/glulx/>), driven by
+  `glulxercise.walk`. It is self-checking, so instead of a transcript
+  diff the classic build must pass every check and the LLVM build may
+  fail only the known layout-sensitive ones (`@catch` tokens are stack
+  addresses; `jumpabs` into another routine's body) — see the comment
+  in `run-m3.sh`.
+
 `cloak.inf` (a full library game) needs the Inform 6 standard library at
 `tests/lib`:
 

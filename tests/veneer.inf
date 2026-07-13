@@ -1,0 +1,194 @@
+! Veneer compliance test: exercises every veneer routine the Glulx
+! compiler can emit, without the library. Output must be deterministic
+! and layout-independent (no raw addresses), so the classic and LLVM
+! builds can be compared transcript-for-transcript.
+!
+! Veneer routines covered (see src/veneer.c):
+!   DefArt InDefArt CDefArt CInDefArt PrintShortName EnglishNumber
+!     - print (the)/(a)/(The)/(A)/(name)/(object)/(number)
+!   Print__PName Print__Addr    - print (property), print (address)
+!   RV__Pr WV__Pr CA__Pr        - property read / write / message call
+!   IA__Pr IB__Pr DA__Pr DB__Pr - property ++ / --
+!   RA__Pr RL__Pr RA__Sc        - .& , .# , superclass ::
+!   OP__Pr OC__Cl Meta__class Z__Region - provides, ofclass, metaclass
+!   Cl__Ms Copy__Primitive      - class messages create/destroy/copy/remaining
+!   OB__Move OB__Remove RT__TrPS - move / remove
+!   RT__ChT RT__ChR RT__ChG RT__ChGt - strict tree / call / attribute checks
+!   RT__ChPS RT__ChPR RT__ChLDW RT__ChLDB RT__ChSTW RT__ChSTB - strict access
+!   RT__ChPrintC/A/O/S          - strict print rules on variables
+!   RT__Err Unsigned__Compare   - a deliberate out-of-range array read
+!   Box__Routine                - box statement
+!   Dynam__String               - string n "..." + "@00" escapes
+!   Glk__Wrap                   - glk() builtin, style, font
+!   R_Process                   - <Action> statements
+
+Attribute shiny;
+
+Property common_weight 7;    ! common property, with default
+Property common_size;        ! common property, left unset (default 0)
+
+Array table --> 8;
+Array bytes -> 16;
+
+Global gfn;
+Global gobj;
+Global gstr;
+Global gval;
+
+Class Animal(4)
+  with legs 4,
+       common_weight 50,
+       describe [; print "a generic animal"; ],
+       noise [; print "..."; ];
+
+Class Bird
+  class Animal
+  with legs 2,
+       noise [; print "tweet"; ];
+
+Animal pig "pig"
+  with common_weight 90,
+       describe [; print "a fat pig"; ];
+
+Bird magpie "magpie";
+
+Object crate "crate";
+Object coin "coin" crate;
+
+[ WaveSub; print "You wave. Action was processed.^"; ];
+
+[ Twice x; return 2*x; ];
+
+[ TestPrintRules;
+    print "-- print rules --^";
+    ! the library-less article veneers print the raw object value, which
+    ! in Glulx is an address (layout-dependent) -- so pass nothing (0)
+    print (the) nothing, " / ", (The) nothing, " / ",
+          (a) nothing, " / ", (A) nothing, "^";
+    print (name) magpie, " / ", (object) magpie, "^";
+    print (number) 0, "; ", (number) 21, "; ", (number) 5, "; ", (number) 100, "^";
+    print (property) legs, " / ", (property) common_weight, "^";
+    print (address) 'magpie', "^";
+    print (string) "plain string", "^";
+    print (char) 'x', "^";
+];
+
+[ TestPrintChecked;
+    ! the same print rules with variable arguments, so strict mode routes
+    ! them through the RT__ChPrint* veneer checks
+    print "-- checked print rules --^";
+    gobj = pig;   print (object) gobj, " / ", (name) gobj, "^";
+    gstr = "string in a global"; print (string) gstr, "^";
+    gval = 'plugh'; print (address) gval, "^";
+    gval = 'q';     print (char) gval, "^";
+];
+
+[ TestProperties x a;
+    print "-- properties --^";
+    x = pig.common_weight;    print "read common: ", x, "^";
+    pig.common_weight = 61;   print "write common: ", pig.common_weight, "^";
+    x = magpie.common_weight; print "inherited common: ", x, "^";
+    x = crate.common_weight;  print "default common: ", x, "^";
+    x = crate.common_size;    print "unset common: ", x, "^";
+    x = magpie.legs;          print "read individual: ", x, "^";
+    magpie.legs = 3;          print "write individual: ", magpie.legs, "^";
+    pig.common_weight++;      print "post-inc: ", pig.common_weight, "^";
+    ++pig.common_weight;      print "pre-inc: ", pig.common_weight, "^";
+    pig.common_weight--;      print "post-dec: ", pig.common_weight, "^";
+    --pig.common_weight;      print "pre-dec: ", pig.common_weight, "^";
+    magpie.legs++; ++magpie.legs; magpie.legs--; --magpie.legs;
+    print "individual inc/dec: ", magpie.legs, "^";
+    x = pig.#common_weight;   print "common length: ", x, "^";
+    x = magpie.#legs;         print "individual length: ", x, "^";
+    a = pig.&common_weight;   print "common addr contents: ", a-->0, "^";
+    a = magpie.&legs;         print "individual addr contents: ", a-->0, "^";
+    x = magpie.Animal::legs;  print "superclass legs: ", x, "^";
+    print "message call: "; pig.describe(); print " / "; magpie.noise();
+    new_line;
+];
+
+[ TestClasses x;
+    print "-- classes --^";
+    if (magpie ofclass Bird)    print "magpie is Bird^";
+    if (magpie ofclass Animal)  print "magpie is Animal^";
+    if (crate ofclass Animal)   print "BUG: crate is Animal^";
+    if (pig provides describe)  print "pig provides describe^";
+    if (crate provides describe) print "BUG: crate provides describe^";
+    if (metaclass(pig) == Object)      print "metaclass Object^";
+    if (metaclass(Animal) == Class)    print "metaclass Class^";
+    if (metaclass(Twice) == Routine)   print "metaclass Routine^";
+    if (metaclass("hi") == String)     print "metaclass String^";
+    if (metaclass(42) == nothing)      print "metaclass nothing^";
+    x = Animal.remaining();  print "remaining: ", x, "^";
+    gobj = Animal.create();  print "created: ", (name) gobj, "^";
+    gobj.common_weight = 33;
+    Animal.copy(gobj, pig);
+    print "copied weight: ", gobj.common_weight, "^";
+    Animal.destroy(gobj);
+    x = Animal.remaining();  print "remaining after destroy: ", x, "^";
+];
+
+[ TestTree;
+    print "-- object tree --^";
+    print "parent: ", (name) parent(coin), "^";
+    print "child: ", (name) child(crate), "^";
+    print "children: ", children(crate), "^";
+    move coin to pig;
+    print "after move, parent: ", (name) parent(coin), "^";
+    if (coin in pig) print "coin in pig^";
+    remove coin;
+    if (coin notin pig) print "coin removed^";
+    move coin to crate;
+    give coin shiny;
+    if (coin has shiny) print "coin is shiny^";
+    give coin ~shiny;
+    if (coin hasnt shiny) print "coin is dull^";
+];
+
+[ TestArrays x;
+    print "-- arrays (strict checks) --^";
+    table-->3 = 7;   x = table-->3;  print "word array: ", x, "^";
+    bytes->2 = 9;    x = bytes->2;   print "byte array: ", x, "^";
+    ! deliberately out of range (via a variable, so the compiler can't
+    ! catch it statically): strict mode reports and carries on
+    gval = 20;
+    x = table-->gval;
+    print "still running after range error^";
+];
+
+[ TestIndirect x;
+    print "-- indirect calls --^";
+    gfn = Twice;
+    x = gfn(5);              print "variable call: ", x, "^";
+    x = indirect(gfn, 7);    print "indirect(): ", x, "^";
+    x = gfn.call(9);         print ".call: ", x, "^";
+];
+
+[ TestMisc x;
+    print "-- misc veneer --^";
+    string 0 "dynamo";
+    print "dynamic string: @00.^";
+    x = glk($00A0, 'A');     ! glk_char_to_lower
+    print "glk builtin: ", (char) x, "^";
+    style bold; print "bold"; style roman;
+    print " / ";
+    font off; print "fixed"; font on;
+    new_line;
+    box "Time is an illusion." "Lunchtime doubly so.";
+    <Wave>;
+];
+
+[ Main win;
+    @setiosys 2 0;
+    win = glk($0023, 0, 0, 0, 3, 0);   ! glk_window_open(0,0,0,textbuffer,0)
+    glk($002F, win);                   ! glk_set_window
+    TestPrintRules();
+    TestPrintChecked();
+    TestProperties();
+    TestClasses();
+    TestTree();
+    TestArrays();
+    TestIndirect();
+    TestMisc();
+    print "veneer test done.^";
+];

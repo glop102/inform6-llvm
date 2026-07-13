@@ -172,5 +172,18 @@ module-at-a-time comes later.
   running both builds under glulxe/cheapglk from the devshell.)
 - `tests/` holds `.inf` sources; larger corpus TBD (Inform library + example
   games) once the round-trip lands.
+- Compliance tests: `tests/veneer.inf` (every veneer routine the Glulx
+  compiler can emit, layout-independent output) and `tests/glulxercise.inf`
+  (Plotkin's Glulx unit test; self-checking, gated on its own pass/fail
+  output since some checks print heap addresses/memory sizes). Known
+  benign glulxercise failures under optimization: `@catch` token checks
+  (tokens are stack addresses; optimized frames are larger) and the
+  `jumpabs` test (jumps to `routine+5`, executing another routine's body
+  in its own frame — unsound under any per-routine optimization).
+- Custom `@"..."` opcodes (opcode-by-number inline assembly, used heavily
+  by glulxercise) live in a single static in `asm.c` that each parse
+  overwrites; the capture buffer snapshots the opcode's fields per event
+  and restores them at replay (found by glulxercise, which otherwise
+  miscompiled under `$LLVM>=1`).
 - Debugging aid: `I6_LLVM_LIMIT=<n>` lowers only the first n lifted
   routines, for bisecting a misbehaving routine in a big game.

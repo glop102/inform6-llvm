@@ -27,8 +27,10 @@ check() {
     fi
 }
 
-check hello   -G
-check torture -G
+check hello       -G
+check torture     -G
+check veneer      -G
+check glulxercise -G
 if [ -d lib ]; then
     # +language_name: the compiler's default is "English", but the library
     # ships the file as lowercase english.h (matters on case-sensitive FS).
