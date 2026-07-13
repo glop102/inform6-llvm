@@ -5,9 +5,9 @@ Instead of encoding bytecode directly as it parses, routines are lifted to
 LLVM IR, run through LLVM's optimization passes, and lowered back to Glulx
 bytecode. See [DESIGN.md](DESIGN.md) for the architecture and milestones.
 
-Based on the upstream [Inform 6 compiler](https://github.com/DavidKinder/Inform6)
-(a convenience clone lives in `./inform6/`; the working sources are copied
-to `./src/`).
+A fork of the upstream
+[Inform 6 compiler](https://github.com/DavidKinder/Inform6), with the
+sources moved under `./src/` and the LLVM modules added alongside them.
 
 ## Building
 
@@ -102,3 +102,19 @@ git clone --depth 1 https://gitlab.com/DavidGriffith/inform6lib.git tests/lib
 (The test script passes `+language_name=english` because the compiler's
 default language include is capitalized "English", while the library ships
 `english.h` — which matters on a case-sensitive filesystem.)
+
+## TODO
+
+- Rework the test corpus around
+  [erkyrath/inform6-testing](https://github.com/erkyrath/inform6-testing)
+  (the upstream compiler's regression suite): compile its tests both ways
+  and gate on behavior, replacing the bespoke `cloak.inf` + `tests/lib`
+  setup. The small local tests (`hello`, `torture`, `m3`, `veneer`,
+  `glulxercise`) stay as quick gates.
+- Provide the Inform 6 library through the devshell (a flake input the
+  test scripts reference, e.g. via an env var passed to `+include_path`)
+  instead of cloning an ad-hoc copy into `tests/lib`.
+- M4 coverage work and M5 validation at scale — see [Status](#status)
+  and [DESIGN.md](DESIGN.md).
+- Consider lifting custom `@"..."` opcodes as opaque operations instead
+  of bailing the whole routine (low priority; rare outside test suites).
