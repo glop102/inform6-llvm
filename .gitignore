@@ -1,1 +1,6 @@
 inform6
+tests/lib/
+build/
+inform6-llvm
+tests/*.ulx
+tests/*.z5
