@@ -51,7 +51,8 @@ See [DESIGN.md](DESIGN.md) for the full milestone definitions.
 ## Tests
 
 ```
-cd tests && ./run-m1.sh
+make test         # build and run the test suite (Glulx only)
+make clean-tests  # remove test artifacts (.ulx, logs, IR dumps)
 ```
 
 `cloak.inf` (a full library game) needs the Inform 6 standard library at

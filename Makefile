@@ -27,7 +27,13 @@ $(BUILDDIR)/llvm_codegen.o: $(SRCDIR)/llvm_codegen.c $(SRCDIR)/header.h | $(BUIL
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-clean:
+test: inform6-llvm
+	tests/run-m1.sh
+
+clean-tests:
+	rm -f tests/*.ulx tests/*.z5 tests/*.log tests/inform6-llvm-dump.ll
+
+clean: clean-tests
 	rm -rf $(BUILDDIR) inform6-llvm
 
-.PHONY: all clean
+.PHONY: all test clean clean-tests
