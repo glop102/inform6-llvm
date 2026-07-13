@@ -50,6 +50,22 @@
         "type": "github"
       }
     },
+    "inform6lib-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1766782116,
+        "narHash": "sha256-l+YwtKcOlthK1BPH6DgsDhkcPSiFvawSlA26WA3RxsE=",
+        "owner": "DavidGriffith",
+        "repo": "inform6lib",
+        "rev": "4f68343268c3ae96a429b7b334ccd80ba759239e",
+        "type": "gitlab"
+      },
+      "original": {
+        "owner": "DavidGriffith",
+        "repo": "inform6lib",
+        "type": "gitlab"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1783776592,
@@ -71,6 +87,7 @@
         "cheapglk-src": "cheapglk-src",
         "flake-utils": "flake-utils",
         "glulxe-src": "glulxe-src",
+        "inform6lib-src": "inform6lib-src",
         "nixpkgs": "nixpkgs"
       }
     },

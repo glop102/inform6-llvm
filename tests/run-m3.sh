@@ -86,10 +86,13 @@ check m3      /dev/null -G
 check zregion /dev/null -G
 check veneer  /dev/null -G
 check_glulxercise
-if [ -d lib ]; then
-    check cloak cloak.walk -G +include_path=lib +language_name=english
+# Library via the devshell (INFORM6_LIB) with tests/lib as fallback; see
+# the note in run-m1.sh.
+LIBDIR=${INFORM6_LIB:-lib}
+if [ -d "$LIBDIR" ]; then
+    check cloak cloak.walk -G +include_path="$LIBDIR" +language_name=english
 else
-    echo "skip  cloak (tests/lib not present)"
+    echo "skip  cloak (no library: enter the devshell or clone tests/lib)"
 fi
 
 exit $fail

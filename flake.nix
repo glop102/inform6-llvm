@@ -14,9 +14,14 @@
       url = "github:erkyrath/glulxe";
       flake = false;
     };
+    # Inform 6 standard library, for tests that compile full library games.
+    inform6lib-src = {
+      url = "gitlab:DavidGriffith/inform6lib";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, cheapglk-src, glulxe-src }:
+  outputs = { self, nixpkgs, flake-utils, cheapglk-src, glulxe-src, inform6lib-src }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
@@ -86,6 +91,8 @@
 
           shellHook = ''
             export PS1="(dev) $PS1"
+            # Inform 6 standard library for the test scripts (+include_path)
+            export INFORM6_LIB=${inform6lib-src}
             echo "inform6-llvm devshell: $(llvm-config --version) at $(llvm-config --prefix)"
           '';
         };

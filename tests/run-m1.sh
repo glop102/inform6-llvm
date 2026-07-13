@@ -31,12 +31,15 @@ check hello       -G
 check torture     -G
 check veneer      -G
 check glulxercise -G
-if [ -d lib ]; then
+# The library comes from the devshell (INFORM6_LIB, a flake input), with
+# a local tests/lib clone as fallback outside the shell.
+LIBDIR=${INFORM6_LIB:-lib}
+if [ -d "$LIBDIR" ]; then
     # +language_name: the compiler's default is "English", but the library
     # ships the file as lowercase english.h (matters on case-sensitive FS).
-    check cloak -G +include_path=lib +language_name=english
+    check cloak -G +include_path="$LIBDIR" +language_name=english
 else
-    echo "skip  cloak (tests/lib not present)"
+    echo "skip  cloak (no library: enter the devshell or clone tests/lib)"
 fi
 
 exit $fail

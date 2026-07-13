@@ -92,14 +92,16 @@ Two compliance tests exercise the API surface beyond ordinary game code:
   addresses; `jumpabs` into another routine's body) — see the comment
   in `run-m3.sh`.
 
-`cloak.inf` (a full library game) needs the Inform 6 standard library at
-`tests/lib`:
+`cloak.inf` (a full library game) needs the Inform 6 standard library.
+Inside the devshell it is provided automatically (the `inform6lib-src`
+flake input, exported as `INFORM6_LIB`); outside, the scripts fall back
+to a clone at `tests/lib`:
 
 ```
 git clone --depth 1 https://gitlab.com/DavidGriffith/inform6lib.git tests/lib
 ```
 
-(The test script passes `+language_name=english` because the compiler's
+(The test scripts pass `+language_name=english` because the compiler's
 default language include is capitalized "English", while the library ships
 `english.h` — which matters on a case-sensitive filesystem.)
 
@@ -111,9 +113,6 @@ default language include is capitalized "English", while the library ships
   and gate on behavior, replacing the bespoke `cloak.inf` + `tests/lib`
   setup. The small local tests (`hello`, `torture`, `m3`, `veneer`,
   `glulxercise`) stay as quick gates.
-- Provide the Inform 6 library through the devshell (a flake input the
-  test scripts reference, e.g. via an env var passed to `+include_path`)
-  instead of cloning an ad-hoc copy into `tests/lib`.
 - M4 coverage work and M5 validation at scale — see [Status](#status)
   and [DESIGN.md](DESIGN.md).
 - Consider lifting custom `@"..."` opcodes as opaque operations instead
