@@ -1,0 +1,25 @@
+! Minimal reproducer for the Z__Region lowering bug (veneer routine).
+
+Object lamp "lamp";
+
+[ F x; return x + 1; ];
+
+[ Main win dummy;
+    @setiosys 2 0;
+    @copy 0 sp;
+    @copy 3 sp;
+    @copy 0 sp;
+    @copy 0 sp;
+    @copy 0 sp;
+    @glk $0023 5 win;
+    @copy win sp;
+    @glk $002F 1 dummy;
+
+    ! print names, not raw class addresses (layout differs between builds)
+    print "obj: ", (name) metaclass(lamp), "^";
+    print "str: ", (name) metaclass("hello"), "^";
+    print "rtn: ", (name) metaclass(F), "^";
+    print "small: ", metaclass(5), "^";
+    print "zero: ", metaclass(0), "^";
+    print "done.^";
+];

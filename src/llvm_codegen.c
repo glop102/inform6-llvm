@@ -24,15 +24,20 @@
 /*   classic encoder instead. The compiler is never wrong, only sometimes    */
 /*   unoptimized.                                                            */
 /*                                                                           */
-/*   Milestone M2: lift + verify + optional dump ($LLVM=2). The lowering     */
-/*   path does not exist yet, so llvm_pipeline_routine() always returns      */
-/*   FALSE and every routine is still emitted by the classic encoder.        */
+/*   Milestone M3: lifted routines are run through LLVM's optimization       */
+/*   passes and lowered back to Glulx by llvm_lower.c, which rewrites the    */
+/*   capture buffer with the optimized instruction stream. Whichever         */
+/*   stream the buffer ends up holding, asm.c replays it through the         */
+/*   classic encoder, so llvm_pipeline_routine() always returns FALSE.       */
 /* ------------------------------------------------------------------------- */
 
 #include "header.h"
+#include "llvm_codegen.h"
 
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
+#include <llvm-c/Error.h>
+#include <llvm-c/Transforms/PassBuilder.h>
 
 /* ------------------------------------------------------------------------- */
 /*   Lift state                                                              */
@@ -45,6 +50,13 @@ static FILE *dump_file;             /* $LLVM=2 dump stream, opened lazily    */
 
 static int no_routines_lifted;      /* statistics                            */
 static int no_routines_bailed;
+static int no_routines_lowered;
+static int no_routines_unlowered;
+
+/* The optimization pipeline (new pass manager syntax). Deliberately no
+   inlining or IPO: one IR function per routine. */
+#define LLVM_PASS_PIPELINE \
+    "function(mem2reg,instcombine,simplifycfg,reassociate,gvn,dce,simplifycfg)"
 
 /* Per-routine state. */
 static LLVMModuleRef  mod;
@@ -90,14 +102,38 @@ static LLVMValueRef declare_fn(const char *name, LLVMTypeRef ret,
 
 /* The symbolic-constant function: an operand whose value will be fixed up
    by the backpatcher (a routine address, string address, etc.) must survive
-   optimization as an opaque token, not fold as an integer. */
+   optimization as an opaque token, not fold as an integer.
+
+   It behaves like a pure function of its arguments — no memory effects, no
+   unwinding, always returns — and is marked as such so that identical
+   symbolic constants can merge, dead ones can vanish, and the calls never
+   act as optimization barriers. The *values* still can't fold, which is
+   the point. */
+static void mark_fn_as_constant(LLVMValueRef f)
+{
+    static const char *names[] = { "nounwind", "willreturn", "speculatable" };
+    unsigned i, kind;
+    kind = LLVMGetEnumAttributeKindForName("memory", 6);
+    LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(llctx, kind, 0));   /* memory(none) */
+    for (i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        kind = LLVMGetEnumAttributeKindForName(names[i], strlen(names[i]));
+        LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
+            LLVMCreateEnumAttribute(llctx, kind, 0));
+    }
+}
+
 static LLVMValueRef symbolic_constant(int marker, int32 value, int symindex)
 {
     LLVMTypeRef params[3];
     LLVMTypeRef ft;
     LLVMValueRef f, args[3];
+    int is_new;
     params[0] = i32t; params[1] = i32t; params[2] = i32t;
+    is_new = (LLVMGetNamedFunction(mod, "i6.sym") == NULL);
     f = declare_fn("i6.sym", i32t, params, 3, &ft);
+    if (is_new)
+        mark_fn_as_constant(f);
     args[0] = LLVMConstInt(i32t, (unsigned)marker, 0);
     args[1] = LLVMConstInt(i32t, (uint32_t)value, 0);
     args[2] = LLVMConstInt(i32t, (uint32_t)symindex, 0);
@@ -317,6 +353,21 @@ static void lift_opaque(const assembly_instruction *ai, int flags,
     }
 }
 
+/* If the operand is an unmarked integer constant, put its value in *v. */
+static int operand_constant_value(const assembly_operand *op, int32 *v)
+{
+    if (op->marker) return FALSE;
+    switch (op->type) {
+    case ZEROCONSTANT_OT:
+        *v = 0; return TRUE;
+    case CONSTANT_OT:
+    case HALFCONSTANT_OT:
+    case BYTECONSTANT_OT:
+        *v = op->value; return TRUE;
+    }
+    return FALSE;
+}
+
 /* Binary arithmetic/logic ops: L1 L2 S1. */
 static void lift_binop(const assembly_instruction *ai, LLVMOpcode opc)
 {
@@ -369,17 +420,55 @@ static void lift_instruction(const assembly_instruction *ai)
     case add_gc:    lift_binop(ai, LLVMAdd);  return;
     case sub_gc:    lift_binop(ai, LLVMSub);  return;
     case mul_gc:    lift_binop(ai, LLVMMul);  return;
-    /* TODO(M3): Glulx division by zero is a VM fault, LLVM's is UB; guard
-       or fall back before the optimizer is allowed to exploit this. Same
-       for shift counts >= 32 (Glulx defines them; LLVM doesn't). */
-    case div_gc:    lift_binop(ai, LLVMSDiv); return;
-    case mod_gc:    lift_binop(ai, LLVMSRem); return;
     case bitand_gc: lift_binop(ai, LLVMAnd);  return;
     case bitor_gc:  lift_binop(ai, LLVMOr);   return;
     case bitxor_gc: lift_binop(ai, LLVMXor);  return;
-    case shiftl_gc: lift_binop(ai, LLVMShl);  return;
-    case sshiftr_gc: lift_binop(ai, LLVMAShr); return;
-    case ushiftr_gc: lift_binop(ai, LLVMLShr); return;
+
+    /* Division: Glulx division by zero is a VM fault (an observable side
+       effect), and INT_MIN/-1 overflows; both are UB for LLVM's sdiv/srem.
+       Lift only divisions whose safety is visible in the divisor; the
+       rest become opaque calls, which pins the fault's ordering. */
+    case div_gc:
+    case mod_gc:
+        {   int32 dv;
+            if (operand_constant_value(&ai->operand[1], &dv)
+                && dv != 0 && dv != -1)
+                lift_binop(ai, ai->internal_number == div_gc
+                    ? LLVMSDiv : LLVMSRem);
+            else
+                lift_opaque(ai, flags, NULL, 0);
+        }
+        return;
+
+    /* Shifts: Glulx defines counts >= 32 (result 0, or all sign bits for
+       sshiftr, with negative counts read as unsigned); LLVM shifts give
+       poison. Lift constant counts, folding oversized ones to their
+       defined Glulx results; variable counts become opaque calls. */
+    case shiftl_gc:
+    case sshiftr_gc:
+    case ushiftr_gc:
+        {   int32 cnt;
+            if (!operand_constant_value(&ai->operand[1], &cnt)) {
+                lift_opaque(ai, flags, NULL, 0);
+                return;
+            }
+            if ((uint32_t)cnt < 32) {
+                lift_binop(ai, ai->internal_number == shiftl_gc ? LLVMShl
+                    : ai->internal_number == sshiftr_gc ? LLVMAShr
+                    : LLVMLShr);
+                return;
+            }
+            {   LLVMValueRef a = load_operand(&ai->operand[0]);
+                LLVMValueRef r;
+                if (lift_failed) return;
+                if (ai->internal_number == sshiftr_gc)
+                    r = LLVMBuildAShr(bld, a, LLVMConstInt(i32t, 31, 0), "");
+                else
+                    r = LLVMConstInt(i32t, 0, 0);
+                store_operand(&ai->operand[2], r);
+            }
+        }
+        return;
 
     case neg_gc:
         {   LLVMValueRef a = load_operand(&ai->operand[0]);
@@ -398,6 +487,14 @@ static void lift_instruction(const assembly_instruction *ai)
             if (lift_failed) return;
             store_operand(&ai->operand[1], a);
         }
+        return;
+    case copys_gc:
+    case copyb_gc:
+        /* Byte/short copies read and write memory-mode (and RAM-mode)
+           operands at their own width; the word-based deref abstraction
+           would misread them (e.g. the "inversion" statement's header
+           bytes). Rare enough to just fall back. */
+        bail("byte/short copy opcode");
         return;
     case sexs_gc:
     case sexb_gc:
@@ -618,13 +715,36 @@ static LLVMModuleRef lift_routine(void)
 /*   Entry points (called from asm.c)                                        */
 /* ------------------------------------------------------------------------- */
 
-/* Process the captured routine. Returns TRUE if this pipeline emitted the
-   routine's code (in which case asm.c must not replay the buffer), FALSE
-   to fall back to the classic encoder. */
+/* $LLVM=3: dump the routine's IR, tagged with the pipeline phase. */
+static void dump_module(LLVMModuleRef m, const char *phase)
+{
+    char *ir;
+    if (LLVM_CODEGEN < 3)
+        return;
+    if (!dump_file)
+        dump_file = fopen("inform6-llvm-dump.ll", "w");
+    if (!dump_file)
+        return;
+    ir = LLVMPrintModuleToString(m);
+    fprintf(dump_file, "; ===== %s (%s)\n%s\n",
+        llvm_current_routine_name(), phase, ir);
+    LLVMDisposeMessage(ir);
+}
+
+/* Process the captured routine. Lift it to IR, optimize, and lower it
+   back into the capture buffer; if any stage can't cope, the buffer is
+   left holding the original instruction stream. Always returns FALSE:
+   asm.c replays whichever stream the buffer holds through the classic
+   encoder (so labels, branch shortening and backpatch markers are handled
+   by the existing machinery either way). */
 extern int llvm_pipeline_routine(void)
 {
     LLVMModuleRef m;
     char *errmsg = NULL;
+
+    /* Level 1: capture and replay only — prove the seam, change nothing. */
+    if (LLVM_CODEGEN < 2)
+        return FALSE;
 
     if (!llctx)
         llctx = LLVMContextCreate();
@@ -632,7 +752,7 @@ extern int llvm_pipeline_routine(void)
     m = lift_routine();
     if (!m) {
         no_routines_bailed++;
-        if (LLVM_CODEGEN >= 2)
+        if (LLVM_CODEGEN >= 3)
             printf("! LLVM: bailed on %s: %s\n",
                 llvm_current_routine_name(),
                 bail_reason ? bail_reason : "unknown");
@@ -644,37 +764,79 @@ extern int llvm_pipeline_routine(void)
             llvm_current_routine_name(), errmsg ? errmsg : "");
         LLVMDisposeMessage(errmsg);
         LLVMDisposeModule(m);
+        mod = NULL;
         no_routines_bailed++;
         return FALSE;
     }
     LLVMDisposeMessage(errmsg);
 
     no_routines_lifted++;
+    dump_module(m, "pre-opt");
 
-    if (LLVM_CODEGEN >= 2) {
-        char *ir = LLVMPrintModuleToString(m);
-        if (!dump_file)
-            dump_file = fopen("inform6-llvm-dump.ll", "w");
-        if (dump_file)
-            fprintf(dump_file, "%s\n", ir);
-        LLVMDisposeMessage(ir);
+    {   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+        LLVMErrorRef err = LLVMRunPasses(m, LLVM_PASS_PIPELINE, NULL, opts);
+        LLVMDisposePassBuilderOptions(opts);
+        if (err) {
+            char *msg = LLVMGetErrorMessage(err);
+            printf("! LLVM: pass pipeline failed on %s: %s\n",
+                llvm_current_routine_name(), msg ? msg : "");
+            LLVMDisposeErrorMessage(msg);
+            LLVMDisposeModule(m);
+            mod = NULL;
+            no_routines_unlowered++;
+            return FALSE;
+        }
+    }
+
+    dump_module(m, "post-opt");
+
+    /* Debugging aid: I6_LLVM_LIMIT=<n> lowers only the first n lifted
+       routines (the rest replay classically), for bisecting a bad one. */
+    {   static int limit = -2;
+        if (limit == -2) {
+            const char *s = getenv("I6_LLVM_LIMIT");
+            limit = s ? atoi(s) : -1;
+        }
+        if (limit >= 0 && no_routines_lifted > limit) {
+            LLVMDisposeModule(m);
+            mod = NULL;
+            no_routines_unlowered++;
+            return FALSE;
+        }
+        if (limit >= 0 && no_routines_lifted == limit)
+            fprintf(stderr, "I6_LLVM_LIMIT: last lowered routine is #%d %s\n",
+                no_routines_lifted, llvm_current_routine_name());
+    }
+
+    {   const char *why = NULL;
+        if (llvm_lower_routine(m, fn, &why))
+            no_routines_lowered++;
+        else {
+            no_routines_unlowered++;
+            if (LLVM_CODEGEN >= 3)
+                printf("! LLVM: could not lower %s: %s\n",
+                    llvm_current_routine_name(), why ? why : "unknown");
+        }
     }
 
     LLVMDisposeModule(m);
-
-    /* M2: lowering doesn't exist yet, so the classic encoder still emits
-       every routine. */
+    mod = NULL;
     return FALSE;
 }
 
 extern void llvm_codegen_free(void)
 {
     if (LLVM_CODEGEN && (no_routines_lifted || no_routines_bailed)) {
-        printf("LLVM: lifted %d of %d captured routines\n",
-            no_routines_lifted, no_routines_lifted + no_routines_bailed);
+        printf("LLVM: optimized %d of %d captured routines "
+            "(%d not lifted, %d not lowered)\n",
+            no_routines_lowered,
+            no_routines_lifted + no_routines_bailed,
+            no_routines_bailed, no_routines_unlowered);
     }
     no_routines_lifted = 0;
     no_routines_bailed = 0;
+    no_routines_lowered = 0;
+    no_routines_unlowered = 0;
     if (dump_file) {
         fclose(dump_file);
         dump_file = NULL;

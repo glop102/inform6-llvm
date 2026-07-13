@@ -1,5 +1,21 @@
 {
   "nodes": {
+    "cheapglk-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1749143350,
+        "narHash": "sha256-GQxka6WwJzozIsI3MMhz2Zlc1sRCX7HT3RDPuL6FBaY=",
+        "owner": "erkyrath",
+        "repo": "cheapglk",
+        "rev": "14d8aaf6e4150669762bd4646a5368e75c1eeee6",
+        "type": "github"
+      },
+      "original": {
+        "owner": "erkyrath",
+        "repo": "cheapglk",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -15,6 +31,22 @@
       "original": {
         "owner": "numtide",
         "repo": "flake-utils",
+        "type": "github"
+      }
+    },
+    "glulxe-src": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1778019147,
+        "narHash": "sha256-zoHdHJogmx5au9BCO2Sdr2gzRYccl6J/S3V/SZnE9cw=",
+        "owner": "erkyrath",
+        "repo": "glulxe",
+        "rev": "56ab8743bab565de307bd892c555d8d8897ed517",
+        "type": "github"
+      },
+      "original": {
+        "owner": "erkyrath",
+        "repo": "glulxe",
         "type": "github"
       }
     },
@@ -36,7 +68,9 @@
     },
     "root": {
       "inputs": {
+        "cheapglk-src": "cheapglk-src",
         "flake-utils": "flake-utils",
+        "glulxe-src": "glulxe-src",
         "nixpkgs": "nixpkgs"
       }
     },

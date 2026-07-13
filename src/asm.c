@@ -1136,6 +1136,78 @@ static void llvm_replay_routine(void)
     llvm_event_count = 0;
 }
 
+/* ------------------------------------------------------------------------- */
+/*   Support for the LLVM lowering path (llvm_lower.c).                       */
+/*                                                                            */
+/*   When a routine is successfully optimized, the lowerer discards the       */
+/*   captured events and refills the buffer with the lowered instruction      */
+/*   stream; asm.c then replays that buffer exactly as it would the           */
+/*   original.                                                                */
+/* ------------------------------------------------------------------------- */
+
+extern void llvm_buffer_reset(void)
+{   llvm_event_count = 0;
+    execution_never_reaches_here = EXECSTATE_REACHABLE;
+    sequence_point_follows = FALSE;
+}
+
+extern void llvm_buffer_append_instruction(const assembly_instruction *AI2)
+{   llvm_capture_instruction(AI2);
+}
+
+extern void llvm_buffer_append_label(int n)
+{   llvm_capture_label(n);
+}
+
+/* Reverse lookup for the opaque-call naming scheme (@i6.<opcode name>). */
+extern int32 glulx_opcode_by_name(const char *name)
+{   int32 i;
+    int32 count = (int32)(sizeof(opcodes_table_g)/sizeof(opcodeg));
+    for (i = 0; i < count; i++)
+        if (strcmp((const char *)opcodes_table_g[i].name, name) == 0)
+            return i;
+    return -1;
+}
+
+/* The Glulx routine header (type byte, locals-format list, and the
+   stack-arg count copy for C0 functions) is emitted into the holding area
+   before the routine body is captured. If lowering needs more local slots
+   than the source declared, the header must be rewritten; these record
+   where it is so llvm_patch_routine_locals() can rewind and re-emit it. */
+static int32 llvm_header_ha_start;  /* zcode_ha_size at the type byte        */
+static int32 llvm_header_ha_end;    /* zcode_ha_size when capture began      */
+static int   llvm_header_stackargs; /* 0xC0 function with _vararg_count      */
+
+extern int llvm_patch_routine_locals(int newcount)
+{   int i;
+
+    /* If anything else landed in the holding area since the header (it
+       never should), rewriting would corrupt it; the caller falls back. */
+    if (zcode_ha_size != llvm_header_ha_end)
+        return FALSE;
+
+    zmachine_pc -= (zcode_ha_size - llvm_header_ha_start);
+    zcode_ha_size = llvm_header_ha_start;
+
+    byteout(llvm_header_stackargs ? 0xC0 : 0xC1, 0);
+    i = newcount;
+    while (i) {
+        int j = i;
+        if (j > 255)
+            j = 255;
+        byteout(4, 0);
+        byteout(j, 0);
+        i -= j;
+    }
+    byteout(0, 0);
+    byteout(0, 0);
+    if (llvm_header_stackargs) {
+        /* @copy sp _vararg_count; */
+        byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0);
+    }
+    return TRUE;
+}
+
 
 /* ========================================================================= */
 /*   The assembler itself does four things:                                  */
@@ -2064,6 +2136,9 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
     else {
         rv = zmachine_pc;
 
+        llvm_header_ha_start = zcode_ha_size;
+        llvm_header_stackargs = stackargs;
+
         if (stackargs)
             byteout(0xC0, 0); /* Glulx type byte for function */
         else
@@ -2183,6 +2258,7 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         && !routine_asterisked && !define_INFIX_switch) {
         llvm_capturing = TRUE;
         llvm_event_count = 0;
+        llvm_header_ha_end = zcode_ha_size;
     }
 
     return rv;

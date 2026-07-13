@@ -1,0 +1,130 @@
+! M3 round-trip test: computational results printed through a bare Glk
+! window. Compiled classic vs LLVM and run under glulxe; the transcripts
+! must be identical.
+
+Constant Story "M3";
+
+Global counter = 0;
+Global mask = $ff00;
+Array numbers --> 12;
+
+[ Square x; return x*x; ];
+
+[ Fib n;
+    if (n < 2) return n;
+    return Fib(n-1) + Fib(n-2);
+];
+
+[ Collatz n steps;
+    while (n ~= 1) {
+        if (n % 2 == 0) n = n / 2;
+        else            n = 3*n + 1;
+        steps++;
+        if (steps > 1000) break;
+    }
+    return steps;
+];
+
+[ Classify x;
+    switch (x) {
+        1: return 100;
+        2, 3: return 200;
+        4 to 9: return 300;
+        default: return 400;
+    }
+];
+
+[ Xor a b; @bitxor a b a; return a; ];
+
+[ Arith a b r;
+    r = a + b * 3 - (a / 2) + (b % 7);
+    r = r + (a & mask) - (b | $0f) + Xor(a, b);
+    return r;
+];
+
+[ Shifty x;
+    ! constant shifts, including boundary cases
+    return (x * 4) + (x / 8) + (x * 65536) / 256;
+];
+
+[ MinMaxAbs a b r;
+    ! idioms instcombine likes to turn into intrinsics
+    if (a > b) r = a; else r = b;   ! smax
+    if (a < 0) a = -a;              ! abs
+    return r + a;
+];
+
+[ CondValue x;
+    ! condition used as a value (select / icmp materialization)
+    return (x > 10) + (x == 42) * 2;
+];
+
+[ Loops i total;
+    for (i = 0: i < 12: i++) numbers-->i = Square(i) - i;
+    for (i = 0: i < 12: i++) total = total + numbers-->i;
+    return total;
+];
+
+[ Labels x;
+    if (x > 3) jump Done;
+    x = x * 2;
+    .Done;
+    return x;
+];
+
+[ Deep a b c d e;
+    return Arith(a, b) + Arith(c, d) - e + Fib(6);
+];
+
+[ Negatives x;
+    return -x + (x * -3) - (32767 * 4);   ! wrapping arithmetic
+];
+
+[ P n; print n, " "; ];
+
+[ Main win dummy i;
+    @setiosys 2 0;
+    ! glk_window_open(0, 0, 0, 3 [textbuffer], 0) -- args pushed in
+    ! reverse so the first argument is popped first
+    @copy 0 sp;      ! rock
+    @copy 3 sp;      ! wintype = textbuffer
+    @copy 0 sp;      ! size
+    @copy 0 sp;      ! method
+    @copy 0 sp;      ! split
+    @glk $0023 5 win;
+    @copy win sp;
+    @glk $002F 1 dummy;  ! glk_set_window
+
+    print "squares: ";
+    for (i = 1: i <= 8: i++) P(Square(i));
+    new_line;
+    print "fib: ";
+    for (i = 1: i <= 12: i++) P(Fib(i));
+    new_line;
+    print "collatz: ";
+    P(Collatz(6)); P(Collatz(27)); P(Collatz(97));
+    new_line;
+    print "classify: ";
+    for (i = 0: i < 12: i++) P(Classify(i));
+    new_line;
+    print "arith: ";
+    P(Arith(100, 3)); P(Arith(-5, 17)); P(Arith(32000, -32000));
+    new_line;
+    print "shifty: ";
+    P(Shifty(1)); P(Shifty(-3)); P(Shifty(12345));
+    new_line;
+    print "minmax: ";
+    P(MinMaxAbs(3, 9)); P(MinMaxAbs(-7, 2)); P(MinMaxAbs(5, 5));
+    new_line;
+    print "condvalue: ";
+    P(CondValue(5)); P(CondValue(42)); P(CondValue(11));
+    new_line;
+    print "loops: ", Loops(), "^";
+    print "labels: ", Labels(2), " ", Labels(9), "^";
+    print "deep: ", Deep(1, 2, 3, 4, 5), "^";
+    print "negatives: ", Negatives(7), " ", Negatives(-9), "^";
+    counter = counter + 3;
+    counter = counter * counter;
+    print "counter: ", counter, "^";
+    print "done.^";
+];

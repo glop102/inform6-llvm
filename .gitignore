@@ -6,3 +6,4 @@ tests/*.ulx
 tests/*.z5
 tests/*.log
 tests/inform6-llvm-dump.ll
+result

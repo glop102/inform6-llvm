@@ -7,7 +7,7 @@ SRCDIR  := src
 BUILDDIR := build
 
 LLVM_CFLAGS := $(shell llvm-config --cflags)
-LLVM_LIBS   := $(shell llvm-config --ldflags --libs core analysis --system-libs)
+LLVM_LIBS   := $(shell llvm-config --ldflags --libs core analysis passes --system-libs)
 
 SRCS := $(wildcard $(SRCDIR)/*.c)
 OBJS := $(patsubst $(SRCDIR)/%.c,$(BUILDDIR)/%.o,$(SRCS))
@@ -20,8 +20,8 @@ inform6-llvm: $(OBJS)
 $(BUILDDIR)/%.o: $(SRCDIR)/%.c $(SRCDIR)/header.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) -c -o $@ $<
 
-# Only the LLVM codegen module needs the LLVM headers.
-$(BUILDDIR)/llvm_codegen.o: $(SRCDIR)/llvm_codegen.c $(SRCDIR)/header.h | $(BUILDDIR)
+# Only the LLVM modules need the LLVM headers.
+$(BUILDDIR)/llvm_%.o: $(SRCDIR)/llvm_%.c $(SRCDIR)/header.h $(SRCDIR)/llvm_codegen.h | $(BUILDDIR)
 	$(CC) $(CFLAGS) $(LLVM_CFLAGS) -c -o $@ $<
 
 $(BUILDDIR):
@@ -29,6 +29,7 @@ $(BUILDDIR):
 
 test: inform6-llvm
 	tests/run-m1.sh
+	tests/run-m3.sh
 
 clean-tests:
 	rm -f tests/*.ulx tests/*.z5 tests/*.log tests/inform6-llvm-dump.ll

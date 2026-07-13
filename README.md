@@ -26,23 +26,33 @@ option (Glulx only) and is **on by default**:
 ```
 ./inform6-llvm -G game.inf game.ulx              # LLVM pipeline (default)
 ./inform6-llvm -G '$LLVM=0' game.inf game.ulx    # classic upstream codegen
-./inform6-llvm -G '$LLVM=2' game.inf game.ulx    # + dump IR to inform6-llvm-dump.ll
+./inform6-llvm -G '$LLVM=1' game.inf game.ulx    # capture/replay only (byte-identical)
+./inform6-llvm -G '$LLVM=3' game.inf game.ulx    # + dump IR to inform6-llvm-dump.ll
 ```
 
-With `$LLVM=0` the compiler behaves exactly like upstream.
+With `$LLVM=0` the compiler behaves exactly like upstream. `$LLVM=1`
+routes every routine through the capture buffer but replays it without
+optimizing (for testing the seam — output stays byte-identical). The
+default, `$LLVM=2`, is the full pipeline; `$LLVM=3` additionally dumps
+each routine's IR before and after optimization and reports routines the
+pipeline could not handle.
 
 ## Status
 
 - **M1 (done):** with `$LLVM=1`, every routine's instruction stream is
   captured and replayed through the classic encoder — output is
   byte-identical to upstream. This proves the interception seam.
-- **M2 (done):** `$LLVM=2` additionally lifts each routine to verified
-  LLVM IR and dumps it to `inform6-llvm-dump.ll` (~67% of a full library
-  game lifts; the rest fall back). Output is still byte-identical.
-- **M3 (next):** run LLVM passes over the IR and lower it back to Glulx —
-  the first genuinely optimized story files.
-- **M4:** lifter coverage — model VM-stack values crossing branches (phi
-  nodes), glk dispatch, memory ops, symbolic-constant hardening.
+- **M2 (done):** each routine is lifted to verified LLVM IR (~67% of a
+  full library game lifts; the rest fall back).
+- **M3 (done):** full round trip. Lifted routines are optimized by LLVM
+  (`mem2reg`, `instcombine`, `simplifycfg`, `reassociate`, `gvn`, `dce`)
+  and lowered back to Glulx bytecode; anything the lowerer can't handle
+  falls back to the classic encoding per routine. On Cloak of Darkness,
+  360 of 548 routines come out optimized and the interpreter transcript
+  is identical to the classic build's.
+- **M4 (next):** coverage — model VM-stack values crossing branches (phi
+  nodes), glk dispatch, memory ops, byte-width accesses, and a smarter
+  slot allocator for lowered routines.
 - **M5:** validation at scale — compile a real corpus both ways, compare
   interpreter transcripts, measure code size and instruction counts.
 
@@ -54,6 +64,11 @@ See [DESIGN.md](DESIGN.md) for the full milestone definitions.
 make test         # build and run the test suite (Glulx only)
 make clean-tests  # remove test artifacts (.ulx, logs, IR dumps)
 ```
+
+`run-m1.sh` checks that `$LLVM=1` (capture/replay) output is
+byte-identical to classic output. `run-m3.sh` compiles each test both
+ways, runs both story files under glulxe (provided by the devshell), and
+requires identical transcripts.
 
 `cloak.inf` (a full library game) needs the Inform 6 standard library at
 `tests/lib`:

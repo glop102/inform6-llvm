@@ -123,7 +123,40 @@ module-at-a-time comes later.
   infglk wrappers, ~130 routines — genuinely unmodelable, permanent
   fallback, no optimization value anyway).
 - **M3** — full round-trip for simple routines (arith, locals, branches,
-  calls), fallback for the rest. Story files must run correctly.
+  calls), fallback for the rest. Story files must run correctly. ✅
+  (`tests/run-m3.sh`; transcript-identical on cloak.inf with 360/548
+  routines optimized.) Implementation notes:
+  - `$LLVM` levels were re-cut: 0 classic, 1 capture/replay only (the M1
+    byte-identity gate), 2 full pipeline (default), 3 = 2 + IR dump.
+  - The lowerer (`src/llvm_lower.c`) runs in two phases: classify/validate
+    (no side effects, clean per-routine bail) then emit. Emission rewrites
+    the capture buffer through `llvm_buffer_*` and asm.c replays it, so
+    branch shortening and backpatching are reused unchanged.
+  - Every live SSA value gets its own fresh local slot (naive but correct);
+    the routine header's locals count is patched after the fact
+    (`llvm_patch_routine_locals`). Phis are lowered with per-edge copies
+    (staged when >1 phi to keep parallel-copy semantics), fused
+    icmp+br pairs become native compare-branches, materialized i1 values
+    live in slots as 0/1, and `smax/smin/umax/umin/abs` intrinsics (which
+    instcombine likes to form) lower to compare+copy sequences.
+  - Semantics guards in the lifter: div/mod only lift with a constant
+    divisor (nonzero, not -1 — Glulx faults/overflows are not LLVM UB to
+    exploit); shifts only with constant counts (counts >= 32 fold to the
+    defined Glulx result); `@copyb`/`@copys` bail because byte/short
+    copies read memory-mode operands at their own width, which the
+    word-based `i6.deref` abstraction would misread.
+  - `i6.sym` is marked `memory(none) nounwind willreturn speculatable`,
+    so identical symbolic constants merge and dead ones vanish without
+    ever folding their values.
+  - Remaining lower-bail causes on cloak.inf (5 routines, all M4 work):
+    "too many local slots" ×3 (WriteAfterEntry, Locale, EmptyTSub — the
+    one-slot-per-SSA-value allocator overflows the 118-slot cap; needs
+    slot reuse/liveness), "unsigned division" ×1 (LanguageNumber —
+    instcombine turns a signed div/mod chain into udiv/urem, which have
+    no Glulx opcode; lower as a divu helper or block the transform), and
+    "narrow select" ×1 (InformLibrary.play — a select on an i8/i16 value
+    from narrowed arithmetic; extend lowering to narrow widths or reject
+    narrowing earlier).
 - **M4** — coverage: stack-balanced expression temporaries, glk dispatch,
   memory ops, symbolic-constant hardening.
 - **M5** — validation: compile a real corpus both ways (e.g. library demos),
@@ -133,7 +166,11 @@ module-at-a-time comes later.
 ## Verification
 
 - M1 gate: `cmp` of story files (classic vs capture-replay) — must be equal.
+  (`tests/run-m1.sh`, using `$LLVM=1`.)
 - M3+ gate: interpreter transcript equality on a test corpus, since
-  optimized code is intentionally different bytes.
+  optimized code is intentionally different bytes. (`tests/run-m3.sh`,
+  running both builds under glulxe/cheapglk from the devshell.)
 - `tests/` holds `.inf` sources; larger corpus TBD (Inform library + example
   games) once the round-trip lands.
+- Debugging aid: `I6_LLVM_LIMIT=<n>` lowers only the first n lifted
+  routines, for bisecting a misbehaving routine in a big game.

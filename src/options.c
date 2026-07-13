@@ -404,15 +404,19 @@ static optiont alloptions[] = {
         "LLVM",
         "\
   LLVM routes routine code generation through LLVM IR so that LLVM's \n\
-  optimization passes can be applied before bytecode is emitted. (Glulx \n\
-  only, where it defaults to 1; set to 0 to compile classically.) \n\
-  Routines which cannot be handled by the LLVM pipeline are compiled \n\
-  classically. Ignored when a debug file is being generated. If set to \n\
-  2, additionally dumps each routine's IR to inform6-llvm-dump.ll and \n\
-  reports routines the lifter could not handle.\n",
+  optimization passes can be applied before bytecode is emitted (Glulx \n\
+  only). Routines which cannot be handled by the LLVM pipeline are \n\
+  compiled classically. Ignored when a debug file is being generated. \n\
+  Levels: 0 compiles classically; 1 captures and replays each routine \n\
+  through the classic encoder without optimizing (byte-identical output, \n\
+  for testing the seam); 2 (the default) runs the full pipeline: lift to \n\
+  IR, optimize, and lower back to Glulx bytecode; 3 is level 2 plus a \n\
+  dump of each routine's IR (before and after optimization) to \n\
+  inform6-llvm-dump.ll and reports of routines the pipeline could not \n\
+  handle.\n",
         OPTUSE_GLULX,
-        { OPTLIM_TOMAX, 2 },
-        DEFAULTVALS(0, 1),
+        { OPTLIM_TOMAX, 3 },
+        DEFAULTVALS(0, 2),
     },
 
     /* obsolete options run past OPT_OPTIONS_COUNT */
