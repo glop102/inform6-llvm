@@ -39,7 +39,14 @@ With `$LLVM=0` the compiler behaves exactly like upstream.
 - **M2 (done):** `$LLVM=2` additionally lifts each routine to verified
   LLVM IR and dumps it to `inform6-llvm-dump.ll` (~67% of a full library
   game lifts; the rest fall back). Output is still byte-identical.
-- **Next (M3):** run LLVM passes over the IR and lower it back to Glulx.
+- **M3 (next):** run LLVM passes over the IR and lower it back to Glulx —
+  the first genuinely optimized story files.
+- **M4:** lifter coverage — model VM-stack values crossing branches (phi
+  nodes), glk dispatch, memory ops, symbolic-constant hardening.
+- **M5:** validation at scale — compile a real corpus both ways, compare
+  interpreter transcripts, measure code size and instruction counts.
+
+See [DESIGN.md](DESIGN.md) for the full milestone definitions.
 
 ## Tests
 
