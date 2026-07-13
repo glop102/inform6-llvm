@@ -4,3 +4,5 @@ build/
 inform6-llvm
 tests/*.ulx
 tests/*.z5
+tests/*.log
+tests/inform6-llvm-dump.ll
