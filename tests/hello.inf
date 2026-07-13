@@ -1,0 +1,6 @@
+! Minimal test program
+[ Square x; return x*x; ];
+[ Main i;
+    for (i=1: i<=5: i++) print (number) Square(i), "^";
+    print "Hello, world!^";
+];

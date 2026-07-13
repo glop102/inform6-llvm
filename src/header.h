@@ -644,7 +644,8 @@ typedef enum optionindex {
     OPT_SERIAL                    = 30,
     OPT_ZCHAR_TABLE               = 31,
     OPT_ZALPHABET                 = 32,
-    OPT_OPTIONS_COUNT             = 33, /* terminator */
+    OPT_LLVM                      = 33,
+    OPT_OPTIONS_COUNT             = 34, /* terminator */
 } optionindex_e;
 
 /* ------------------------------------------------------------------------- */
@@ -968,6 +969,23 @@ typedef struct assembly_instruction_t
     int operand_count;
     assembly_operand operand[8];
 } assembly_instruction;
+
+/* One captured code-generation event for the LLVM pipeline: either an
+   instruction or a label definition. See the capture seam in asm.c. */
+typedef struct llvm_event_s
+{   int is_label;           /* TRUE: label event; FALSE: instruction event   */
+    int label;              /* label number, for label events                */
+    int exec_state;         /* execution_never_reaches_here at capture time  */
+    int seq_point;          /* sequence_point_follows at capture time        */
+    assembly_instruction ai;
+} llvm_event;
+
+/* Glulx opcode flag bits, as reported by glulx_opcode_flags(). These match
+   the internal St/Br/Rf/St2 flags in asm.c. */
+#define OPFLAG_STORE   1    /* last operand is a store */
+#define OPFLAG_BRANCH  2    /* last operand is a branch label */
+#define OPFLAG_RETURNS 4    /* execution never continues past this opcode */
+#define OPFLAG_STORE2  8    /* second-to-last operand is also a store */
 
 typedef struct expression_tree_node_s
 {
@@ -2236,6 +2254,17 @@ extern int   no_sequence_points;
 extern assembly_instruction AI;
 extern int32 *named_routine_symbols;
 
+/* The LLVM capture seam (asm.c) and pipeline (llvm_codegen.c). */
+extern llvm_event *llvm_events;
+extern int   llvm_event_count;
+extern int   llvm_capturing;
+extern const char *glulx_opcode_name(int32 internal_number);
+extern int   glulx_opcode_flags(int32 internal_number);
+extern int   glulx_opcode_operand_count(int32 internal_number);
+extern char *llvm_current_routine_name(void);
+extern int   llvm_pipeline_routine(void);
+extern void  llvm_codegen_free(void);
+
 extern void print_operand(const assembly_operand *o, int annotate);
 extern char *variable_name(int32 i);
 extern void set_constant_otv(assembly_operand *AO, int32 val);
@@ -2690,6 +2719,7 @@ extern int DICT_IMPLICIT_SINGULAR;
 extern int DICT_TRUNCATE_FLAG;
 extern int LONG_DICT_FLAG_BUG;
 extern int TRANSCRIPT_FORMAT;
+extern int LLVM_CODEGEN;
 
 /* These macros define offsets that depend on the value of NUM_ATTR_BYTES.
    (Meaningful only for Glulx.) */

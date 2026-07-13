@@ -400,7 +400,21 @@ static optiont alloptions[] = {
         { OPTLIM_STR },
         DEFAULTSTR(NULL),
     },
-    
+    {
+        "LLVM",
+        "\
+  LLVM routes routine code generation through LLVM IR so that LLVM's \n\
+  optimization passes can be applied before bytecode is emitted. (Glulx \n\
+  only, where it defaults to 1; set to 0 to compile classically.) \n\
+  Routines which cannot be handled by the LLVM pipeline are compiled \n\
+  classically. Ignored when a debug file is being generated. If set to \n\
+  2, additionally dumps each routine's IR to inform6-llvm-dump.ll and \n\
+  reports routines the lifter could not handle.\n",
+        OPTUSE_GLULX,
+        { OPTLIM_TOMAX, 2 },
+        DEFAULTVALS(0, 1),
+    },
+
     /* obsolete options run past OPT_OPTIONS_COUNT */
     {
         "BUFFER_LENGTH",
@@ -901,6 +915,7 @@ extern void apply_compiler_options(void)
     DICT_IMPLICIT_SINGULAR = SELECTVAL(OPT_DICT_IMPLICIT_SINGULAR);
     DICT_TRUNCATE_FLAG = SELECTVAL(OPT_DICT_TRUNCATE_FLAG);
     LONG_DICT_FLAG_BUG = SELECTVAL(OPT_LONG_DICT_FLAG_BUG);
+    LLVM_CODEGEN = SELECTVAL(OPT_LLVM);
 
     /* Grammar version: this will be handled later, in verbs_begin_pass(). */
     /* Z-alphabet and Zchar-table: will be handled in chars_begin_pass(). */

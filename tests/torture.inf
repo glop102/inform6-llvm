@@ -1,0 +1,85 @@
+! Torture test: exercises branches, loops, switch, arrays, objects,
+! properties (veneer), strings, recursion, and inline assembly.
+
+Constant Story "TORTURE";
+
+Array numbers --> 10;
+Array buffer -> 64;
+Global counter = 0;
+
+Attribute lit;
+Property weight;
+
+Object lamp "brass lamp"
+  with weight 42,
+       describe [; print "A shiny brass lamp.^"; ],
+  has  lit;
+
+Object box "wooden box"
+  with weight 100;
+
+[ Fib n;
+    if (n < 2) return n;
+    return Fib(n-1) + Fib(n-2);
+];
+
+[ Collatz n steps;
+    while (n ~= 1) {
+        if (n % 2 == 0) n = n / 2;
+        else            n = 3*n + 1;
+        steps++;
+        if (steps > 1000) break;
+    }
+    return steps;
+];
+
+[ Classify x;
+    switch (x) {
+        1: return 100;
+        2, 3: return 200;
+        4 to 9: return 300;
+        default: return 400;
+    }
+];
+
+[ SumArray i total;
+    for (i=0: i<10: i++) numbers-->i = i*i;
+    for (i=0: i<10: i++) total = total + numbers-->i;
+    return total;
+];
+
+[ Weigh o;
+    if (o has lit) print "It glows. ";
+    print "Weight: ", o.weight, "^";
+    return o.weight;
+];
+
+[ Unreachable x;
+    return 5;
+    x = x + 1;   ! deliberately dead code (tests label stripping)
+    return x;
+];
+
+[ Labels x;
+    if (x > 3) jump Done;
+    x = x * 2;
+    .Done;
+    return x;
+];
+
+[ Main i;
+    print "Fib(10)=", Fib(10), "^";
+    print "Collatz(27)=", Collatz(27), "^";
+    for (i=0: i<12: i++) print Classify(i), " ";
+    new_line;
+    print "SumArray=", SumArray(), "^";
+    Weigh(lamp); Weigh(box);
+    lamp.describe();
+    print "Labels(2)=", Labels(2), " Labels(9)=", Labels(9), "^";
+    print "Unreachable()=", Unreachable(), "^";
+    counter = counter + 1;
+    @add counter 10 counter;
+    print "counter=", counter, "^";
+    buffer->0 = 65;
+    print (char) buffer->0, "^";
+];

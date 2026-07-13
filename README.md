@@ -1,52 +1,59 @@
-# Inform 6
+# inform6-llvm
 
-This is Inform 6.44, copyright (c) Graham Nelson 1993 - 2025, a compiler for
-interactive fiction (text adventure games).
+An Inform 6 compiler with an LLVM-based code generator for the Glulx target.
+Instead of encoding bytecode directly as it parses, routines are lifted to
+LLVM IR, run through LLVM's optimization passes, and lowered back to Glulx
+bytecode. See [DESIGN.md](DESIGN.md) for the architecture and milestones.
 
-Release notes, manuals, executables and more are available from
-https://ifarchive.org/indexes/if-archive/infocom/compilers/inform6/.
+Based on the upstream [Inform 6 compiler](https://github.com/DavidKinder/Inform6)
+(a convenience clone lives in `./inform6/`; the working sources are copied
+to `./src/`).
 
-## Introduction
+## Building
 
-Back in the late 1980s, people began investigating the format of Infocom's
-text adventures. Infocom used a standard format that defined a virtual
-machine, which has come to be known as the Z-Machine, to allow them to be
-able to port their games to many different computers. This investigation lead
-to the creation of open source implementations of the Z-Machine, such as the
-InfoTaskForce interpreter, Zip, Frotz, and many others.
+A Nix devshell provides the toolchain (LLVM 21, clang, make):
 
-In 1993, Graham Nelson released the first version of Inform, which compiled a
-somewhat C-like language ("Inform") to the Z-Machine. In the years that
-followed this led to the creation of hundreds of free games by a community
-that had sprung up based around the Usenet group rec.arts.int-fiction.
+```
+nix develop
+make
+```
 
-The latest version of Inform is [Inform 7](http://inform7.com/), but Inform 6
-still lives on, both as the code generator used by Inform 7, and as a language
-and compiler in its own right. Inform 6 is now considered stable and only has
-bugs fixed and minor, non-breaking features added, but development continues.
+## Usage
 
-## Using Inform 6
+Same as upstream Inform 6. The LLVM pipeline is controlled by the `$LLVM`
+option (Glulx only) and is **on by default**:
 
-To use the compiler, you will need an executable. There are
-[pre-built executables](https://ifarchive.org/indexes/if-archive/infocom/compilers/inform6/executables/)
-available, or you can compile the source yourself. All that is required is a
-C compiler and for it to be invoked with something like
+```
+./inform6-llvm -G game.inf game.ulx              # LLVM pipeline (default)
+./inform6-llvm -G '$LLVM=0' game.inf game.ulx    # classic upstream codegen
+./inform6-llvm -G '$LLVM=2' game.inf game.ulx    # + dump IR to inform6-llvm-dump.ll
+```
 
-      cc -O2 -o inform *.c
+With `$LLVM=0` the compiler behaves exactly like upstream.
 
-Suitable defaults for various operating systems can be selected by defining
-the appropriate symbol, a list of which are near the top of the "header.h"
-file (under "Our host machine or OS for today is..."). For example, to compile
-for Windows, use
+## Status
 
-      cc -DPC_WIN32 -O2 -o inform *.c
+- **M1 (done):** with `$LLVM=1`, every routine's instruction stream is
+  captured and replayed through the classic encoder — output is
+  byte-identical to upstream. This proves the interception seam.
+- **M2 (done):** `$LLVM=2` additionally lifts each routine to verified
+  LLVM IR and dumps it to `inform6-llvm-dump.ll` (~67% of a full library
+  game lifts; the rest fall back). Output is still byte-identical.
+- **Next (M3):** run LLVM passes over the IR and lower it back to Glulx.
 
-To write a work of interactive fiction with Inform 6, you will also need a
-version of the Inform 6 library.
-[Stable versions](https://ifarchive.org/indexes/if-archive/infocom/compilers/inform6/library/)
-of the library are available, and development of the library continues in a
-[separate project](https://gitlab.com/DavidGriffith/inform6lib).
+## Tests
 
-More resources and documentation, including the Inform Designer's Manual, are
-available from the [Inform 6 web site](https://www.inform-fiction.org/).
+```
+cd tests && ./run-m1.sh
+```
 
+`cloak.inf` (a full library game) needs the Inform 6 standard library at
+`tests/lib`:
+
+```
+git clone --depth 1 https://gitlab.com/DavidGriffith/inform6lib.git tests/lib
+```
+
+(The test script passes `+language_name=english` because the compiler's
+default language include is capitalized "English", while the library ships
+`english.h` — which matters on a case-sensitive filesystem.)

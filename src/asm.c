@@ -1022,6 +1022,120 @@ static void make_opcode_syntax_g(opcodeg opco)
     sprintf(q+strlen(q), ">");
 }
 
+/* ------------------------------------------------------------------------- */
+/*   LLVM capture seam (Glulx only).                                          */
+/*                                                                            */
+/*   When LLVM_CODEGEN is set, each routine's instruction and label stream    */
+/*   is captured into a buffer instead of being encoded immediately. At       */
+/*   assemble_routine_end() time the buffer is handed to the LLVM pipeline    */
+/*   (lift -> optimize -> lower), or -- if the routine can't be handled, or   */
+/*   the pipeline isn't built in yet -- replayed verbatim through the         */
+/*   classic encoder, producing byte-identical output.                        */
+/*                                                                            */
+/*   The capture stubs must mirror the parse-visible side effects of the      */
+/*   encoder, because statement parsing depends on them:                      */
+/*     - consuming sequence_point_follows,                                    */
+/*     - updating execution_never_reaches_here from the opcode's Rf flag,     */
+/*     - counting forward branches in labeluse[] (read back by                */
+/*       assemble_forward_label_no and the label-strip logic).                */
+/*   At replay time the encoder recomputes all of this; labeluse[] is reset   */
+/*   first so the counts aren't doubled (transfer_routine_g decrements them   */
+/*   as it optimizes branches away, so exact counts matter).                  */
+/* ------------------------------------------------------------------------- */
+
+llvm_event *llvm_events;    /* the captured routine (typedef in header.h)   */
+static memory_list llvm_events_memlist;
+int llvm_event_count;
+
+int llvm_capturing;         /* capturing the current routine's code          */
+static int llvm_replaying;  /* replaying the buffer through the encoder      */
+
+/* Opcode metadata accessors for the LLVM pipeline. The OPFLAG_* bits in
+   header.h are defined to match the St/Br/Rf/St2 flag bits used here. */
+extern const char *glulx_opcode_name(int32 internal_number)
+{   return (const char *) internal_number_to_opcode_g(internal_number).name;
+}
+extern int glulx_opcode_flags(int32 internal_number)
+{   return internal_number_to_opcode_g(internal_number).flags;
+}
+extern int glulx_opcode_operand_count(int32 internal_number)
+{   return internal_number_to_opcode_g(internal_number).no;
+}
+extern char *llvm_current_routine_name(void)
+{   return current_routine_name.data;
+}
+
+static void llvm_capture_instruction(const assembly_instruction *AI)
+{   llvm_event *ev;
+    opcodeg opco = internal_number_to_opcode_g(AI->internal_number);
+
+    ensure_memory_list_available(&llvm_events_memlist, llvm_event_count+1);
+    ev = &llvm_events[llvm_event_count++];
+    ev->is_label = FALSE;
+    ev->label = -1;
+    ev->exec_state = execution_never_reaches_here;
+    ev->seq_point = sequence_point_follows;
+    ev->ai = *AI;
+    /* Glulx instructions never use the text field, and token_text is a
+       transient buffer; don't keep the pointer around. */
+    ev->ai.text = NULL;
+
+    sequence_point_follows = FALSE;
+    execution_never_reaches_here =
+        ((opco.flags & Rf) ? EXECSTATE_UNREACHABLE : EXECSTATE_REACHABLE);
+    if ((opco.flags & Br) && (AI->operand_count == opco.no))
+        mark_label_used(AI->operand[AI->operand_count-1].value);
+}
+
+static void llvm_capture_label(int n)
+{   llvm_event *ev;
+
+    ensure_memory_list_available(&llvm_events_memlist, llvm_event_count+1);
+    ev = &llvm_events[llvm_event_count++];
+    ev->is_label = TRUE;
+    ev->label = n;
+    /* The strip-label check has already run (and declined to strip), so it
+       must not fire again at replay time: clear the ENTIRE bit. The
+       UNREACHABLE bit is kept so that labels[].never_reaches comes out
+       truthy exactly as it would have in a classic compile. */
+    ev->exec_state = execution_never_reaches_here & ~EXECSTATE_ENTIRE;
+    ev->seq_point = FALSE;
+
+    execution_never_reaches_here = EXECSTATE_REACHABLE;
+}
+
+/* Replay the captured routine through the classic encoder, then reset the
+   capture state. */
+static void llvm_replay_routine(void)
+{   int i;
+
+    llvm_replaying = TRUE;
+
+    /* The encoder recounts branch uses as it goes. */
+    labeluse_size = 0;
+
+    for (i=0; i<llvm_event_count; i++) {
+        llvm_event *ev = &llvm_events[i];
+        execution_never_reaches_here = ev->exec_state;
+        if (ev->is_label) {
+            /* assemble_label_no clears the label's symbol association
+               (set by define_symbol_label after the capture stub ran),
+               so preserve it across the call. */
+            int sym = labels[ev->label].symbol;
+            assemble_label_no(ev->label);
+            labels[ev->label].symbol = sym;
+        }
+        else {
+            sequence_point_follows = ev->seq_point;
+            assembleg_instruction(&ev->ai);
+        }
+    }
+
+    llvm_replaying = FALSE;
+    llvm_capturing = FALSE;
+    llvm_event_count = 0;
+}
+
 
 /* ========================================================================= */
 /*   The assembler itself does four things:                                  */
@@ -1465,6 +1579,11 @@ extern void assembleg_instruction(const assembly_instruction *AI)
         return;
     }
 
+    if (llvm_capturing && !llvm_replaying) {
+        llvm_capture_instruction(AI);
+        return;
+    }
+
     offset = zmachine_pc;
 
     no_instructions++;
@@ -1774,6 +1893,11 @@ extern void assemble_label_no(int n)
         return;
     }
 
+    if (llvm_capturing && !llvm_replaying) {
+        llvm_capture_label(n);
+        return;
+    }
+
     if (asm_trace_level > 0)
         printf("%5d  +%05lx    .L%d\n", ErrorReport.line_number,
             ((long int) zmachine_pc), n);
@@ -2051,6 +2175,16 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         }
     }
 
+    /* Begin capturing this routine's code for the LLVM pipeline. Debug
+       builds are excluded: sequence points and the asterisk-trace preamble
+       (which is already encoded above, with live labels) don't survive
+       reordering. */
+    if (LLVM_CODEGEN && glulx_mode && !debugfile_switch
+        && !routine_asterisked && !define_INFIX_switch) {
+        llvm_capturing = TRUE;
+        llvm_event_count = 0;
+    }
+
     return rv;
 }
 
@@ -2080,6 +2214,20 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
         }
     }
     
+    /* If this routine was captured for the LLVM pipeline, emit it now.
+       llvm_pipeline_routine() returns TRUE if it emitted code itself;
+       otherwise fall back to replaying the capture buffer verbatim
+       through the classic encoder.                                          */
+
+    if (llvm_capturing) {
+        if (llvm_pipeline_routine()) {
+            llvm_capturing = FALSE;
+            llvm_event_count = 0;
+        }
+        else
+            llvm_replay_routine();
+    }
+
     /* Dump the contents of the current routine into longer-term Z-code
        storage                                                               */
 
@@ -3936,6 +4084,11 @@ extern void init_asm_vars(void)
     label_moved_error_already_given = FALSE;
 
     zcode_area = NULL;
+
+    llvm_events = NULL;
+    llvm_event_count = 0;
+    llvm_capturing = FALSE;
+    llvm_replaying = FALSE;
 }
 
 extern void asm_begin_pass(void)
@@ -3947,6 +4100,9 @@ extern void asm_begin_pass(void)
     next_sequence_point = 0;
     zcode_ha_size = 0;
     execution_never_reaches_here = EXECSTATE_REACHABLE;
+    llvm_capturing = FALSE;
+    llvm_replaying = FALSE;
+    llvm_event_count = 0;
 }
 
 extern void asm_allocate_arrays(void)
@@ -3986,6 +4142,10 @@ extern void asm_allocate_arrays(void)
     initialise_memory_list(&current_routine_name,
         sizeof(char), 64, NULL,
         "routine name currently being defined");
+
+    initialise_memory_list(&llvm_events_memlist,
+        sizeof(llvm_event), 400, (void**)&llvm_events,
+        "llvm capture events");
 }
 
 extern void asm_free_arrays(void)
@@ -4004,6 +4164,8 @@ extern void asm_free_arrays(void)
     deallocate_memory_list(&named_routine_symbols_memlist);
     deallocate_memory_list(&zcode_area_memlist);
     deallocate_memory_list(&current_routine_name);
+    deallocate_memory_list(&llvm_events_memlist);
+    llvm_codegen_free();
 }
 
 /* ========================================================================= */

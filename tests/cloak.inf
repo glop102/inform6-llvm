@@ -1,0 +1,100 @@
+! Cloak of Darkness — the standard demonstration game (Roger Firth).
+! Serves as a full-library compile test for the LLVM pipeline.
+
+Constant Story "A Cloak of Darkness";
+Constant Headline "^A basic IF demonstration.^";
+
+Include "parser";
+Include "verblib";
+
+Object Foyer "Foyer of the Opera House"
+  with description
+          "You are standing in a spacious hall, splendidly decorated in red
+           and gold, with glittering chandeliers overhead. The entrance from
+           the street is to the north, and there are doorways south and west.",
+       s_to Bar,
+       w_to Cloakroom,
+       n_to "You've only just arrived, and besides, the weather outside
+             seems to be getting worse.",
+  has  light;
+
+Object Cloakroom "Cloakroom"
+  with description
+          "The walls of this small room were clearly once lined with hooks,
+           though now only one remains. The exit is a door to the east.",
+       e_to Foyer,
+  has  light;
+
+Object hook "small brass hook" Cloakroom
+  with name 'small' 'brass' 'hook' 'peg',
+       description [;
+           print "It's just a small brass hook, ";
+           if (cloak in self) "with a cloak hanging on it.";
+           "screwed to the wall.";
+       ],
+  has  scenery supporter;
+
+Object Bar "Foyer Bar"
+  with description
+          "The bar, much rougher than you'd have guessed after the opulence
+           of the foyer to the north, is completely empty. There seems to
+           be some sort of message scrawled in the sawdust on the floor.",
+       n_to Foyer,
+       before [;
+           Go: if (cloak in player && noun == n_obj) return false;
+           default:
+               if (cloak in player && (action ~= ##Go or ##Look)) {
+                   Bar.number = Bar.number + 2;
+                   "In the dark? You could easily disturb something!";
+               }
+       ],
+       number 0,
+  has  ~light;
+
+Object cloak "velvet cloak"
+  with name 'handsome' 'dark' 'black' 'velvet' 'satin' 'cloak',
+       description
+          "A handsome cloak, of velvet trimmed with satin, and slightly
+           spattered with raindrops. Its blackness is so deep that it
+           almost seems to suck light from the room.",
+       before [;
+           Drop, PutOn:
+               if (location == Cloakroom) { give Cloakroom light; }
+               else "This isn't the best place to leave a smart cloak
+                     lying around.";
+       ],
+       after [;
+           Take: give Cloakroom ~light;
+       ],
+  has  clothing;
+
+Object message "scrawled message" Bar
+  with name 'message' 'sawdust' 'floor',
+       description [;
+           if (Bar.number < 2) {
+               deadflag = 2;
+               "The message, neatly marked in the sawdust, reads...";
+           }
+           else {
+               deadflag = 3;
+               "The message has been carelessly trampled, making it
+                difficult to read. You can just distinguish the words...";
+           }
+       ],
+  has  scenery;
+
+[ Initialise;
+    location = Foyer;
+    move cloak to player;
+    give cloak worn;
+    "^^Hurrying through the rainswept November night, you're glad to see
+     the bright lights of the Opera House. It's surprising that there
+     aren't more people about but, hey, what do you expect in a cheap demo
+     game...?^^";
+];
+
+[ DeathMessage;
+    if (deadflag == 3) print "You have lost";
+];
+
+Include "grammar";
