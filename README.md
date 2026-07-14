@@ -58,11 +58,21 @@ pipeline could not handle.
   falls back to the classic encoding per routine. On Cloak of Darkness,
   360 of 548 routines come out optimized and the interpreter transcript
   is identical to the classic build's.
-- **M4 (next):** coverage — model VM-stack values crossing branches (phi
-  nodes), glk dispatch, memory ops, byte-width accesses, and a smarter
-  slot allocator for lowered routines.
-- **M5:** validation at scale — compile a real corpus both ways, compare
-  interpreter transcripts, measure code size and instruction counts.
+- **M4 (done):** lowering quality and coverage. The interpreter's cost
+  model is instructions dispatched, so the lowerer now assigns each SSA
+  value the cheapest representation that is still correct: direct global
+  operands, single-use values riding the VM stack, slot reuse with
+  liveness, phi coalescing, select-arm sinking (un-speculating what
+  instcombine speculated), and branch/return/switch shaping. `make bench`
+  (Game of Life) went from ~30% slower to parity with classic. The lifter
+  also models VM-stack values crossing branches as phis, and every
+  lower-bail cause found so far is fixed: on Cloak of Darkness 412 of 548
+  routines come out optimized (was 360), and everything that lifts now
+  lowers. Most of the rest are the stack-vararg infglk wrappers, which
+  are a permanent (and harmless) fallback. See [DESIGN.md](DESIGN.md).
+- **M5 (next):** validation at scale — compile a real corpus both ways,
+  compare interpreter transcripts, measure code size and instruction
+  counts.
 
 See [DESIGN.md](DESIGN.md) for the full milestone definitions.
 
@@ -70,6 +80,7 @@ See [DESIGN.md](DESIGN.md) for the full milestone definitions.
 
 ```
 make test         # build and run the test suite (Glulx only)
+make bench        # run the Game of Life benchmark (tests/run-life.sh)
 make clean-tests  # remove test artifacts (.ulx, logs, IR dumps)
 ```
 
@@ -91,6 +102,14 @@ Two compliance tests exercise the API surface beyond ordinary game code:
   fail only the known layout-sensitive ones (`@catch` tokens are stack
   addresses; `jumpabs` into another routine's body) — see the comment
   in `run-m3.sh`.
+
+`life.inf` is a Game of Life benchmark: 500 generations on a 64x48
+torus, self-timed via `glk_current_time`. On an interpreter with Glk
+graphics (Gargoyle, WinGlulxe, ...) it draws each cell as a filled
+square in a graphics window; under the headless CheapGlk glulxe it
+falls back to text rendering. `run-life.sh` (also `make bench`)
+compiles it both ways, requires identical simulation output (transcripts
+minus the timing line), and reports each build's run time.
 
 `cloak.inf` (a full library game) needs the Inform 6 standard library.
 Inside the devshell it is provided automatically (the `inform6lib-src`

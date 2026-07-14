@@ -70,6 +70,17 @@ static int            n_locals;
 static LLVMBasicBlockRef *label_blocks; /* indexed by label number           */
 static int            n_label_blocks;
 
+/* Values living on the VM stack where control flow converges (Inform's
+   condition-to-value idioms) become phis at the target label. Each label
+   remembers its entry-stack shape; every edge must arrive with the same
+   depth or the routine bails. */
+#define MAX_ENTRY_STACK 8
+typedef struct label_entry_s {
+    int depth;                              /* -1 until the first edge     */
+    LLVMValueRef phis[MAX_ENTRY_STACK];
+} label_entry;
+static label_entry   *label_entries;        /* parallel to label_blocks    */
+
 static LLVMBasicBlockRef retblock[2];   /* lazily built "ret 0" / "ret 1"    */
 
 static LLVMValueRef   symstack[MAX_SYMBOLIC_STACK];
@@ -268,8 +279,47 @@ static LLVMBasicBlockRef block_for_label(int n)
     return label_blocks[n];
 }
 
+/* Record an edge from the current block to label n, carrying the current
+   symbolic stack: the first edge fixes the label's entry-stack depth and
+   creates its phis; every edge adds its stack values as incomings. */
+static LLVMBasicBlockRef edge_to_label(int n)
+{
+    LLVMBasicBlockRef b = block_for_label(n);
+    LLVMBasicBlockRef pred;
+    label_entry *e;
+    int i;
+
+    if (!b) return NULL;
+    e = &label_entries[n];
+    if (e->depth < 0) {
+        if (symstack_depth > MAX_ENTRY_STACK) {
+            bail("too many values on stack at branch");
+            return NULL;
+        }
+        e->depth = symstack_depth;
+        if (e->depth > 0) {
+            /* The block has no contents yet (it gets them when its label
+               is defined), so the phis land at its start. */
+            LLVMBasicBlockRef saved = LLVMGetInsertBlock(bld);
+            LLVMPositionBuilderAtEnd(bld, b);
+            for (i = 0; i < e->depth; i++)
+                e->phis[i] = LLVMBuildPhi(bld, i32t, "stk");
+            LLVMPositionBuilderAtEnd(bld, saved);
+        }
+    }
+    else if (e->depth != symstack_depth) {
+        bail("stack depth mismatch where control flow joins");
+        return NULL;
+    }
+    pred = LLVMGetInsertBlock(bld);
+    for (i = 0; i < e->depth; i++)
+        LLVMAddIncoming(e->phis[i], &symstack[i], &pred, 1);
+    return b;
+}
+
 /* Target block for a branch operand: a label number, or the special
-   values -3 ("branch means return 0") / -4 ("branch means return 1"). */
+   values -3 ("branch means return 0") / -4 ("branch means return 1").
+   Branching to a return discards the VM stack, so no edge bookkeeping. */
 static LLVMBasicBlockRef block_for_branch_target(int32 target)
 {
     if (target == -3 || target == -4) {
@@ -290,16 +340,7 @@ static LLVMBasicBlockRef block_for_branch_target(int32 target)
         bail("branch no-op target");
         return NULL;
     }
-    return block_for_label((int)target);
-}
-
-/* The symbolic stack must be empty whenever control flow converges;
-   modeling values that cross block boundaries on the VM stack would
-   require phi nodes (possible, but not implemented yet). */
-static void require_empty_symstack(const char *where)
-{
-    if (symstack_depth != 0)
-        bail(where);
+    return edge_to_label((int)target);
 }
 
 static int block_is_terminated(void)
@@ -388,12 +429,12 @@ static void lift_condbranch(const assembly_instruction *ai,
     a = load_operand(&ai->operand[0]);
     b = with_zero ? LLVMConstInt(i32t, 0, 0) : load_operand(&ai->operand[1]);
     if (lift_failed) return;
-    require_empty_symstack("values on stack across conditional branch");
     then_bb = block_for_branch_target(target);
     if (lift_failed) return;
     cond = LLVMBuildICmp(bld, pred, a, b, "");
     else_bb = LLVMAppendBasicBlockInContext(llctx, fn, "next");
     LLVMBuildCondBr(bld, cond, then_bb, else_bb);
+    /* The fallthrough path keeps the same stack values (single pred). */
     LLVMPositionBuilderAtEnd(bld, else_bb);
 }
 
@@ -512,7 +553,6 @@ static void lift_instruction(const assembly_instruction *ai)
     /* -- control flow --------------------------------------------------- */
     case jump_gc:
         {   LLVMBasicBlockRef target;
-            require_empty_symstack("values on stack across jump");
             target = block_for_branch_target(ai->operand[0].value);
             if (lift_failed) return;
             LLVMBuildBr(bld, target);
@@ -534,7 +574,7 @@ static void lift_instruction(const assembly_instruction *ai)
     case return_gc:
         {   LLVMValueRef a = load_operand(&ai->operand[0]);
             if (lift_failed) return;
-            require_empty_symstack("values on stack across return");
+            /* Anything left on the VM stack dies with the call frame. */
             LLVMBuildRet(bld, a);
         }
         return;
@@ -542,7 +582,8 @@ static void lift_instruction(const assembly_instruction *ai)
     /* -- calls with stack-passed arguments ------------------------------ */
     case call_gc:
     case glk_gc:
-        {   /* (addr, count, store): count operands are popped from the
+    case tailcall_gc:
+        {   /* (addr, count[, store]): count operands are popped from the
                stack at runtime; peel them off the symbolic stack and pass
                them explicitly to the opaque call. */
             LLVMValueRef extra[MAX_SYMBOLIC_STACK];
@@ -569,6 +610,9 @@ static void lift_instruction(const assembly_instruction *ai)
             for (i = 0; i < cnt; i++)
                 extra[i] = sympop();
             lift_opaque(ai, flags, extra, cnt);
+            /* @tailcall never returns. */
+            if (!lift_failed && (flags & OPFLAG_RETURNS))
+                LLVMBuildUnreachable(bld);
         }
         return;
 
@@ -594,10 +638,8 @@ static void lift_instruction(const assembly_instruction *ai)
         lift_opaque(ai, flags, NULL, 0);
         /* Opcodes that never return (quit, restart, tailcall...) end the
            basic block. */
-        if (!lift_failed && (flags & OPFLAG_RETURNS)) {
-            require_empty_symstack("values on stack at noreturn opcode");
+        if (!lift_failed && (flags & OPFLAG_RETURNS))
             LLVMBuildUnreachable(bld);
-        }
         return;
     }
 }
@@ -615,6 +657,10 @@ static LLVMModuleRef lift_routine(void)
     sprintf(fname, "%.100s.R%d", llvm_current_routine_name(), no_routines);
 
     mod = LLVMModuleCreateWithNameInContext(fname, llctx);
+    /* Declare i32 the only legal integer width: instcombine then leaves
+       32-bit arithmetic alone instead of narrowing it to i8/i16, which
+       Glulx has no instructions for (the "narrow select" lower-bail). */
+    LLVMSetDataLayout(mod, "e-p:32:32-i32:32-n32");
     bld = LLVMCreateBuilderInContext(llctx);
     i32t = LLVMInt32TypeInContext(llctx);
     lift_failed = FALSE;
@@ -659,17 +705,35 @@ static LLVMModuleRef lift_routine(void)
     n_label_blocks = max_label + 1;
     label_blocks = my_calloc(sizeof(LLVMBasicBlockRef),
         n_label_blocks ? n_label_blocks : 1, "llvm label blocks");
+    label_entries = my_calloc(sizeof(label_entry),
+        n_label_blocks ? n_label_blocks : 1, "llvm label entries");
+    for (i = 0; i < n_label_blocks; i++)
+        label_entries[i].depth = -1;
 
     for (i = 0; i < llvm_event_count && !lift_failed; i++) {
         llvm_event *ev = &llvm_events[i];
         if (ev->is_label) {
             LLVMBasicBlockRef b;
-            require_empty_symstack("values on stack at label");
-            b = block_for_label(ev->label);
-            if (lift_failed) break;
-            if (!block_is_terminated())
-                LLVMBuildBr(bld, b);        /* fall through */
+            label_entry *e;
+            int k;
+            if (!block_is_terminated()) {
+                /* Falling through is an edge like any other. */
+                b = edge_to_label(ev->label);
+                if (lift_failed) break;
+                LLVMBuildBr(bld, b);
+            }
+            else {
+                b = block_for_label(ev->label);
+                if (lift_failed) break;
+            }
+            e = &label_entries[ev->label];
+            if (e->depth < 0)
+                e->depth = 0;   /* no edges yet: only reachable backward */
             LLVMPositionBuilderAtEnd(bld, b);
+            /* The block's entry stack is its phis. */
+            symstack_depth = e->depth;
+            for (k = 0; k < e->depth; k++)
+                symstack[k] = e->phis[k];
         }
         else {
             if (block_is_terminated()) {
@@ -701,6 +765,7 @@ static LLVMModuleRef lift_routine(void)
 
     my_free(&local_slots, "llvm local slots");
     my_free(&label_blocks, "llvm label blocks");
+    my_free(&label_entries, "llvm label entries");
     LLVMDisposeBuilder(bld);
     bld = NULL;
 
@@ -710,6 +775,77 @@ static LLVMModuleRef lift_routine(void)
         return NULL;
     }
     return mod;
+}
+
+/* ------------------------------------------------------------------------- */
+/*   Post-optimization cleanup                                               */
+/*                                                                           */
+/*   simplifycfg/instcombine merge conditional reads of two globals into a   */
+/*   load of a select-of-pointers, which has no Glulx encoding. Rewrite      */
+/*   such loads back into selects of loads (globals are always readable,     */
+/*   so hoisting the loads is safe), leaving IR the lowerer understands.     */
+/* ------------------------------------------------------------------------- */
+
+static int is_global_select_tree(LLVMValueRef p, int depth)
+{
+    if (LLVMIsAGlobalVariable(p)) {
+        size_t len;
+        const char *name = LLVMGetValueName2(p, &len);
+        return name && strncmp(name, "i6.g", 4) == 0;
+    }
+    if (depth >= 4 || !LLVMIsASelectInst(p)) return FALSE;
+    return is_global_select_tree(LLVMGetOperand(p, 1), depth + 1)
+        && is_global_select_tree(LLVMGetOperand(p, 2), depth + 1);
+}
+
+static LLVMValueRef load_of_select_tree(LLVMBuilderRef b, LLVMValueRef p)
+{
+    if (LLVMIsAGlobalVariable(p))
+        return LLVMBuildLoad2(b, i32t, p, "");
+    return LLVMBuildSelect(b, LLVMGetOperand(p, 0),
+        load_of_select_tree(b, LLVMGetOperand(p, 1)),
+        load_of_select_tree(b, LLVMGetOperand(p, 2)), "");
+}
+
+static void unmerge_pointer_selects(LLVMValueRef f)
+{
+    LLVMBuilderRef b = LLVMCreateBuilderInContext(llctx);
+    LLVMBasicBlockRef bb;
+    LLVMValueRef in, next;
+    int changed;
+
+    for (bb = LLVMGetFirstBasicBlock(f); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        for (in = LLVMGetFirstInstruction(bb); in; in = next) {
+            LLVMValueRef ptr, v;
+            next = LLVMGetNextInstruction(in);
+            if (!LLVMIsALoadInst(in)) continue;
+            if (LLVMTypeOf(in) != i32t) continue;
+            ptr = LLVMGetOperand(in, 0);
+            if (LLVMIsAGlobalVariable(ptr)
+                || !is_global_select_tree(ptr, 0)) continue;
+            LLVMPositionBuilderBefore(b, in);
+            v = load_of_select_tree(b, ptr);
+            LLVMReplaceAllUsesWith(in, v);
+            LLVMInstructionEraseFromParent(in);
+        }
+    }
+    /* Sweep the now-dead pointer selects (innermost last). */
+    do {
+        changed = FALSE;
+        for (bb = LLVMGetFirstBasicBlock(f); bb;
+             bb = LLVMGetNextBasicBlock(bb)) {
+            for (in = LLVMGetFirstInstruction(bb); in; in = next) {
+                next = LLVMGetNextInstruction(in);
+                if (LLVMIsASelectInst(in) && !LLVMGetFirstUse(in)
+                    && LLVMGetTypeKind(LLVMTypeOf(in))
+                       == LLVMPointerTypeKind) {
+                    LLVMInstructionEraseFromParent(in);
+                    changed = TRUE;
+                }
+            }
+        }
+    } while (changed);
+    LLVMDisposeBuilder(b);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -788,6 +924,8 @@ extern int llvm_pipeline_routine(void)
             return FALSE;
         }
     }
+
+    unmerge_pointer_selects(fn);
 
     dump_module(m, "post-opt");
 
