@@ -1,0 +1,213 @@
+!% -~S
+! Conway's Game of Life: a Glulx benchmark.
+!
+! Runs GENS generations of Life on a GRIDW x GRIDH torus seeded with a
+! deterministic pseudo-random soup. The inner loop is pure computation --
+! byte-array reads/writes, arithmetic, and branches -- which makes it a
+! good measure of raw VM speed; a rolling checksum of each generation's
+! population is printed so two builds of the same program can be checked
+! for identical behavior. Strict mode is off (the !% -~S header) so array
+! accesses aren't routed through the veneer's bounds checks.
+!
+! Rendering: on an interpreter with Glk graphics (Gargoyle, WinGlulxe,
+! ...) each cell is drawn as a filled square in a graphics window,
+! updated incrementally each generation, and the final state stays on
+! screen until a key is pressed. Under a text-only Glk (CheapGlk, as in
+! the test harness) it falls back to printing the grid as characters at
+! each report interval.
+!
+! Timing uses glk_current_time when available and is printed as the
+! final "Elapsed:" line -- strip that line when diffing transcripts
+! (see run-life.sh).
+
+Constant GRIDW 64;
+Constant GRIDH 48;
+Constant CELLS = GRIDW * GRIDH;
+Constant GENS 500;
+Constant REPORT 100;         ! print a status line every REPORT generations
+Constant STIR_EVERY 100;     ! re-seed a random block every STIR_EVERY
+                             ! generations so the soup never settles
+Constant CELLPX 8;           ! square size in pixels (graphics mode)
+Constant SOUP_PCT 35;        ! initial live-cell density, percent
+Constant LIVE_COLOR $00205080;
+
+! Glk selectors
+Constant GLK_GESTALT             $0004;
+Constant GLK_WINDOW_OPEN         $0023;
+Constant GLK_WINDOW_CLEAR        $002A;
+Constant GLK_SET_WINDOW          $002F;
+Constant GLK_SELECT              $00C0;
+Constant GLK_REQUEST_CHAR_EVENT  $00D2;
+Constant GLK_CURRENT_TIME        $0160;
+Constant GLK_FILL_RECT           $00EA;
+Constant GLK_ERASE_RECT          $00E9;
+
+Constant gestalt_Graphics  6;
+Constant gestalt_DateTime 20;
+Constant wintype_TextBuffer 3;
+Constant wintype_Graphics   5;
+Constant winmethod_Above  $02;
+Constant winmethod_Fixed  $10;
+Constant evtype_CharInput 2;
+Constant evtype_Redraw    6;
+
+Array grid1 -> CELLS;
+Array grid2 -> CELLS;
+Array timeval --> 3;         ! glktimeval: high sec, low sec, microsec
+Array event --> 4;
+
+Global cur;                  ! current generation (address of grid1/grid2)
+Global nxt;                  ! next generation being computed
+Global twin;                 ! text buffer window
+Global gwin;                 ! graphics window, or 0
+Global seed = 8675309;
+Global hash;
+Global start_sec; Global start_usec;
+
+[ Rnd;
+    seed = seed * 1103515245 + 12345;
+    return (seed / $10000) & $7FFF;
+];
+
+[ SeedSoup i;
+    for (i = 0: i < CELLS: i++) {
+        if (Rnd() % 100 < SOUP_PCT) cur->i = 1; else cur->i = 0;
+    }
+];
+
+! Splat fresh soup over a random 16x16 block, keeping the grid active.
+[ Stir  bx by x y;
+    bx = Rnd() % (GRIDW-16);
+    by = Rnd() % (GRIDH-16);
+    for (y = 0: y < 16: y++)
+        for (x = 0: x < 16: x++)
+            if (Rnd() % 100 < SOUP_PCT) cur->((by+y)*GRIDW + bx+x) = 1;
+];
+
+! One generation: compute nxt from cur, return the new population.
+[ Step  x y n c pop row rowu rowd xl xr;
+    pop = 0;
+    for (y = 0: y < GRIDH: y++) {
+        row = y * GRIDW;
+        if (y == 0)         rowu = (GRIDH-1) * GRIDW; else rowu = row - GRIDW;
+        if (y == GRIDH-1)   rowd = 0;                 else rowd = row + GRIDW;
+        for (x = 0: x < GRIDW: x++) {
+            if (x == 0)        xl = GRIDW-1; else xl = x - 1;
+            if (x == GRIDW-1)  xr = 0;       else xr = x + 1;
+            n = cur->(rowu+xl) + cur->(rowu+x) + cur->(rowu+xr)
+              + cur->(row+xl)                  + cur->(row+xr)
+              + cur->(rowd+xl) + cur->(rowd+x) + cur->(rowd+xr);
+            c = cur->(row+x);
+            if (n == 3 || (n == 2 && c)) { nxt->(row+x) = 1; pop++; }
+            else nxt->(row+x) = 0;
+        }
+    }
+    return pop;
+];
+
+! --- graphics-mode rendering ---------------------------------------------
+
+[ DrawCell x y alive;
+    if (alive)
+        glk(GLK_FILL_RECT, gwin, LIVE_COLOR,
+            x*CELLPX, y*CELLPX, CELLPX-1, CELLPX-1);
+    else
+        glk(GLK_ERASE_RECT, gwin,
+            x*CELLPX, y*CELLPX, CELLPX-1, CELLPX-1);
+];
+
+[ DrawFull g  x y;
+    glk(GLK_WINDOW_CLEAR, gwin);
+    for (y = 0: y < GRIDH: y++)
+        for (x = 0: x < GRIDW: x++)
+            if (g->(y*GRIDW+x)) DrawCell(x, y, 1);
+];
+
+! Redraw only the cells that changed between g0 and g1.
+[ DrawDiff g0 g1  x y i;
+    i = 0;
+    for (y = 0: y < GRIDH: y++)
+        for (x = 0: x < GRIDW: x++) {
+            if (g0->i ~= g1->i) DrawCell(x, y, g1->i);
+            i++;
+        }
+];
+
+! --- text-mode rendering --------------------------------------------------
+
+[ PrintGrid  x y;
+    for (y = 0: y < GRIDH: y++) {
+        for (x = 0: x < GRIDW: x++) {
+            if (cur->(y*GRIDW+x)) print "#"; else print ".";
+        }
+        new_line;
+    }
+];
+
+! --- timing ---------------------------------------------------------------
+
+[ MarkStart;
+    if (glk(GLK_GESTALT, gestalt_DateTime, 0) == 0) return;
+    glk(GLK_CURRENT_TIME, timeval);
+    start_sec = timeval-->1; start_usec = timeval-->2;
+];
+
+[ PrintElapsed  ms;
+    if (glk(GLK_GESTALT, gestalt_DateTime, 0) == 0) {
+        print "Elapsed: (time unavailable)^";
+        return;
+    }
+    glk(GLK_CURRENT_TIME, timeval);
+    ms = (timeval-->1 - start_sec) * 1000 + (timeval-->2 - start_usec) / 1000;
+    print "Elapsed: ", ms, " ms^";
+];
+
+! --- main -----------------------------------------------------------------
+
+[ WaitKey;
+    print "^[Press a key to exit]^";
+    glk(GLK_REQUEST_CHAR_EVENT, twin);
+    for (::) {
+        glk(GLK_SELECT, event);
+        if (event-->0 == evtype_CharInput) return;
+        if (event-->0 == evtype_Redraw) DrawFull(cur);
+    }
+];
+
+[ Main gen pop tmp;
+    @setiosys 2 0;       ! I/O through Glk
+    twin = glk(GLK_WINDOW_OPEN, 0, 0, 0, wintype_TextBuffer, 0);
+    glk(GLK_SET_WINDOW, twin);
+    if (glk(GLK_GESTALT, gestalt_Graphics, 0))
+        gwin = glk(GLK_WINDOW_OPEN, twin,
+                   winmethod_Above + winmethod_Fixed, GRIDH*CELLPX,
+                   wintype_Graphics, 0);
+
+    print "Game of Life benchmark: ", GRIDW, "x", GRIDH,
+          " torus, ", GENS, " generations^";
+    if (gwin) print "(graphics window)^"; else print "(text fallback)^";
+
+    cur = grid1; nxt = grid2;
+    SeedSoup();
+    hash = 0;
+    if (gwin) DrawFull(cur); else PrintGrid();
+
+    MarkStart();
+    for (gen = 1: gen <= GENS: gen++) {
+        pop = Step();
+        if (gwin) DrawDiff(cur, nxt);
+        tmp = cur; cur = nxt; nxt = tmp;
+        hash = hash * 31 + pop;
+        if (gen % REPORT == 0) {
+            print "gen ", gen, ": pop ", pop, " hash ", hash, "^";
+            if (gwin == 0) PrintGrid();
+        }
+        if (gen % STIR_EVERY == 0 && gen < GENS) {
+            Stir();
+            if (gwin) DrawFull(cur);
+        }
+    }
+    print "final hash ", hash, "^";
+    PrintElapsed();
+    if (gwin) WaitKey();
+];

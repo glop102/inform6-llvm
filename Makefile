@@ -47,10 +47,13 @@ test: inform6-llvm
 	tests/run-m1.sh
 	tests/run-m3.sh
 
+bench: inform6-llvm
+	tests/run-life.sh
+
 clean-tests:
 	rm -f tests/*.ulx tests/*.z5 tests/*.log tests/inform6-llvm-dump.ll
 
 clean: clean-tests
 	rm -rf $(BUILDDIR) inform6-llvm
 
-.PHONY: all test clean clean-tests
+.PHONY: all test bench clean clean-tests
