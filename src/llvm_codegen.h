@@ -18,4 +18,14 @@
 extern int llvm_lower_routine(LLVMModuleRef mod, LLVMValueRef fn,
     const char **fail_reason);
 
+/* Static instruction counts over all successfully lowered routines
+   (captured stream vs. lowered stream), for the statistics line. */
+extern int llvm_lower_insts_in, llvm_lower_insts_out;
+
+/* TRUE if the named Glulx opcode never writes RAM, globals, or locals
+   and never calls back into VM code (so it cannot clobber anything the
+   lowerer's memory analyses track). Defined by the lifter, which grades
+   the same opcodes' IR declarations with matching attributes. */
+extern int llvm_opcode_no_ram_write(const char *opname);
+
 #endif

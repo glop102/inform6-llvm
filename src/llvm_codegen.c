@@ -38,6 +38,17 @@
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Error.h>
 #include <llvm-c/Transforms/PassBuilder.h>
+#include <llvm/Config/llvm-config.h>
+
+/* MemoryEffects bitmask values for the "memory" function attribute: two
+   bits of ModRef (Ref=1, Mod=2) per memory location. LLVM 20 inserted the
+   errno location, growing the mask from 3 locations to 4. */
+#if LLVM_VERSION_MAJOR >= 20
+#define MEMATTR_READONLY        0x55u   /* memory(read)  */
+#else
+#define MEMATTR_READONLY        0x15u
+#endif
+#define MEMATTR_INACCESSIBLE_RW 0x0Cu   /* memory(inaccessiblemem: readwrite) */
 
 /* ------------------------------------------------------------------------- */
 /*   Lift state                                                              */
@@ -54,9 +65,20 @@ static int no_routines_lowered;
 static int no_routines_unlowered;
 
 /* The optimization pipeline (new pass manager syntax). Deliberately no
-   inlining or IPO: one IR function per routine. */
+   inlining or IPO: one IR function per routine. licm hoists loop-invariant
+   computations, loads, and readonly opcode calls out of loops (a pure
+   dynamic win under the instructions-dispatched cost model).
+
+   loop-rotate was tried and rejected: the rotated bottom test reads the
+   *incremented* induction variable, giving the increment a third use,
+   which defeats the lowerer's edge-copy folding — the saved backedge jump
+   comes back as a phi copy per iteration, and the duplicated guards cost
+   static size for nothing (measured: cloak +744 instructions, life bench
+   ~40ms slower). Revisit if the lowerer learns interference-based
+   coalescing of the increment with its phi's slot. */
 #define LLVM_PASS_PIPELINE \
-    "function(mem2reg,instcombine,simplifycfg,reassociate,gvn,dce,simplifycfg)"
+    "function(mem2reg,instcombine,simplifycfg,reassociate," \
+    "loop-mssa(licm),gvn,dce,simplifycfg)"
 
 /* Per-routine state. */
 static LLVMModuleRef  mod;
@@ -120,18 +142,102 @@ static LLVMValueRef declare_fn(const char *name, LLVMTypeRef ret,
    symbolic constants can merge, dead ones can vanish, and the calls never
    act as optimization barriers. The *values* still can't fold, which is
    the point. */
+static void add_fn_attr(LLVMValueRef f, const char *name, uint64_t val)
+{
+    unsigned kind = LLVMGetEnumAttributeKindForName(name, strlen(name));
+    LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
+        LLVMCreateEnumAttribute(llctx, kind, val));
+}
+
 static void mark_fn_as_constant(LLVMValueRef f)
 {
-    static const char *names[] = { "nounwind", "willreturn", "speculatable" };
-    unsigned i, kind;
-    kind = LLVMGetEnumAttributeKindForName("memory", 6);
-    LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
-        LLVMCreateEnumAttribute(llctx, kind, 0));   /* memory(none) */
-    for (i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
-        kind = LLVMGetEnumAttributeKindForName(names[i], strlen(names[i]));
-        LLVMAddAttributeAtIndex(f, LLVMAttributeFunctionIndex,
-            LLVMCreateEnumAttribute(llctx, kind, 0));
-    }
+    add_fn_attr(f, "memory", 0);            /* memory(none) */
+    add_fn_attr(f, "nounwind", 0);
+    add_fn_attr(f, "willreturn", 0);
+    add_fn_attr(f, "speculatable", 0);
+}
+
+/* A function that reads memory but never writes it, faults on bad
+   addresses (so not speculatable, but dead calls may still be removed —
+   the deref/aload addresses the compiler emits are valid), and always
+   returns. GVN can merge identical calls with no intervening writes. */
+static void mark_fn_as_readonly(LLVMValueRef f)
+{
+    add_fn_attr(f, "memory", MEMATTR_READONLY);
+    add_fn_attr(f, "nounwind", 0);
+    add_fn_attr(f, "willreturn", 0);
+}
+
+/* Touches VM state outside the memory map (the RNG): calls stay ordered
+   with respect to each other and never merge, but loads and stores of
+   RAM and globals move freely across them. */
+static void mark_fn_as_inaccessible_rw(LLVMValueRef f)
+{
+    add_fn_attr(f, "memory", MEMATTR_INACCESSIBLE_RW);
+    add_fn_attr(f, "nounwind", 0);
+    add_fn_attr(f, "willreturn", 0);
+}
+
+/* ------------------------------------------------------------------------- */
+/*   Opcode memory behavior                                                  */
+/*                                                                           */
+/*   Glulx opcodes that never write RAM, globals, or locals and never call   */
+/*   back into VM code. The lifter grades their IR declarations so LLVM      */
+/*   can optimize around them; the lowerer's clobber analysis (via           */
+/*   llvm_codegen.h) uses the same answer. Stream opcodes are deliberately   */
+/*   absent: under @setiosys 1 ("filter") every one of them invokes an       */
+/*   arbitrary routine per character.                                        */
+/* ------------------------------------------------------------------------- */
+
+/* Pure functions of their operands (Glulx float math is deterministic
+   and cannot fault). Only single-store opcodes appear: two-store float
+   opcodes never lift. */
+static const char *const pure_opcodes[] = {
+    "numtof", "ftonumz", "ftonumn", "ceil", "floor",
+    "fadd", "fsub", "fmul", "fdiv",
+    "sqrt", "exp", "log", "pow",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "dtonumz", "dtonumn", "dtof",
+    NULL
+};
+
+/* Read RAM (or query fixed VM state) without writing anything. */
+static const char *const readonly_opcodes[] = {
+    "aload", "aloads", "aloadb", "aloadbit",
+    "linearsearch", "binarysearch", "linkedsearch",
+    "gestalt",
+    NULL
+};
+
+/* Touch only state outside the memory map (the RNG). */
+static const char *const inaccessible_opcodes[] = {
+    "random", "setrandom",
+    NULL
+};
+
+static int name_in_list(const char *name, const char *const *list)
+{
+    int i;
+    for (i = 0; list[i]; i++)
+        if (strcmp(name, list[i]) == 0) return TRUE;
+    return FALSE;
+}
+
+extern int llvm_opcode_no_ram_write(const char *opname)
+{
+    return name_in_list(opname, pure_opcodes)
+        || name_in_list(opname, readonly_opcodes)
+        || name_in_list(opname, inaccessible_opcodes);
+}
+
+static void mark_opaque_fn_attrs(LLVMValueRef f, const char *opname)
+{
+    if (name_in_list(opname, pure_opcodes))
+        mark_fn_as_constant(f);
+    else if (name_in_list(opname, readonly_opcodes))
+        mark_fn_as_readonly(f);
+    else if (name_in_list(opname, inaccessible_opcodes))
+        mark_fn_as_inaccessible_rw(f);
 }
 
 static LLVMValueRef symbolic_constant(int marker, int32 value, int symindex)
@@ -207,8 +313,12 @@ static LLVMValueRef load_operand(const assembly_operand *op)
             global_var(op->value - MAX_LOCAL_VARIABLES), "");
     case DEREFERENCE_OT:
         {   LLVMTypeRef params[1]; LLVMTypeRef ft; LLVMValueRef f, addr;
+            int is_new;
             params[0] = i32t;
+            is_new = (LLVMGetNamedFunction(mod, "i6.deref") == NULL);
             f = declare_fn("i6.deref", i32t, params, 1, &ft);
+            if (is_new)
+                mark_fn_as_readonly(f);
             if (op->marker)
                 addr = symbolic_constant(op->marker, op->value, op->symindex);
             else
@@ -387,7 +497,11 @@ static void lift_opaque(const assembly_instruction *ai, int flags,
     ret = (flags & OPFLAG_STORE) ? i32t : LLVMVoidTypeInContext(llctx);
     sprintf(name, "i6.%.32s%s", glulx_opcode_name(ai->internal_number),
         n_extra ? ".s" : "");
-    f = declare_fn(name, ret, params, n_args, &ft);
+    {   int is_new = (LLVMGetNamedFunction(mod, name) == NULL);
+        f = declare_fn(name, ret, params, n_args, &ft);
+        if (is_new)
+            mark_opaque_fn_attrs(f, glulx_opcode_name(ai->internal_number));
+    }
     {   LLVMValueRef result = LLVMBuildCall2(bld, ft, f, args, n_args, "");
         if (flags & OPFLAG_STORE)
             store_operand(&ai->operand[ai->operand_count-1], result);
@@ -967,15 +1081,19 @@ extern void llvm_codegen_free(void)
 {
     if (LLVM_CODEGEN && (no_routines_lifted || no_routines_bailed)) {
         printf("LLVM: optimized %d of %d captured routines "
-            "(%d not lifted, %d not lowered)\n",
+            "(%d not lifted, %d not lowered); "
+            "%d instructions -> %d\n",
             no_routines_lowered,
             no_routines_lifted + no_routines_bailed,
-            no_routines_bailed, no_routines_unlowered);
+            no_routines_bailed, no_routines_unlowered,
+            llvm_lower_insts_in, llvm_lower_insts_out);
     }
     no_routines_lifted = 0;
     no_routines_bailed = 0;
     no_routines_lowered = 0;
     no_routines_unlowered = 0;
+    llvm_lower_insts_in = 0;
+    llvm_lower_insts_out = 0;
     if (dump_file) {
         fclose(dump_file);
         dump_file = NULL;

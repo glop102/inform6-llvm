@@ -256,3 +256,104 @@ module-at-a-time comes later.
   miscompiled under `$LLVM>=1`).
 - Debugging aid: `I6_LLVM_LIMIT=<n>` lowers only the first n lifted
   routines, for bisecting a misbehaving routine in a big game.
+
+## Instruction-count reduction backlog (post-M4)
+
+Key finding from the M4 benchmark work: **runtime tracks dispatched
+instruction count almost 1:1**. The interpreter's cost model has no
+instruction weights worth modeling — fewer emitted ops of any kind is
+faster. This backlog ranks the known opportunities by expected savings.
+
+Status 2026-07-14: items 1-7 implemented (3 partially — licm yes,
+loop-rotate rejected, see item 3), plus the "do no harm" statistic from
+the lower-priority list (the stats line now prints captured-vs-emitted
+static instruction counts over the lowered routines). Cloak of Darkness
+static count went 25039 → 21092 emitted for 18004 captured across the
+series (store fusion −110, attributes/whitelists −1130, return inlining
+−748, connective trees −2021, phi-param coalescing −40, licm +114 static
+bought as a dynamic win); all M1/M3/glulxercise/veneer gates stayed
+green throughout, and the life bench holds at classic parity or better
+(~855ms vs ~880ms classic, within noise).
+
+High impact:
+
+1. **Store fusion** (DONE) — a single-emission valued op whose only use is
+   the immediately following `store`/`i6.deref.store` should write the store's
+   target directly (`add a b Glob`) instead of riding the stack into a
+   copy (`add a b sp; copy sp Glob`). This is currently a *regression*
+   versus classic codegen, which emits the one-instruction form for every
+   `global = expr` / `array-->i = expr` assignment. Glulx evaluates source
+   operands before the store operand, so `Glob = Glob + 1` fuses soundly.
+   Same `sunk_into`/`edge_fold`-style machinery in the lowerer.
+2. **Memory attributes and clobber whitelists** (DONE; deref kept
+   non-speculatable — a hoisted read of a bogus constant address could
+   fault on a path that never executed it) — `i6.deref` is declared
+   with no attributes, so GVN assumes it writes memory: repeated derefs of
+   the same address don't CSE and global-load CSE dies across every deref.
+   Mark it `memory(read) nounwind willreturn` (addresses are always
+   compile-time constants into mapped memory, so `speculatable` is
+   defensible and unlocks LICM). On the lowering side, `global_clobbers`
+   / `memory_clobber_span` treat every opaque `i6.*` call as a clobber;
+   whitelist pure-read opcodes (`aload` family, searches, `gestalt`),
+   RNG-only opcodes, and pure float math. Stream opcodes can NOT be
+   whitelisted: under `@setiosys 1` (filter mode) every stream opcode
+   calls an arbitrary routine per character, which may write anything.
+3. **Loop passes** — the pipeline had none. DONE for `loop-mssa(licm)`
+   (hoists loop-invariant computations and readonly opcode calls; bench
+   neutral, wins in loops with invariant work). `loop-rotate` was tried
+   and REJECTED: the rotated bottom test reads the *incremented*
+   induction variable, giving the increment a third use (phi + select +
+   compare), which defeats edge-copy folding — the saved backedge jump
+   returns as a phi copy per iteration, plus duplicated guards (measured:
+   cloak +744 static, life bench ~40ms slower). Revisit only with
+   interference-based coalescing of the increment into its phi's slot.
+   Note globals cannot be hoisted past `astore`/opaque calls: VM globals
+   live in RAM, so any RAM store may alias them.
+
+Medium impact:
+
+4. **Inline non-constant returns** (DONE, including per-edge returns for
+   lone "phi; ret phi" blocks, whose bodies are no longer emitted) —
+   lone `ret %v` blocks (not just
+   `ret <constant>`) can be inlined at each predecessor: gotos become
+   `return v`, branch edges get a one-instruction `return v` stub instead
+   of a jump to a shared return block; a phi at the return block folds
+   into per-edge `return incoming`.
+5. **Fuse icmp into return** (DONE, plus the more general
+   "ret (select c, K1, K2)" with immediate arms — the form our pipeline
+   actually produces, since no instcombine runs after simplifycfg to
+   canonicalize select(c,1,0) into zext) — `return (a < b)` costs 5 ops
+   via the 0/1
+   materialization; with the -3/-4 return-branch encodings it is
+   `jlt a b <ret-1>; return 0` (2 ops). Extend `icmp_fusable` to accept a
+   same-block `ret` user through the `zext i1` alias.
+6. **Un-speculate i1 and/or trees** (DONE — the single biggest win,
+   cloak −2021. Covers `and`/`or i1`, the poison-safe logical select
+   forms `select(c,x,false)`/`select(c,true,x)`, and xor-with-true
+   negation; consumers are conditional branches AND selects, whose
+   diamonds re-branch on the tree. Leaf compares fuse into the chained
+   branches. The safety window only forbids *writes* between the tree
+   and its consumer — pure computations can't clobber moved reads.) —
+   instcombine folds `if (a && b)`
+   into `and i1` of two materialized icmps (~8 ops); re-expand single-use
+   i1 and/or trees feeding a conditional branch into short-circuit branch
+   chains (2 ops). Same family as select-arm sinking.
+7. **Coalesce loop phis with parameter slots** (DONE) — a phi whose entry-edge
+   incoming is a parameter (with no other param uses) can take over the
+   parameter's slot, killing one entry copy per *call*.
+
+Lower priority:
+
+- Cross-block icmp fusion (single-use branch in another block; needs
+  operand last_use extension so the slot pool doesn't reuse under it).
+- Stub fallthrough: `flush_stubs` always ends with a jump; elide when the
+  last stub's successor is the next emitted block. A `jump L; L:`
+  peephole over the emitted buffer would catch stragglers.
+- "Do no harm" statistic (DONE): count emitted vs. captured instructions
+  per routine in the stats line, so every tweak is measurable without
+  the bench. Note the absolute emitted count sits above the captured
+  count (icmp materializations, select diamonds, udiv tricks trade
+  static size for dynamic wins); use it as a per-change delta, not an
+  absolute goal.
+- Compile-time only: `lookup()` linear scans make phase A O(n²) in
+  routine size; hash if compile times ever hurt.

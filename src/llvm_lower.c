@@ -74,6 +74,7 @@ typedef struct valinfo_s {
     LLVMValueRef alias_to;  /* VK_ALIAS */
     LLVMValueRef sunk_into; /* select this arm computation is emitted in    */
     LLVMValueRef edge_fold; /* phi whose edge copy emits this computation   */
+    LLVMValueRef fold_store;/* store whose target this def writes directly  */
     int pos;                /* linear position in layout order              */
     int blk;                /* index of containing block                    */
     int last_use;           /* last position whose emission reads the value */
@@ -84,8 +85,11 @@ typedef struct blockinfo_s {
     LLVMBasicBlockRef bb;
     int label;              /* -1 for the entry block                       */
     int hazard;             /* phi copies on some edge need staging         */
-    LLVMValueRef ret_inline;/* constant operand of a lone "ret c", or NULL  */
+    LLVMValueRef ret_inline;/* operand of a lone "ret v" (a constant or a   */
+                            /*   value readable at every pred), or NULL     */
     int retconst;           /* 0/1 if ret_inline is that constant, else -1  */
+    LLVMValueRef ret_phi;   /* phi of a lone "phi; ret phi" block: every    */
+                            /*   edge returns its own incoming directly     */
     int emit_body;          /* FALSE: every reference is inlined, skip it   */
     int end_pos;            /* position of the terminator                   */
 } blockinfo;
@@ -101,6 +105,12 @@ static int   next_slot;      /* next free local slot                        */
 static int   lower_failed;
 static const char *lower_fail_reason;
 static int   last_emit_noreturn;  /* last emitted opcode had the Rf flag    */
+
+/* Statistics: static instruction counts across all lowered routines, as a
+   crude "do no harm" measure (printed with the LLVM stats line). */
+int llvm_lower_insts_in;
+int llvm_lower_insts_out;
+static int n_emitted;        /* instructions emitted for this routine       */
 
 static void lfail(const char *why)
 {   if (!lower_failed) {
@@ -141,6 +151,21 @@ static int name_has_prefix(const char *name, const char *prefix)
 {   return strncmp(name, prefix, strlen(prefix)) == 0;
 }
 
+/* TRUE if this call names an i6.<opcode> whose opcode never writes RAM,
+   globals, or locals (see llvm_opcode_no_ram_write in llvm_codegen.c). */
+static int call_writes_no_ram(const char *name)
+{
+    char base[64];
+    size_t blen;
+    if (!name_has_prefix(name, "i6.")) return FALSE;
+    blen = strlen(name + 3);
+    if (blen >= sizeof(base)) return FALSE;
+    strcpy(base, name + 3);
+    if (blen > 2 && strcmp(base + blen - 2, ".s") == 0)
+        base[blen - 2] = 0;
+    return llvm_opcode_no_ram_write(base);
+}
+
 static valinfo *lookup(LLVMValueRef v)
 {
     int i;
@@ -171,6 +196,15 @@ static LLVMValueRef rep(LLVMValueRef v)
     return NULL;
 }
 
+/* Has this store's value def taken over the store's emission (writing the
+   store's target directly)? validx is the store's value operand index. */
+static int store_is_folded(LLVMValueRef st, int validx)
+{
+    LLVMValueRef v = LLVMGetOperand(st, validx);
+    valinfo *di = (v && LLVMIsAInstruction(v)) ? underlying(v) : NULL;
+    return di && di->fold_store == st;
+}
+
 static int param_index(LLVMValueRef v)
 {
     int i;
@@ -195,6 +229,22 @@ static int phi_count(LLVMBasicBlockRef bb)
          in = LLVMGetNextInstruction(in))
         n++;
     return n;
+}
+
+/* Is this phi the whole value of a lone "phi; ret phi" block? Such
+   blocks are never emitted: every edge to them becomes a return of its
+   own incoming value, so the phi has no slot and no edge copies. */
+static int is_ret_phi(LLVMValueRef phi)
+{
+    LLVMBasicBlockRef bb;
+    LLVMValueRef term;
+    if (!LLVMIsAPHINode(phi)) return FALSE;
+    bb = LLVMGetInstructionParent(phi);
+    if (LLVMGetFirstInstruction(bb) != phi) return FALSE;
+    term = LLVMGetNextInstruction(phi);
+    if (!term || term != LLVMGetBasicBlockTerminator(bb)) return FALSE;
+    if (LLVMGetInstructionOpcode(term) != LLVMRet) return FALSE;
+    return LLVMGetNumOperands(term) == 1 && LLVMGetOperand(term, 0) == phi;
 }
 
 /* The value flowing into a phi along the edge from pred. */
@@ -227,9 +277,115 @@ static int icmp_fusable(LLVMValueRef inst)
             && LLVMGetCondition(user) == inst;
     case LLVMSelect:
         return LLVMGetOperand(user, 0) == inst;
+    case LLVMZExt:
+        /* ret (zext icmp), all in one block: lowers as a compare-branch
+           to the -4 "return 1" target followed by "return 0" (2 emitted
+           instructions instead of the 0/1 materialization's 5). */
+        {   LLVMUseRef zuse = LLVMGetFirstUse(user);
+            LLVMValueRef zuser;
+            if (int_width(user) != 32) return FALSE;
+            if (!zuse || LLVMGetNextUse(zuse)) return FALSE;
+            zuser = LLVMGetUser(zuse);
+            if (!LLVMIsAInstruction(zuser)) return FALSE;
+            if (LLVMGetInstructionOpcode(zuser) != LLVMRet) return FALSE;
+            return LLVMGetInstructionParent(zuser)
+                == LLVMGetInstructionParent(inst);
+        }
     default:
         return FALSE;
     }
+}
+
+/* The fused icmp behind "ret (zext icmp)", or NULL. */
+static LLVMValueRef ret_fused_icmp(LLVMValueRef term)
+{
+    LLVMValueRef rv, c;
+    valinfo *ci;
+    if (LLVMGetNumOperands(term) != 1) return NULL;
+    rv = LLVMGetOperand(term, 0);
+    if (!LLVMIsAInstruction(rv)
+        || LLVMGetInstructionOpcode(rv) != LLVMZExt) return NULL;
+    c = LLVMGetOperand(rv, 0);
+    if (!LLVMIsAInstruction(c) || !LLVMIsAICmpInst(c)) return NULL;
+    ci = lookup(c);
+    return (ci && ci->kind == VK_FUSED) ? c : NULL;
+}
+
+/* ---- i1 connective trees ------------------------------------------------ */
+
+#define TREE_NONE 0
+#define TREE_AND  1
+#define TREE_OR   2
+#define TREE_NOT  3
+
+/* Recognize the i1 connective shapes instcombine/simplifycfg build when
+   they fold source-level short-circuit branches: plain and/or, the
+   poison-safe "logical" select forms select(c,x,false) == c && x and
+   select(c,true,x) == c || x, and xor-with-true negation. Children come
+   back in evaluation (short-circuit) order. */
+static int tree_node_shape(LLVMValueRef v, LLVMValueRef *a, LLVMValueRef *b)
+{
+    LLVMOpcode o;
+    if (!LLVMIsAInstruction(v) || int_width(v) != 1) return TREE_NONE;
+    o = LLVMGetInstructionOpcode(v);
+    if (o == LLVMAnd || o == LLVMOr) {
+        *a = LLVMGetOperand(v, 0);
+        *b = LLVMGetOperand(v, 1);
+        return o == LLVMAnd ? TREE_AND : TREE_OR;
+    }
+    if (o == LLVMXor) {
+        LLVMValueRef x = LLVMGetOperand(v, 1);
+        if (LLVMIsAConstantInt(x)
+            && (LLVMConstIntGetZExtValue(x) & 1) == 1) {
+            *a = LLVMGetOperand(v, 0);
+            *b = NULL;
+            return TREE_NOT;
+        }
+        return TREE_NONE;
+    }
+    if (o == LLVMSelect) {
+        LLVMValueRef tv = LLVMGetOperand(v, 1);
+        LLVMValueRef fv = LLVMGetOperand(v, 2);
+        if (LLVMIsAConstantInt(fv)
+            && (LLVMConstIntGetZExtValue(fv) & 1) == 0) {
+            *a = LLVMGetOperand(v, 0); *b = tv;
+            return TREE_AND;
+        }
+        if (LLVMIsAConstantInt(tv)
+            && (LLVMConstIntGetZExtValue(tv) & 1) == 1) {
+            *a = LLVMGetOperand(v, 0); *b = fv;
+            return TREE_OR;
+        }
+        return TREE_NONE;
+    }
+    return TREE_NONE;
+}
+
+/* A connective marked (by branch_tree_pass) as emitted inside the given
+   conditional branch, as a chain of short-circuit compare-branches. */
+static int is_marked_tree_node(LLVMValueRef v, LLVMValueRef term)
+{
+    LLVMValueRef a, b;
+    valinfo *vi = LLVMIsAInstruction(v) ? lookup(v) : NULL;
+    return vi && vi->kind == VK_SKIP && vi->sunk_into == term
+        && tree_node_shape(v, &a, &b) != TREE_NONE;
+}
+
+/* The select fused into this return (marked by ret_select_pass with
+   sunk_into = the ret), or NULL. "ret (select c, K1, K2)" emits as a
+   conditional branch between two returns — via the -3/-4 encodings when
+   an arm is 0 or 1 — instead of the select's copy/branch/copy diamond
+   plus a return. */
+static LLVMValueRef ret_fused_select(LLVMValueRef term)
+{
+    LLVMValueRef rv;
+    valinfo *si;
+    if (LLVMGetNumOperands(term) != 1) return NULL;
+    rv = LLVMGetOperand(term, 0);
+    if (!LLVMIsAInstruction(rv)
+        || LLVMGetInstructionOpcode(rv) != LLVMSelect) return NULL;
+    si = lookup(rv);
+    return (si && si->sunk_into == term) ? rv : NULL;
 }
 
 static int32 const_int_value(LLVMValueRef v)
@@ -253,6 +409,7 @@ static void classify(LLVMValueRef in, valinfo *vi)
     vi->alias_to = NULL;
     vi->sunk_into = NULL;
     vi->edge_fold = NULL;
+    vi->fold_store = NULL;
 
     switch (opc) {
     case LLVMRet:
@@ -529,6 +686,17 @@ static void validate(LLVMValueRef in)
     LLVMOpcode opc = LLVMGetInstructionOpcode(in);
     unsigned i, n;
 
+    /* Nodes already decided (before validation) to emit inside their
+       consumer — ret-selects and connective trees (whose consumer may
+       itself be a select) — are read through their leaves, which are
+       validated on their own. */
+    {   valinfo *vi = lookup(in);
+        if (vi && vi->kind == VK_SKIP && vi->sunk_into
+            && (LLVMIsATerminatorInst(vi->sunk_into)
+                || is_marked_tree_node(in, vi->sunk_into)))
+            return;
+    }
+
     switch (opc) {
     case LLVMAdd: case LLVMSub: case LLVMMul:
     case LLVMSDiv: case LLVMSRem:
@@ -543,7 +711,8 @@ static void validate(LLVMValueRef in)
     case LLVMSelect:
         {   LLVMValueRef cond = LLVMGetOperand(in, 0);
             valinfo *ci = lookup(cond);
-            if (!(ci && ci->kind == VK_FUSED)
+            if (!is_marked_tree_node(cond, in)
+                && !(ci && ci->kind == VK_FUSED)
                 && !LLVMIsAConstantInt(cond)
                 && !LLVMIsUndef(cond) && !LLVMIsPoison(cond))
                 check_operand(cond, "unlowerable select condition");
@@ -626,6 +795,8 @@ static void validate(LLVMValueRef in)
         if (LLVMIsConditional(in)) {
             LLVMValueRef cond = LLVMGetCondition(in);
             valinfo *ci = lookup(cond);
+            if (is_marked_tree_node(cond, in))
+                return;   /* leaves validated by their own cases */
             if (!(ci && ci->kind == VK_FUSED)
                 && !LLVMIsAConstantInt(cond)
                 && !LLVMIsUndef(cond) && !LLVMIsPoison(cond))
@@ -641,6 +812,21 @@ static void validate(LLVMValueRef in)
 
     case LLVMRet:
         if (LLVMGetNumOperands(in) != 1) { lfail("void return"); return; }
+        if (ret_fused_icmp(in)) {
+            LLVMValueRef c = ret_fused_icmp(in);
+            check_operand(LLVMGetOperand(c, 0), "unlowerable operand");
+            check_operand(LLVMGetOperand(c, 1), "unlowerable operand");
+            return;
+        }
+        {   LLVMValueRef sel = ret_fused_select(in);
+            if (sel) {
+                LLVMValueRef cond = LLVMGetOperand(sel, 0);
+                valinfo *ci = lookup(cond);
+                if (!(ci && ci->kind == VK_FUSED))
+                    check_operand(cond, "unlowerable return condition");
+                return;
+            }
+        }
         check_operand(LLVMGetOperand(in, 0), "unlowerable return value");
         return;
 
@@ -690,6 +876,55 @@ static void rs_cond(readset *rs, LLVMValueRef cond)
     else if (!LLVMIsAConstantInt(cond)
              && !LLVMIsUndef(cond) && !LLVMIsPoison(cond))
         rs_pop(rs, cond);
+}
+
+static void rs_tree_cond(readset *rs, LLVMValueRef v, LLVMValueRef term,
+    int *first);
+
+/* Condition reads for a consumer that may carry a marked connective
+   tree (a conditional branch or a select). */
+static void rs_cond_tree_aware(readset *rs, LLVMValueRef cond,
+    LLVMValueRef consumer)
+{
+    if (is_marked_tree_node(cond, consumer)) {
+        int first = TRUE;
+        rs_tree_cond(rs, cond, consumer, &first);
+    }
+    else
+        rs_cond(rs, cond);
+}
+
+/* Reads made by a marked connective tree's emission at its branch: the
+   first-evaluated leaf reads unconditionally (a genuine pop site), every
+   later leaf only on some paths. */
+static void rs_tree_cond(readset *rs, LLVMValueRef v, LLVMValueRef term,
+    int *first)
+{
+    LLVMValueRef a, b;
+    if (is_marked_tree_node(v, term)) {
+        int k = tree_node_shape(v, &a, &b);
+        rs_tree_cond(rs, a, term, first);
+        if (k != TREE_NOT)
+            rs_tree_cond(rs, b, term, first);
+        return;
+    }
+    {   valinfo *vi = LLVMIsAInstruction(v) ? lookup(v) : NULL;
+        if (vi && vi->kind == VK_FUSED && LLVMIsAICmpInst(v)) {
+            if (*first) {
+                rs_pop(rs, LLVMGetOperand(v, 0));
+                rs_pop(rs, LLVMGetOperand(v, 1));
+            }
+            else {
+                rs_other(rs, LLVMGetOperand(v, 0));
+                rs_other(rs, LLVMGetOperand(v, 1));
+            }
+        }
+        else if (*first)
+            rs_pop(rs, v);
+        else
+            rs_other(rs, v);
+        *first = FALSE;
+    }
 }
 
 static void rs_arm_reads(readset *rs, LLVMValueRef op);
@@ -812,7 +1047,7 @@ static void emission_readset_core(LLVMValueRef in, readset *rs)
             if (tvs || fvs) {
                 /* Diamond emission: the branch reads the condition first;
                    both arms are then conditional. */
-                rs_cond(rs, cond);
+                rs_cond_tree_aware(rs, cond, in);
                 if (tvs) rs_arm_reads(rs, tvs);
                 else rs_other(rs, LLVMGetOperand(in, 1));
                 if (fvs) rs_arm_reads(rs, fvs);
@@ -821,12 +1056,12 @@ static void emission_readset_core(LLVMValueRef in, readset *rs)
             }
             if (select_swapped(in)) {
                 rs_pop(rs, LLVMGetOperand(in, 2));   /* fv first */
-                rs_cond(rs, cond);
+                rs_cond_tree_aware(rs, cond, in);
                 rs_other(rs, LLVMGetOperand(in, 1));
                 return;
             }
             rs_pop(rs, LLVMGetOperand(in, 1));   /* tv, unconditionally */
-            rs_cond(rs, cond);
+            rs_cond_tree_aware(rs, cond, in);
             rs_other(rs, LLVMGetOperand(in, 2)); /* fv, conditionally */
         }
         return;
@@ -857,20 +1092,37 @@ static void emission_readset_core(LLVMValueRef in, readset *rs)
     case LLVMLoad:
         return;
     case LLVMStore:
-        rs_pop(rs, LLVMGetOperand(in, 0));
+        if (!store_is_folded(in, 0))
+            rs_pop(rs, LLVMGetOperand(in, 0));
         return;
 
     case LLVMRet:
-        if (LLVMGetNumOperands(in) == 1)
-            rs_pop(rs, LLVMGetOperand(in, 0));
+        {   LLVMValueRef fc = ret_fused_icmp(in);
+            LLVMValueRef sel = ret_fused_select(in);
+            if (fc) {
+                rs_pop(rs, LLVMGetOperand(fc, 0));
+                rs_pop(rs, LLVMGetOperand(fc, 1));
+            }
+            else if (sel)
+                rs_cond(rs, LLVMGetOperand(sel, 0));
+            else if (LLVMGetNumOperands(in) == 1)
+                rs_pop(rs, LLVMGetOperand(in, 0));
+        }
         return;
 
     case LLVMBr:
         /* A branch whose successors coincide is emitted as a plain goto:
            the condition is never read at runtime. */
         if (LLVMIsConditional(in)
-            && LLVMGetSuccessor(in, 0) != LLVMGetSuccessor(in, 1))
-            rs_cond(rs, LLVMGetCondition(in));
+            && LLVMGetSuccessor(in, 0) != LLVMGetSuccessor(in, 1)) {
+            LLVMValueRef cond = LLVMGetCondition(in);
+            if (is_marked_tree_node(cond, in)) {
+                int first = TRUE;
+                rs_tree_cond(rs, cond, in, &first);
+            }
+            else
+                rs_cond(rs, cond);
+        }
         rs_succ_phis(rs, in);
         return;
 
@@ -906,7 +1158,8 @@ static void emission_readset_core(LLVMValueRef in, readset *rs)
                 return;
             }
             if (strcmp(name, "i6.deref.store") == 0) {
-                rs_pop(rs, LLVMGetOperand(in, 1));
+                if (!store_is_folded(in, 1))
+                    rs_pop(rs, LLVMGetOperand(in, 1));
                 return;
             }
             /* opaque i6.<opcode>[.s] call */
@@ -968,8 +1221,10 @@ static int global_clobbers(LLVMValueRef in, LLVMValueRef g)
             if (strcmp(name, "i6.sym") == 0) return FALSE;
             if (strcmp(name, "i6.deref") == 0) return FALSE;
             if (name_has_prefix(name, "llvm.")) return FALSE;
-            /* i6.deref.store and opaque opcodes (call, glk, astore...)
-               may write anywhere in RAM, including the globals array. */
+            if (call_writes_no_ram(name)) return FALSE;
+            /* i6.deref.store and other opaque opcodes (call, glk,
+               astore...) may write anywhere in RAM, including the
+               globals array. */
             return TRUE;
         }
     default:
@@ -1069,6 +1324,7 @@ static int memory_clobber_span(int p1, int p2)
                 if (strcmp(name, "i6.sym") == 0) continue;
                 if (strcmp(name, "i6.deref") == 0) continue;
                 if (name_has_prefix(name, "llvm.")) continue;
+                if (call_writes_no_ram(name)) continue;
                 return TRUE;
             }
         default:
@@ -1199,8 +1455,11 @@ static void edge_fold_pass(void)
             if (!LLVMIsAInstruction(user)) { ok = FALSE; break; }
             if (LLVMIsAPHINode(user)) {
                 /* All entries carrying this value must come from our own
-                   block (its operands are re-read on that edge). */
+                   block (its operands are re-read on that edge). Ret-phis
+                   have no edge copies to fold into: their edges resolve
+                   the incoming as a return operand, which needs a slot. */
                 unsigned i, n = LLVMCountIncoming(user);
+                if (is_ret_phi(user)) { ok = FALSE; break; }
                 if (phi_use && phi_use != user) { ok = FALSE; break; }
                 for (i = 0; i < n; i++) {
                     blockinfo *pb;
@@ -1231,6 +1490,278 @@ static void edge_fold_pass(void)
         vi->kind = VK_SKIP;
         if (sel_use)
             vi->sunk_into = sel_use;   /* rematerialized clone in the arm */
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*   Phase A, pass 4d: store folding                                         */
+/*                                                                           */
+/*   A single-emission def whose only consumer is a store can write the      */
+/*   store's target (a global or deref operand) directly, instead of         */
+/*   passing through the stack or a slot and paying a copy: "add a b Glob"   */
+/*   where classic codegen also emits one instruction. Glulx evaluates       */
+/*   source operands before the store operand, so the def may read its own   */
+/*   target ("add Glob 1 Glob"). Sound only when nothing emitted between     */
+/*   the def and the store could observe the target's early write, so we     */
+/*   require the window between them to emit nothing at all.                 */
+/* ------------------------------------------------------------------------- */
+
+static int stackable_def(valinfo *vi);
+static LLVMValueRef effective_reader(LLVMValueRef v);
+
+/* TRUE if this instruction's emission dispatches no runtime instructions
+   at its own position (any reads it causes happen at its consumers). */
+static int emits_nothing(valinfo *vi)
+{
+    switch (vi->kind) {
+    case VK_ALIAS: case VK_FUSED: case VK_GLOBAL:
+        return TRUE;
+    case VK_SKIP:
+        {   LLVMOpcode opc = LLVMGetInstructionOpcode(vi->v);
+            if (opc == LLVMTrunc) return TRUE;  /* narrow trunc */
+            if (opc == LLVMCall) {
+                const char *name = called_fn_name(vi->v);
+                return name && (strcmp(name, "i6.sym") == 0
+                    || name_has_prefix(name, "llvm.assume")
+                    || name_has_prefix(name, "llvm.lifetime")
+                    || name_has_prefix(name, "llvm.dbg")
+                    || name_has_prefix(name, "llvm.donothing"));
+            }
+        }
+        return FALSE;
+    default:
+        return FALSE;   /* VK_SLOT / VK_STACK emit */
+    }
+}
+
+/* TRUE if this instruction's emission cannot invalidate anything a
+   later-moved read might see: it writes no RAM, no globals, and nothing
+   but its own result slot. Used by the passes that move reads later
+   (ret-selects, branch trees); pool slot reuse cannot alias the moved
+   reads' slots because their last_use extends to the consumer. */
+static int window_safe_for_reads(valinfo *vi)
+{
+    if (emits_nothing(vi)) return TRUE;
+    switch (LLVMGetInstructionOpcode(vi->v)) {
+    case LLVMAdd: case LLVMSub: case LLVMMul:
+    case LLVMSDiv: case LLVMSRem:
+    case LLVMUDiv: case LLVMURem:
+    case LLVMAnd: case LLVMOr: case LLVMXor:
+    case LLVMShl: case LLVMLShr: case LLVMAShr:
+    case LLVMICmp: case LLVMSelect:
+    case LLVMZExt: case LLVMSExt: case LLVMTrunc:
+    case LLVMFreeze: case LLVMLoad:
+        return TRUE;
+    case LLVMCall:
+        {   const char *name = called_fn_name(vi->v);
+            if (!name) return FALSE;
+            if (strcmp(name, "i6.deref") == 0) return TRUE;
+            if (name_has_prefix(name, "llvm.")) return TRUE;
+            return call_writes_no_ram(name);
+        }
+    default:
+        return FALSE;   /* stores, opaque calls, terminators */
+    }
+}
+
+static void store_fold_pass(void)
+{
+    int p, q;
+    for (p = 0; p < n_vals; p++) {
+        valinfo *vi = &vals[p];
+        LLVMValueRef reader;
+        valinfo *si;
+        int validx;
+
+        if (vi->kind != VK_SLOT || !stackable_def(vi)) continue;
+        reader = effective_reader(vi->v);
+        if (!reader) continue;
+        if (LLVMGetInstructionOpcode(reader) == LLVMStore)
+            validx = 0;
+        else if (LLVMIsACallInst(reader)) {
+            const char *name = called_fn_name(reader);
+            if (!name || strcmp(name, "i6.deref.store") != 0) continue;
+            validx = 1;
+        }
+        else continue;
+        if (underlying(LLVMGetOperand(reader, validx)) != vi) continue;
+        si = lookup(reader);
+        if (!si || si->blk != vi->blk) continue;
+        for (q = vi->pos + 1; q < si->pos; q++)
+            if (!emits_nothing(&vals[q])) break;
+        if (q < si->pos) continue;
+        vi->fold_store = reader;
+        vi->kind = VK_SKIP;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*   Phase A, pass 1b: returns of selects                                    */
+/*                                                                           */
+/*   "ret (select c, K1, K2)" with immediate arms: the select's diamond      */
+/*   (copy/branch/copy, 3-5 instructions) plus the return collapse into a    */
+/*   conditional branch between two returns (2-3). The select is marked      */
+/*   sunk into the ret; the decision is memoized here because it depends     */
+/*   on a window check whose answer must not drift as later passes           */
+/*   reclassify values. Runs right after classify, before validation.        */
+/* ------------------------------------------------------------------------- */
+
+static int is_immediate_val(LLVMValueRef v);
+
+static void ret_select_pass(void)
+{
+    int p, q;
+    for (p = 0; p < n_vals; p++) {
+        LLVMValueRef term = vals[p].v, rv, cond;
+        LLVMUseRef use;
+        valinfo *si;
+
+        if (LLVMGetInstructionOpcode(term) != LLVMRet) continue;
+        if (LLVMGetNumOperands(term) != 1) continue;
+        rv = LLVMGetOperand(term, 0);
+        if (!LLVMIsAInstruction(rv)
+            || LLVMGetInstructionOpcode(rv) != LLVMSelect) continue;
+        si = lookup(rv);
+        if (!si || si->kind != VK_SLOT || si->blk != vals[p].blk) continue;
+        if (int_width(rv) != 32) continue;
+        use = LLVMGetFirstUse(rv);
+        if (!use || LLVMGetNextUse(use)) continue;
+        cond = LLVMGetOperand(rv, 0);
+        if (LLVMIsAConstantInt(cond) || LLVMIsUndef(cond)
+            || LLVMIsPoison(cond)) continue;
+        if (!is_immediate_val(LLVMGetOperand(rv, 1))
+            || !is_immediate_val(LLVMGetOperand(rv, 2))) continue;
+        /* The condition's reads move from the select's position to the
+           ret's; anything in between that writes could clobber them. */
+        for (q = si->pos + 1; q < p; q++)
+            if (!window_safe_for_reads(&vals[q])) break;
+        if (q < p) continue;
+        si->kind = VK_SKIP;
+        si->sunk_into = term;
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/*   Phase A, pass 1c: branch condition trees                                */
+/*                                                                           */
+/*   instcombine folds source-level short-circuit branches ("if (a && b)")  */
+/*   into i1 connectives feeding one conditional branch — right for          */
+/*   hardware, expensive for an interpreter, where each materialized 0/1     */
+/*   compare costs a diamond. A single-use connective tree whose only        */
+/*   consumer is a same-block conditional branch is marked sunk into that    */
+/*   branch and re-expanded at emission into chained compare-branches;       */
+/*   its single-use same-block compare leaves fuse into those branches.      */
+/*   Decided and memoized here, before validation, like ret-selects.         */
+/* ------------------------------------------------------------------------- */
+
+#define MAX_TREE 16
+
+typedef struct treebuf_s {
+    LLVMValueRef nodes[MAX_TREE]; int n_nodes;
+    LLVMValueRef fuse[MAX_TREE];  int n_fuse;
+    int min_pos;
+} treebuf;
+
+static int tree_leaf_ok(LLVMValueRef v, LLVMBasicBlockRef bb, treebuf *tb)
+{
+    if (LLVMIsAInstruction(v) && LLVMIsAICmpInst(v)
+        && LLVMGetInstructionParent(v) == bb) {
+        LLVMUseRef use = LLVMGetFirstUse(v);
+        valinfo *vi = lookup(v);
+        if (vi && (vi->kind == VK_SLOT || vi->kind == VK_FUSED)
+            && use && !LLVMGetNextUse(use)) {
+            /* VK_FUSED here means "fused into its select user", which is
+               itself a node of this tree; it needs no re-marking. */
+            if (vi->kind == VK_SLOT) {
+                if (tb->n_fuse >= MAX_TREE) return FALSE;
+                tb->fuse[tb->n_fuse++] = v;
+            }
+            if (vi->pos < tb->min_pos) tb->min_pos = vi->pos;
+            return TRUE;
+        }
+    }
+    return operand_ok(v);   /* any readable 0/1 value */
+}
+
+static int tree_collect(LLVMValueRef v, LLVMBasicBlockRef bb, treebuf *tb,
+    int depth)
+{
+    LLVMValueRef a, b;
+    valinfo *vi;
+    LLVMUseRef use;
+    int shape;
+
+    if (depth > 6) return FALSE;
+    shape = tree_node_shape(v, &a, &b);
+    if (shape == TREE_NONE) return FALSE;
+    vi = lookup(v);
+    if (!vi || vi->kind != VK_SLOT) return FALSE;
+    if (LLVMGetInstructionParent(v) != bb) return FALSE;
+    use = LLVMGetFirstUse(v);
+    if (!use || LLVMGetNextUse(use)) return FALSE;
+    if (tb->n_nodes >= MAX_TREE) return FALSE;
+
+    if (!tree_collect(a, bb, tb, depth + 1) && !tree_leaf_ok(a, bb, tb))
+        return FALSE;
+    if (shape != TREE_NOT
+        && !tree_collect(b, bb, tb, depth + 1) && !tree_leaf_ok(b, bb, tb))
+        return FALSE;
+    tb->nodes[tb->n_nodes++] = v;
+    if (vi->pos < tb->min_pos) tb->min_pos = vi->pos;
+    return TRUE;
+}
+
+static int in_treebuf(treebuf *tb, LLVMValueRef v)
+{
+    int i;
+    for (i = 0; i < tb->n_nodes; i++) if (tb->nodes[i] == v) return TRUE;
+    for (i = 0; i < tb->n_fuse; i++) if (tb->fuse[i] == v) return TRUE;
+    return FALSE;
+}
+
+static void branch_tree_pass(void)
+{
+    int p, q, i;
+    /* Walk backward so an outer consumer claims a nested connective
+       select (as a tree node) before that select could claim its own
+       condition as a separate tree. */
+    for (p = n_vals - 1; p >= 0; p--) {
+        LLVMValueRef term = vals[p].v, cond;
+        LLVMOpcode opc = LLVMGetInstructionOpcode(term);
+        treebuf tb;
+
+        /* Consumers whose emission branches on a condition: conditional
+           branches, and selects (their diamond re-branches on it). */
+        if (opc == LLVMBr) {
+            if (!LLVMIsConditional(term)) continue;
+            if (LLVMGetSuccessor(term, 0) == LLVMGetSuccessor(term, 1))
+                continue;
+            cond = LLVMGetCondition(term);
+        }
+        else if (opc == LLVMSelect) {
+            valinfo *si = lookup(term);
+            if (!si || si->kind != VK_SLOT) continue;
+            cond = LLVMGetOperand(term, 0);
+        }
+        else
+            continue;
+        tb.n_nodes = 0; tb.n_fuse = 0; tb.min_pos = p;
+        if (!tree_collect(cond, LLVMGetInstructionParent(term), &tb, 0))
+            continue;
+        /* The leaves' reads move to the consumer; anything in between
+           that writes could clobber what they read. */
+        for (q = tb.min_pos + 1; q < p; q++)
+            if (!in_treebuf(&tb, vals[q].v)
+                && !window_safe_for_reads(&vals[q]))
+                break;
+        if (q < p) continue;
+        for (i = 0; i < tb.n_nodes; i++) {
+            valinfo *ni = lookup(tb.nodes[i]);
+            ni->kind = VK_SKIP;
+            ni->sunk_into = term;
+        }
+        for (i = 0; i < tb.n_fuse; i++)
+            lookup(tb.fuse[i])->kind = VK_FUSED;
     }
 }
 
@@ -1316,7 +1847,12 @@ static LLVMValueRef effective_reader(LLVMValueRef v)
         if (!ui) return NULL;
         if (ui->kind == VK_ALIAS || ui->kind == VK_FUSED
             || (ui->kind == VK_SKIP
-                && LLVMGetInstructionOpcode(user) == LLVMTrunc)) {
+                && LLVMGetInstructionOpcode(user) == LLVMTrunc)
+            || (ui->kind == VK_SKIP && ui->sunk_into
+                && (LLVMIsATerminatorInst(ui->sunk_into)
+                    || is_marked_tree_node(user, ui->sunk_into)))) {
+            /* The last case: ret-selects and connective trees, whose
+               reads happen at the consumer that absorbs them. */
             v = user;
             continue;
         }
@@ -1465,18 +2001,32 @@ static void block_analysis(void)
                     blkinfo[i].hazard = TRUE;
         }
 
-        /* Lone "ret <constant>" blocks: gotos inline the return; branches
-           reach a ret 0 / ret 1 via the -3/-4 encodings. */
+        /* Lone "ret v" blocks: gotos inline the return when v is a
+           constant or a value readable at every predecessor (a dedicated
+           cross-block slot or a parameter slot — both are written by v's
+           def, which dominates every edge into this block, and neither
+           is ever reused). Branches reach a ret 0 / ret 1 via the -3/-4
+           encodings. */
         blkinfo[i].ret_inline = NULL;
         blkinfo[i].retconst = -1;
+        blkinfo[i].ret_phi = NULL;
         blkinfo[i].emit_body = TRUE;
         in = LLVMGetFirstInstruction(bb);
         if (in && in == LLVMGetBasicBlockTerminator(bb)
             && LLVMGetInstructionOpcode(in) == LLVMRet
             && LLVMGetNumOperands(in) == 1) {
             LLVMValueRef rv = LLVMGetOperand(in, 0);
+            int inlinable = FALSE;
             if (LLVMIsAConstantInt(rv) || LLVMIsUndef(rv) || LLVMIsPoison(rv)
-                || is_sym_call(rv)) {
+                || is_sym_call(rv))
+                inlinable = TRUE;
+            else if (LLVMIsAArgument(rv))
+                inlinable = (param_index(rv) >= 0);
+            else if (LLVMIsAInstruction(rv)) {
+                valinfo *ri = underlying(rv);
+                inlinable = (ri && ri->kind == VK_SLOT);
+            }
+            if (inlinable) {
                 blkinfo[i].ret_inline = rv;
                 if (LLVMIsAConstantInt(rv)) {
                     int32 c = const_int_value(rv);
@@ -1487,6 +2037,13 @@ static void block_analysis(void)
                 if (i > 0 && blkinfo[i].retconst >= 0)
                     blkinfo[i].emit_body = FALSE;
             }
+        }
+        else if (in && is_ret_phi(in)) {
+            /* Every edge returns its incoming value directly; nothing
+               ever jumps to the block itself. */
+            blkinfo[i].ret_phi = in;
+            if (i > 0)
+                blkinfo[i].emit_body = FALSE;
         }
     }
 }
@@ -1567,6 +2124,29 @@ static int coalesce_with_phi(valinfo *vi)
     return TRUE;
 }
 
+/* A phi one of whose incomings is a parameter with no other reader can
+   live in the parameter's own slot: the entry edge copy becomes an
+   elided self-copy (one instruction saved per call). Parameter slots
+   are never written by lowered code and never pooled, so with the
+   parameter's other reads ruled out no one can observe the overwrite. */
+static int phi_param_slot(LLVMValueRef phi)
+{
+    unsigned i, n = LLVMCountIncoming(phi);
+    for (i = 0; i < n; i++) {
+        LLVMValueRef v = LLVMGetIncomingValue(phi, i);
+        LLVMUseRef use;
+        int pi;
+        if (!LLVMIsAArgument(v)) continue;
+        pi = param_index(v);
+        if (pi < 0) continue;
+        for (use = LLVMGetFirstUse(v); use; use = LLVMGetNextUse(use))
+            if (LLVMGetUser(use) != phi) break;
+        if (use) continue;   /* some other reader of the parameter */
+        return pi + 1;
+    }
+    return 0;
+}
+
 static void assign_slots(void)
 {
     int p, s;
@@ -1581,7 +2161,11 @@ static void assign_slots(void)
         valinfo *vi = &vals[p];
         if (vi->kind != VK_SLOT) continue;
         if (LLVMIsAPHINode(vi->v)) {
-            vi->slot = next_slot++;
+            int pslot;
+            if (is_ret_phi(vi->v))
+                continue;   /* per-edge returns: never copied into or read */
+            pslot = phi_param_slot(vi->v);
+            vi->slot = pslot ? pslot : next_slot++;
             if (blkinfo[vi->blk].hazard) vi->scratch = next_slot++;
         }
         else if (vi->cross)
@@ -1725,6 +2309,7 @@ static void genop(int internal_number, int count,
     for (i = 0; i < count; i++)
         ai.operand[i] = ops[i];
     llvm_buffer_append_instruction(&ai);
+    n_emitted++;
     last_emit_noreturn =
         (glulx_opcode_flags(internal_number) & OPFLAG_RETURNS) != 0;
 }
@@ -1832,6 +2417,35 @@ static void gen_cond_branch(LLVMValueRef cond, int label, int invert)
         gen_branch1(invert ? jz_gc : jnz_gc, resolve(cond), label);
 }
 
+/* Emit a marked connective tree as chained short-circuit branches:
+   control transfers to label when the tree's value equals !invert, and
+   falls through otherwise. Leaves emit through gen_cond_branch. */
+static void emit_tree_branch(LLVMValueRef cond, int label, int invert,
+    LLVMValueRef term)
+{
+    LLVMValueRef a, b;
+    if (is_marked_tree_node(cond, term)) {
+        int k = tree_node_shape(cond, &a, &b);
+        if (k == TREE_NOT)
+            emit_tree_branch(a, label, !invert, term);
+        else if ((k == TREE_AND) != (invert != 0)) {
+            /* AND taken-if-true / OR taken-if-false: the first leg can
+               short-circuit past the branch. */
+            int skip = alloc_label();
+            emit_tree_branch(a, skip, k == TREE_AND, term);
+            emit_tree_branch(b, label, invert, term);
+            gen_label(skip);
+        }
+        else {
+            /* AND taken-if-false / OR taken-if-true: either leg decides. */
+            emit_tree_branch(a, label, invert, term);
+            emit_tree_branch(b, label, invert, term);
+        }
+        return;
+    }
+    gen_cond_branch(cond, label, invert);
+}
+
 static void emit_valued_op(LLVMValueRef in, assembly_operand dst);
 
 /* One phi's edge copy: a plain copy, or the folded computation itself. */
@@ -1905,9 +2519,15 @@ static void flush_stubs(void)
 {
     int i;
     for (i = 0; i < n_stubs; i++) {
+        blockinfo *sb = block_info(stubs[i].succ);
         gen_label(stubs[i].label);
-        emit_edge_copies(stubs[i].pred, stubs[i].succ);
-        gen_jump(block_info(stubs[i].succ)->label);
+        if (sb->ret_phi)
+            gen1(return_gc,
+                resolve(incoming_for(sb->ret_phi, stubs[i].pred)));
+        else {
+            emit_edge_copies(stubs[i].pred, stubs[i].succ);
+            gen_jump(sb->label);
+        }
     }
     n_stubs = 0;
 }
@@ -1919,6 +2539,10 @@ static void emit_goto(LLVMBasicBlockRef pred, LLVMBasicBlockRef succ,
     LLVMBasicBlockRef next_bb)
 {
     blockinfo *sb = block_info(succ);
+    if (sb->ret_phi) {
+        gen1(return_gc, resolve(incoming_for(sb->ret_phi, pred)));
+        return;
+    }
     if (sb->ret_inline && phi_count(succ) == 0) {
         gen1(return_gc, resolve(sb->ret_inline));
         return;
@@ -1942,6 +2566,14 @@ static void emit_icmp(LLVMValueRef in, valinfo *vi)
 }
 
 static assembly_operand deref_op(LLVMValueRef addr);
+
+/* The operand a folded store writes: its global or deref target. */
+static assembly_operand store_target_op(LLVMValueRef st)
+{
+    if (LLVMGetInstructionOpcode(st) == LLVMStore)
+        return global_op(LLVMGetOperand(st, 1));
+    return deref_op(LLVMGetOperand(st, 0));   /* i6.deref.store */
+}
 
 /* Emit a single-instruction computation with an explicit destination
    (used both for ordinary defs and for arms sunk into a select). */
@@ -2024,7 +2656,7 @@ static void emit_select(LLVMValueRef in, valinfo *vi)
         int arm = alloc_label();
         done = alloc_label();
         if (fvs) {
-            gen_cond_branch(cond, arm, TRUE);   /* to fv when false */
+            emit_tree_branch(cond, arm, TRUE, in);   /* to fv when false */
             if (tvs) emit_valued_op(tvs, slot_op(vi->slot));
             else gen_copy(resolve(LLVMGetOperand(in, 1)), slot_op(vi->slot));
             gen_jump(done);
@@ -2032,7 +2664,7 @@ static void emit_select(LLVMValueRef in, valinfo *vi)
             emit_valued_op(fvs, slot_op(vi->slot));
         }
         else {
-            gen_cond_branch(cond, arm, FALSE);  /* to tv when true */
+            emit_tree_branch(cond, arm, FALSE, in);  /* to tv when true */
             gen_copy(resolve(LLVMGetOperand(in, 2)), slot_op(vi->slot));
             gen_jump(done);
             gen_label(arm);
@@ -2044,12 +2676,12 @@ static void emit_select(LLVMValueRef in, valinfo *vi)
     done = alloc_label();
     if (select_swapped(in)) {
         gen_copy(resolve(LLVMGetOperand(in, 2)), slot_op(vi->slot));
-        gen_cond_branch(cond, done, TRUE);
+        emit_tree_branch(cond, done, TRUE, in);
         gen_copy(resolve(LLVMGetOperand(in, 1)), slot_op(vi->slot));
     }
     else {
         gen_copy(resolve(LLVMGetOperand(in, 1)), slot_op(vi->slot));
-        gen_cond_branch(cond, done, FALSE);
+        emit_tree_branch(cond, done, FALSE, in);
         gen_copy(resolve(LLVMGetOperand(in, 2)), slot_op(vi->slot));
     }
     gen_label(done);
@@ -2213,7 +2845,8 @@ static void emit_opaque_call(LLVMValueRef in, valinfo *vi, const char *name)
     for (i = 0; i < n_src; i++)
         ops[i] = resolve(LLVMGetOperand(in, i));
     if (flags & OPFLAG_STORE)
-        ops[n_src] = (vi->kind == VK_SLOT || vi->kind == VK_STACK)
+        ops[n_src] = vi->fold_store ? store_target_op(vi->fold_store)
+            : (vi->kind == VK_SLOT || vi->kind == VK_STACK)
             ? dst_op(vi)
             : mkop(ZEROCONSTANT_OT, 0);   /* discard */
     genop(opnum, opct, ops);
@@ -2226,6 +2859,16 @@ static void emit_instruction(LLVMValueRef in)
 
     if (vi && (vi->sunk_into || vi->edge_fold))
         return;   /* emitted inside its consumer(s) */
+
+    if (vi && vi->fold_store) {
+        /* The def writes its store's target directly; opaque opcode
+           calls handle the destination in emit_opaque_call instead. */
+        const char *name = (opc == LLVMCall) ? called_fn_name(in) : NULL;
+        if (!name || strcmp(name, "i6.deref") == 0) {
+            emit_valued_op(in, store_target_op(vi->fold_store));
+            return;
+        }
+    }
 
     switch (opc) {
     case LLVMAdd: case LLVMSub: case LLVMMul:
@@ -2289,6 +2932,8 @@ static void emit_instruction(LLVMValueRef in)
         gen_copy(global_op(LLVMGetOperand(in, 0)), dst_op(vi));
         return;
     case LLVMStore:
+        if (store_is_folded(in, 0))
+            return;   /* the value's def wrote the global itself */
         gen_copy(resolve(LLVMGetOperand(in, 0)),
             global_op(LLVMGetOperand(in, 1)));
         return;
@@ -2320,6 +2965,8 @@ static void emit_instruction(LLVMValueRef in)
                 return;
             }
             if (strcmp(name, "i6.deref.store") == 0) {
+                if (store_is_folded(in, 1))
+                    return;   /* the value's def wrote the target itself */
                 gen_copy(resolve(LLVMGetOperand(in, 1)),
                     deref_op(LLVMGetOperand(in, 0)));
                 return;
@@ -2340,6 +2987,40 @@ static void emit_terminator(LLVMValueRef term, LLVMBasicBlockRef cur,
     switch (LLVMGetInstructionOpcode(term)) {
 
     case LLVMRet:
+        {   LLVMValueRef fc = ret_fused_icmp(term);
+            LLVMValueRef sel = ret_fused_select(term);
+            if (fc) {
+                gen_branch2(pred_branch_opcode(LLVMGetICmpPredicate(fc)),
+                    resolve(LLVMGetOperand(fc, 0)),
+                    resolve(LLVMGetOperand(fc, 1)),
+                    -4);   /* "branch means return 1" */
+                gen1(return_gc, const_op(0));
+                return;
+            }
+            if (sel) {
+                LLVMValueRef cond = LLVMGetOperand(sel, 0);
+                LLVMValueRef tv = LLVMGetOperand(sel, 1);
+                LLVMValueRef fv = LLVMGetOperand(sel, 2);
+                int32 tc = LLVMIsAConstantInt(tv) ? const_int_value(tv) : -1;
+                int32 fc2 = LLVMIsAConstantInt(fv) ? const_int_value(fv) : -1;
+                if (LLVMIsAConstantInt(tv) && (tc == 0 || tc == 1)) {
+                    gen_cond_branch(cond, tc ? -4 : -3, FALSE);
+                    gen1(return_gc, resolve(fv));
+                }
+                else if (LLVMIsAConstantInt(fv) && (fc2 == 0 || fc2 == 1)) {
+                    gen_cond_branch(cond, fc2 ? -4 : -3, TRUE);
+                    gen1(return_gc, resolve(tv));
+                }
+                else {
+                    int l = alloc_label();
+                    gen_cond_branch(cond, l, TRUE);   /* false arm at l */
+                    gen1(return_gc, resolve(tv));
+                    gen_label(l);
+                    gen1(return_gc, resolve(fv));
+                }
+                return;
+            }
+        }
         gen1(return_gc, resolve(LLVMGetOperand(term, 0)));
         return;
 
@@ -2375,11 +3056,13 @@ static void emit_terminator(LLVMValueRef term, LLVMBasicBlockRef cur,
             if (then_bb == next_bb) {
                 /* Fall through into the then block instead of jumping
                    around an else-jump. */
-                gen_cond_branch(cond, edge_target_label(cur, else_bb), TRUE);
+                emit_tree_branch(cond, edge_target_label(cur, else_bb),
+                    TRUE, term);
                 emit_goto(cur, then_bb, n_stubs ? NULL : next_bb);
             }
             else {
-                gen_cond_branch(cond, edge_target_label(cur, then_bb), FALSE);
+                emit_tree_branch(cond, edge_target_label(cur, then_bb),
+                    FALSE, term);
                 /* If a stub is pending it is emitted right below, in the
                    fallthrough path — so the else edge must jump explicitly. */
                 emit_goto(cur, else_bb, n_stubs ? NULL : next_bb);
@@ -2497,6 +3180,8 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
             }
         }
     }
+    if (!lower_failed) ret_select_pass();
+    if (!lower_failed) branch_tree_pass();
     if (!lower_failed) {
         for (bb = LLVMGetFirstBasicBlock(fn); bb && !lower_failed;
              bb = LLVMGetNextBasicBlock(bb))
@@ -2505,6 +3190,7 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
                 validate(in);
     }
     if (!lower_failed) global_operand_pass();
+    if (!lower_failed) store_fold_pass();
     if (!lower_failed) sink_pass();
     if (!lower_failed) edge_fold_pass();
     if (!lower_failed) liveness_pass();
@@ -2530,6 +3216,11 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
         return FALSE;
     }
 
+    for (i = 0; i < llvm_event_count; i++)
+        if (!llvm_events[i].is_label)
+            llvm_lower_insts_in++;
+    n_emitted = 0;
+
     llvm_buffer_reset();
     for (i = 1; i < n_blocks; i++)
         blkinfo[i].label = alloc_label();
@@ -2552,6 +3243,8 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
                 emit_instruction(in);
         }
     }
+
+    llvm_lower_insts_out += n_emitted;
 
     my_free(&vals, "llvm lower values");
     my_free(&blkinfo, "llvm lower blocks");
