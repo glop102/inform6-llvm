@@ -23,9 +23,21 @@
 
   outputs = inputs@{ self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
-      (pkgs: {
+      (pkgs:
+        let
+          glulxe-counted = pkgs.glulxe.overrideAttrs (old: {
+            pname = "glulxe-counted";
+            patches = (old.patches or [ ]) ++ [
+              ./patches/glulxe-instruction-count.patch
+            ];
+            postInstall = (old.postInstall or "") + ''
+              mv "$out/bin/glulxe" "$out/bin/glulxe-counted"
+            '';
+          });
+        in {
         packages = {
           inherit (pkgs) cheapglk glulxe;
+          inherit glulxe-counted;
         };
 
         devShells.default = pkgs.mkShell {
@@ -47,6 +59,7 @@
 
             # Glulx interpreter for running compiled story files in tests
             pkgs.glulxe
+            glulxe-counted
           ];
 
           shellHook = ''
@@ -57,5 +70,5 @@
             echo "inform6lib: ${inputs.inform6lib}"
           '';
         };
-      }) (nixpkgs.legacyPackages.${system}.extend (import ./overlay.nix inputs)));
+        }) (nixpkgs.legacyPackages.${system}.extend (import ./overlay.nix inputs)));
 }

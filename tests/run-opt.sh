@@ -143,7 +143,60 @@ if [ "$fail" -eq 0 ] && ! grep -aq '^done\.$' "$tmpdir/llvm.log"; then
     fail=1
 fi
 
+if command -v glulxe-counted >/dev/null 2>&1; then
+    GLULXE_COUNTED=$(command -v glulxe-counted)
+elif [ -x "$ROOT/result-counted/bin/glulxe-counted" ]; then
+    GLULXE_COUNTED="$ROOT/result-counted/bin/glulxe-counted"
+elif [ "${REQUIRE_GLULXE_COUNTED:-0}" = 1 ]; then
+    echo "FAIL  opt (glulxe-counted is required but was not found)"
+    exit 1
+else
+    GLULXE_COUNTED=
+fi
+
+run_counted() {
+    local story=$1 count_log=$2 status line re
+    if timeout 30 "$GLULXE_COUNTED" "$story" </dev/null >/dev/null \
+            2>"$count_log"; then
+        :
+    else
+        status=$?
+        echo "FAIL  opt ($(basename "$story") counted interpreter exited $status)"
+        return 1
+    fi
+    re='^GLULXE_INSTRUCTION_COUNT=([0-9]+)$'
+    line=$(grep -aE "$re" "$count_log" || true)
+    if [ "$(grep -acE "$re" "$count_log")" -ne 1 ] || [[ ! $line =~ $re ]]; then
+        echo "FAIL  opt ($(basename "$story") has malformed dynamic count)"
+        return 1
+    fi
+    COUNTED_RESULT=${BASH_REMATCH[1]}
+}
+
+if [ -n "$GLULXE_COUNTED" ]; then
+    COUNTED_RESULT=0
+    if run_counted "$tmpdir/opt.classic.ulx" "$tmpdir/classic.count"; then
+        classic_count=$COUNTED_RESULT
+    else
+        fail=1
+    fi
+    if run_counted "$tmpdir/opt.llvm.ulx" "$tmpdir/llvm.count"; then
+        llvm_count=$COUNTED_RESULT
+    else
+        fail=1
+    fi
+    if [ "$fail" -eq 0 ] &&
+       { [ "$classic_count" -ne 131 ] || [ "$llvm_count" -gt 142 ]; }; then
+        echo "FAIL  opt (dynamic instruction bound: classic $classic_count, LLVM $llvm_count)"
+        fail=1
+    fi
+fi
+
 if [ "$fail" -eq 0 ]; then
-    echo "ok    opt"
+    if [ -n "$GLULXE_COUNTED" ]; then
+        echo "ok    opt (dynamic: classic $classic_count, LLVM $llvm_count)"
+    else
+        echo "ok    opt (dynamic counts skipped without glulxe-counted)"
+    fi
 fi
 exit "$fail"

@@ -1,0 +1,74 @@
+diff --git a/exec.c b/exec.c
+index f2bbf68..dad9c36 100644
+--- a/exec.c
++++ b/exec.c
+@@ -90,6 +90,7 @@ void execute_loop()
+     /* Based on the oplist structure, load the actual operand values
+        into inst. This moves the PC up to the end of the instruction. */
+     parse_operands(inst, oplist);
++    glulx_dispatched_instruction_count++;
+ 
+     /* Perform the opcode. This switch statement is split in two, based
+        on some paranoid suspicions about the ability of compilers to
+diff --git a/glulxe.h b/glulxe.h
+index bb7a296..8dc2b66 100644
+--- a/glulxe.h
++++ b/glulxe.h
+@@ -167,6 +167,7 @@ typedef struct operandlist_struct {
+ /* Some useful globals */
+ 
+ extern int vm_exited_cleanly;
++extern uint64_t glulx_dispatched_instruction_count;
+ extern strid_t gamefile;
+ extern glui32 gamefile_start, gamefile_len;
+ extern char *init_err, *init_err2;
+diff --git a/main.c b/main.c
+index 5a99872..74cc49a 100644
+--- a/main.c
++++ b/main.c
+@@ -3,9 +3,25 @@
+     http://eblong.com/zarf/glulx/index.html
+ */
+ 
++#include <inttypes.h>
++#include <stdio.h>
++#include <stdlib.h>
++
+ #include "glk.h"
+ #include "glulxe.h"
+ 
++uint64_t glulx_dispatched_instruction_count = 0;
++static int report_instruction_count = FALSE;
++
++static void report_dispatched_instruction_count(void)
++{
++  if (report_instruction_count) {
++    fprintf(stderr, "GLULXE_INSTRUCTION_COUNT=%" PRIu64 "\n",
++      glulx_dispatched_instruction_count);
++    fflush(stderr);
++  }
++}
++
+ int vm_exited_cleanly = TRUE;
+ strid_t gamefile = NULL; /* The stream containing the Glulx file. */
+ glui32 gamefile_start = 0; /* The position within the stream. (This will not 
+@@ -65,6 +81,10 @@ void glk_main()
+   }
+ 
+   setup_vm();
++  glulx_dispatched_instruction_count = 0;
++  if (atexit(report_dispatched_instruction_count) != 0)
++    fatal_error("Unable to register instruction count reporter.");
++  report_instruction_count = TRUE;
+   if (library_autorestore_hook)
+     library_autorestore_hook();
+   execute_loop();
+@@ -120,6 +140,8 @@ static winid_t get_error_win()
+ */
+ void fatal_error_handler(char *str, char *arg, int useval, glsi32 val)
+ {
++  report_instruction_count = FALSE;
++
+   winid_t win;
+ 
+   /* If the debugger is compiled in, send the error message to the debug

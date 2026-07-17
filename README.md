@@ -18,6 +18,12 @@ nix develop
 make
 ```
 
+The devshell also provides `glulxe` for behavioral tests and
+`glulxe-counted`, a separately patched reference interpreter which reports
+`GLULXE_INSTRUCTION_COUNT=<n>` on stderr. `make bench` uses it to report
+deterministic classic-versus-LLVM dynamic instruction totals alongside timing
+medians. Set `BENCH_RUNS` to change the default five timing runs.
+
 LLVM is optional: the Makefile detects it via `llvm-config` and, when it
 isn't found (or with `make WITH_LLVM=0`), builds `src/llvm_stub.c` in
 place of the pipeline. A stub build compiles everything classically —
