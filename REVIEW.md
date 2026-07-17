@@ -1,53 +1,126 @@
 # LLVM Pipeline Review
 
 This review treats dynamically dispatched Glulx instruction count as the
-primary performance metric. Benchmarking indicates that runtime across the
-interpreters tested tracks instruction count approximately 1:1, so native-code
-assumptions such as preferring simpler instructions, speculative execution, or
-register-like copies do not apply. Every additional VM instruction incurs a
-fetch/decode/dispatch cycle.
+primary performance metric, but not the whole cost model. Every additional VM
+instruction incurs a fetch/decode/dispatch cycle, and count has been the best
+predictor of interpreter performance observed so far. Individual opcode
+handlers, operand modes, memory behavior, Glk calls, host branch prediction,
+and accelerated routines nevertheless have different costs. Instruction count
+should therefore dominate optimization decisions without being treated as a
+perfectly weighted runtime estimate.
 
 The pipeline already reflects this model in several important places,
 particularly stack fusion, direct global operands, phi coalescing, select-arm
 sinking, connective-tree reconstruction, and the decision not to run
-`loop-rotate`. The largest immediate weakness is not a missing optimization,
-but the lack of tests which prove that these transformations continue to
-reduce dispatched instructions.
+`loop-rotate`. The focused regression gate now protects representative forms;
+the largest measured optimization gap is the additional 1,402,512 dynamic
+instructions in the LLVM Life build.
+
+## Measured Performance Model
+
+The patched `glulxe-counted` interpreter increments a 64-bit counter after an
+opcode and its operands have been decoded and immediately before its handler is
+dispatched. It counts every successfully decoded Glulx instruction executed in
+called routines and across VM restarts. It does not count interpreter
+bookkeeping, work within an opcode handler as separate operations, or native C
+work performed by accelerated routines.
+
+The current Life benchmark executes:
+
+```text
+classic: 56,177,197 instructions
+LLVM:    57,579,709 instructions (+2.50%)
+```
+
+After alternating execution order, one five-run sample measured medians of
+932 ms classic and 941 ms LLVM. This points in the expected direction, but the
+timing delta is not exactly proportional to instruction count and individual
+samples remain noisy. Deterministic dispatch totals are the preferred
+regression gate; repeated timing medians remain an important secondary check
+for changes in opcode mix or other costs which the unweighted counter misses.
+
+Static emitted counts are less predictive than dynamic counts because cold
+blocks and hot loops are weighted equally. They remain useful for isolated
+microfixtures and explaining where a transformation added bytecode.
+
+## Next Investigation: Opcode Costs
+
+The next priority is to explain the Life benchmark's additional 1,402,512
+dispatches and determine how much the opcode mix affects runtime. Total dynamic
+count shows that a regression exists, but not whether LLVM added copies,
+branches, arithmetic, address calculations, or expensive VM operations.
+
+Extend `glulxe-counted` with an optional per-opcode histogram. The normal
+machine-readable output should include the total plus one count for every
+executed opcode, allowing classic and LLVM runs to be compared directly. Keep
+histogram collection optional so the simplest total-count path remains cheap
+and stable.
+
+The histogram is also the prerequisite for a weighted interpreter cost model.
+Per-opcode costs should be measured rather than guessed:
+
+1. Construct controlled Glulx loops dominated by one opcode family.
+2. Run enough iterations to separate handler cost from timer noise and fixed
+   startup/loop overhead.
+3. Measure important operand modes separately where decoding or memory access
+   differs, such as constants, locals, globals, stack operands, and RAM
+   dereferences.
+4. Repeat across the interpreters used for project benchmarks; do not assume
+   that one interpreter's opcode weights transfer to another.
+5. Fit or validate a simple weighted sum against whole-program timings before
+   using it for optimization decisions.
+
+The expected outcome is a hierarchy of metrics:
+
+- Dynamic total: deterministic primary regression signal.
+- Opcode histogram: identifies what kind of interpreted work changed.
+- Weighted dynamic cost: estimates runtime when opcode mixes differ.
+- Repeated wall-clock timing: validates that the model predicts real execution.
+
+After opcode-level attribution, add routine or PC-range profiling to identify
+where the extra operations execute. This requires routine boundaries from the
+compiler or story metadata, but would turn a whole-program delta into a ranked
+list of optimization targets.
+
+Benchmark output should eventually have a machine-readable JSON or TSV mode
+recording compiler revision, LLVM and interpreter versions, optimized/captured
+routine counts, static instructions, opcode histogram, weighted cost, dynamic
+total, story size, and timing samples. This will make comparisons across
+commits and LLVM upgrades reproducible.
 
 ## First Priority: Optimization Tests
 
-The current tests provide useful behavioral coverage but almost no
-optimization-quality regression coverage.
+The initial review found useful behavioral coverage but almost no
+optimization-quality regression coverage. The first test-suite work has since
+addressed the most serious harness gaps:
 
 - `tests/run-m1.sh` proves that capture/replay remains byte-identical.
+- `tests/run-opt.sh` requires a real LLVM build in strict mode, asserts that a
+  focused fixture lifts and lowers completely, and enforces aggregate,
+  per-routine static, and dynamic instruction ceilings.
 - `tests/run-m3.sh` compares classic and optimized interpreter transcripts.
-- `tests/run-life.sh` provides one useful wall-clock benchmark.
-- Compiler optimization statistics are redirected to `/dev/null` by the test
-  scripts.
-- No test asserts that a routine was successfully lifted or lowered.
-- No test asserts an instruction-count ceiling for a specific transformation.
-- The Life benchmark reports one timing and applies no performance threshold.
-- The ordinary transcript tests do not check the exit status from `timeout` or
-  the interpreter, so matching crashes or timeouts can potentially pass.
+- `tests/run-life.sh` alternates execution order, reports timing median/min/max,
+  and reports deterministic dynamic instruction totals.
+- Interpreter and timeout statuses are checked explicitly.
+- The `glulxercise` gate asserts the exact count of known layout-sensitive
+  failures rather than accepting an unlimited substring match.
+- Level 3 compiler output includes per-routine captured/emitted static counts.
 - The real LLVM pipeline is not exercised by CI; the Windows build uses the
   no-LLVM stub.
 - Missing `glulxe` causes the behavioral and benchmark scripts to exit
   successfully without testing anything. Missing Inform library files also
   turn the Cloak checks into successful skips.
-- `tests/run-m1.sh` is described in `DESIGN.md` as a gate for both targets, but
-  all of its fixtures are compiled with `-G`, so it exercises only Glulx.
-- The `glulxercise` gate filters every failure line containing `token=` or
-  `jumpabs test=` rather than asserting an exact expected set. A new failure
-  containing either substring could be hidden.
+- `tests/run-m1.sh` exercises only Glulx; there is no Z-machine baseline for
+  assembler changes shared with the capture seam.
 
-A regression which causes every routine to fall back to classic codegen could
-therefore pass most tests. A regression which adds one instruction to a hot
-loop can also pass while materially reducing performance.
+The focused fixture detects complete fallback and its current hot-path count
+regressions. Broader fixtures still need coverage assertions so corpus routines
+cannot silently stop optimizing.
 
 ### Recommended Test Gate
 
-Add a small optimization-specific suite which compiles known-liftable routines
-with LLVM diagnostics enabled and checks all of the following:
+The focused optimization suite now compiles known-liftable routines with LLVM
+diagnostics enabled and checks all of the following:
 
 1. Compilation succeeds with the real LLVM implementation, not
    `src/llvm_stub.c`.
@@ -59,10 +132,9 @@ with LLVM diagnostics enabled and checks all of the following:
 6. Hot-loop fixtures remain below a weighted or measured dynamic instruction
    ceiling, not merely a whole-routine static count.
 
-The compiler currently reports only aggregate input and output counts at
-`src/llvm_codegen.c:1082-1089`. Tests would be more useful if level 3 output
-also included per-routine captured and emitted counts in a stable,
-machine-readable format.
+The compiler reports aggregate and per-routine input/output counts. A future
+dedicated machine-readable diagnostics mode would be less brittle than parsing
+human-facing level 3 output, especially for corpus-scale result collection.
 
 The aggregate counters include only successfully lowered routines. If a
 routine which previously optimized starts falling back, both its input and
@@ -120,10 +192,9 @@ accepts some static expansion to remove instructions from frequently executed
 paths. Loop depth, branch likelihood, or interpreter-level instruction
 instrumentation is needed to estimate dynamic cost.
 
-For the Life benchmark, run each version multiple times and compare medians.
-Record both elapsed time and interpreter instruction count where the
-interpreter exposes it. A performance gate should tolerate normal timing noise
-but fail a sustained instruction-count regression.
+The Life benchmark now runs each version multiple times, compares medians, and
+records dynamic instruction count. It reports rather than gates its Life count
+delta while the current `+2.50%` difference is being investigated.
 
 ## Correctness Findings
 
@@ -363,14 +434,9 @@ gains on additional VM dispatches.
 
 ## Documentation and Maintenance Notes
 
-- `DESIGN.md` says the M1 identity gate covers both targets, while the script
-  currently tests only Glulx.
-- The design's earlier recommendation that optimization remain off by default
-  conflicts with the current default LLVM level of 2.
-- The `glulxercise` catch-token explanation still says there is one local slot
-  per SSA value, predating slot reuse.
-- README M5 and corpus-validation work remains open, and the TODO wording still
-  refers to M4 coverage after M4 is marked complete.
+- The M1 identity script currently tests only Glulx.
+- Corpus-scale dual compilation, behavioral comparison, code-size measurement,
+  and dynamic-instruction reporting remain open.
 - Compile-time `lookup()` scans remain quadratic in routine size. This does not
   affect interpreted instruction count, but should be measured if larger
   corpus testing exposes compiler-time problems.
@@ -390,19 +456,22 @@ whose performance behavior is currently unguarded.
 
 ## Recommended Order of Work
 
-1. Add an LLVM-required optimization test suite with per-routine count output,
-   successful-lowering assertions, and interpreter exit checks.
-2. Add focused regression fixtures for switches, phi stubs, select returns,
+1. Add optional opcode histograms to `glulxe-counted` and compare the classic
+   and LLVM Life instruction mixes.
+2. Measure per-opcode and important operand-mode costs, then validate a
+   weighted model against repeated whole-program timings.
+3. Add routine or PC-range attribution for the extra Life dispatches.
+4. Add focused regression fixtures for switches, phi stubs, select returns,
    division canonicalization, and LICM.
-3. Put the real LLVM build and optimization suite in Linux CI.
-4. Disable unsafe optimization in the presence of `jumpabs` and correct the
+5. Put the real LLVM build and strict optimization suite in Linux CI.
+6. Disable unsafe optimization in the presence of `jumpabs` and correct the
    removable-read attributes.
-5. Fix the demonstrated instruction-count regressions, beginning with switch
+7. Fix the demonstrated instruction-count regressions, beginning with switch
    ordering and phi-stub fallthrough.
-6. Develop a CFG-weighted dynamic profitability estimate before making
-   routine replacement conditional on cost.
+8. Develop a CFG-weighted profitability estimate before making routine
+   replacement conditional on cost.
 
-At the time of review, `make test` passed all existing tests. One `make bench`
-run reported 902 ms for classic output and 854 ms for LLVM output. These values
-are useful as a smoke test but are not statistically sufficient to establish a
-performance threshold.
+The initial optimization-test and dynamic-count infrastructure described above
+was added after this review. `make test`, the strict count gate, the patched
+interpreter build, and the repeated benchmark all passed at the time of the
+update.

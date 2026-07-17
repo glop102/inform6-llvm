@@ -3,7 +3,8 @@
 An Inform 6 compiler with an LLVM-based code generator for the Glulx target.
 Instead of encoding bytecode directly as it parses, routines are lifted to
 LLVM IR, run through LLVM's optimization passes, and lowered back to Glulx
-bytecode. See [DESIGN.md](DESIGN.md) for the architecture and milestones.
+bytecode. LLVM is used as a mid-level optimizer; the result remains a normal
+Glulx story file interpreted by existing VMs.
 
 A fork of the upstream
 [Inform 6 compiler](https://github.com/DavidKinder/Inform6), with the
@@ -51,36 +52,52 @@ default, `$LLVM=2`, is the full pipeline; `$LLVM=3` additionally dumps
 each routine's IR before and after optimization and reports routines the
 pipeline could not handle.
 
+## Architecture
+
+Inform's front end emits `assembly_instruction` records directly to the
+classic assembler. In Glulx mode this fork intercepts that assembler boundary
+and records each routine as instruction and label events. At routine end:
+
+1. `src/llvm_codegen.c` lifts the captured stream into one LLVM `i32` function.
+2. LLVM runs `mem2reg`, `instcombine`, `simplifycfg`, `reassociate`, LICM, GVN,
+   DCE, and a final CFG simplification.
+3. `src/llvm_lower.c` validates the optimized shape, assigns Glulx
+   representations, and lowers it back into the capture buffer.
+4. `src/asm.c` replays either the optimized or original stream through the
+   classic encoder, preserving branch shortening, labels, and backpatching.
+
+Unsupported routines fall back independently to classic code generation. The
+Z-machine target always uses the classic path.
+
+Locals begin as LLVM allocas and are promoted by `mem2reg`; Glulx branches form
+the CFG, VM-stack values crossing joins become phis, globals become external
+`i32` globals, and backpatchable symbols remain opaque `i6.sym` calls. Calls,
+Glk, stream operations, and most memory operations remain opaque where LLVM
+cannot safely model VM effects. Division and shifts are lifted directly only
+when their LLVM semantics match Glulx.
+
+The lowerer is designed around interpreter costs rather than native register
+allocation. Values can resolve directly as global operands, ride the VM stack
+when consumed once in LIFO order, or occupy reusable local slots. It also
+coalesces phis, sinks speculated select arms, reconstructs short-circuit
+conditions, folds stores and returns, and shapes branches for Glulx encodings.
+`loop-rotate` is deliberately excluded because it increased dynamic work in
+benchmarks.
+
 ## Status
 
-- **M1 (done):** with `$LLVM=1`, every routine's instruction stream is
-  captured and replayed through the classic encoder — output is
-  byte-identical to upstream. This proves the interception seam.
-- **M2 (done):** each routine is lifted to verified LLVM IR (~67% of a
-  full library game lifts; the rest fall back).
-- **M3 (done):** full round trip. Lifted routines are optimized by LLVM
-  (`mem2reg`, `instcombine`, `simplifycfg`, `reassociate`, `gvn`, `dce`)
-  and lowered back to Glulx bytecode; anything the lowerer can't handle
-  falls back to the classic encoding per routine. On Cloak of Darkness,
-  360 of 548 routines come out optimized and the interpreter transcript
-  is identical to the classic build's.
-- **M4 (done):** lowering quality and coverage. The interpreter's cost
-  model is instructions dispatched, so the lowerer now assigns each SSA
-  value the cheapest representation that is still correct: direct global
-  operands, single-use values riding the VM stack, slot reuse with
-  liveness, phi coalescing, select-arm sinking (un-speculating what
-  instcombine speculated), and branch/return/switch shaping. `make bench`
-  (Game of Life) went from ~30% slower to parity with classic. The lifter
-  also models VM-stack values crossing branches as phis, and every
-  lower-bail cause found so far is fixed: on Cloak of Darkness 412 of 548
-  routines come out optimized (was 360), and everything that lifts now
-  lowers. Most of the rest are the stack-vararg infglk wrappers, which
-  are a permanent (and harmless) fallback. See [DESIGN.md](DESIGN.md).
-- **M5 (next):** validation at scale — compile a real corpus both ways,
-  compare interpreter transcripts, measure code size and instruction
-  counts.
+The full lift/optimize/lower pipeline is enabled by default and has focused
+behavioral, compliance, static instruction, and dynamic instruction-count
+tests. Unsupported instructions, fixed resource limits, debug output, traced
+routines, or unfamiliar post-LLVM shapes can cause per-routine fallback.
 
-See [DESIGN.md](DESIGN.md) for the full milestone definitions.
+Dynamic dispatch count is the primary performance signal, but it is not a
+complete cost model. Opcode handlers, operand modes, memory behavior, Glk work,
+host branch prediction, and accelerated routines have different costs.
+Deterministic dispatch totals are used as the main regression signal and are
+reported alongside repeated wall-clock timings. See [REVIEW.md](REVIEW.md) for
+current measurements, detailed findings, known limitations, and the
+optimization roadmap.
 
 ## Tests
 
@@ -90,10 +107,13 @@ make bench        # run the Game of Life benchmark (tests/run-life.sh)
 make clean-tests  # remove test artifacts (.ulx, logs, IR dumps)
 ```
 
-`run-m1.sh` checks that `$LLVM=1` (capture/replay) output is
-byte-identical to classic output. `run-m3.sh` compiles each test both
-ways, runs both story files under glulxe (provided by the devshell), and
-requires identical transcripts.
+`run-m1.sh` checks that `$LLVM=1` capture/replay output is byte-identical to
+classic Glulx output. `run-opt.sh` requires complete lowering of a focused
+fixture and enforces aggregate, per-routine static, and optional dynamic
+instruction ceilings. Set `REQUIRE_LLVM=1`, `REQUIRE_GLULXE=1`, and
+`REQUIRE_GLULXE_COUNTED=1` for a strict environment. `run-m3.sh` compiles each
+test both ways, runs both stories under `glulxe`, and requires identical
+behavior.
 
 Two compliance tests exercise the API surface beyond ordinary game code:
 
@@ -104,18 +124,18 @@ Two compliance tests exercise the API surface beyond ordinary game code:
 - `glulxercise.inf` is Andrew Plotkin's Glulx interpreter unit test
   (public domain, from <https://eblong.com/zarf/glulx/>), driven by
   `glulxercise.walk`. It is self-checking, so instead of a transcript
-  diff the classic build must pass every check and the LLVM build may
-  fail only the known layout-sensitive ones (`@catch` tokens are stack
-  addresses; `jumpabs` into another routine's body) — see the comment
-  in `run-m3.sh`.
+  diff the classic build must pass every check and the LLVM build may fail only
+  the exact known layout-sensitive checks documented in `run-m3.sh` and
+  [REVIEW.md](REVIEW.md).
 
 `life.inf` is a Game of Life benchmark: 500 generations on a 64x48
 torus, self-timed via `glk_current_time`. On an interpreter with Glk
-graphics (Gargoyle, WinGlulxe, ...) it draws each cell as a filled
-square in a graphics window; under the headless CheapGlk glulxe it
-falls back to text rendering. `run-life.sh` (also `make bench`)
-compiles it both ways, requires identical simulation output (transcripts
-minus the timing line), and reports each build's run time.
+graphics (Gargoyle, WinGlulxe, ...) it draws each cell as a filled square in a
+graphics window; under the headless CheapGlk glulxe it falls back to text
+rendering. `run-life.sh` (also `make bench`) compiles it both ways, requires
+identical simulation output, alternates execution order, and reports timing
+median, minimum, maximum, and dynamic instruction totals. It runs each version
+five times by default; set `BENCH_RUNS` to change this.
 
 `cloak.inf` (a full library game) needs the Inform 6 standard library.
 Inside the devshell it is provided automatically (the `inform6lib-src`
@@ -138,7 +158,14 @@ default language include is capitalized "English", while the library ships
   and gate on behavior, replacing the bespoke `cloak.inf` + `tests/lib`
   setup. The small local tests (`hello`, `torture`, `m3`, `veneer`,
   `glulxercise`) stay as quick gates.
-- M4 coverage work and M5 validation at scale — see [Status](#status)
-  and [DESIGN.md](DESIGN.md).
+- Add Linux CI which requires the real LLVM pipeline, `glulxe`, and
+  `glulxe-counted` instead of permitting local dependency skips.
+- Use dynamic counts to reduce interpreted work in the optimization benchmark;
+  see [REVIEW.md](REVIEW.md) for current measurements and candidate causes.
+- Validate a larger game corpus both ways, recording behavior, optimization
+  coverage, story size, static instructions, and dynamic instructions.
+- Resolve the correctness and LLVM-effect-model findings in the review.
+- Consider typed memory and fuller Glk modeling only after corpus validation
+  shows that the additional optimization scope is worthwhile.
 - Consider lifting custom `@"..."` opcodes as opaque operations instead
   of bailing the whole routine (low priority; rare outside test suites).

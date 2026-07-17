@@ -21,11 +21,10 @@
 /*                                                                           */
 /*   Any construct the lifter doesn't handle makes the routine "bail":       */
 /*   the IR is discarded and asm.c replays the capture buffer through the    */
-/*   classic encoder instead. The compiler is never wrong, only sometimes    */
-/*   unoptimized.                                                            */
+/*   classic encoder instead.                                                */
 /*                                                                           */
-/*   Milestone M3: lifted routines are run through LLVM's optimization       */
-/*   passes and lowered back to Glulx by llvm_lower.c, which rewrites the    */
+/*   Lifted routines run through LLVM's optimization passes and are lowered  */
+/*   back to Glulx by llvm_lower.c, which rewrites the                        */
 /*   capture buffer with the optimized instruction stream. Whichever         */
 /*   stream the buffer ends up holding, asm.c replays it through the         */
 /*   classic encoder, so llvm_pipeline_routine() always returns FALSE.       */
