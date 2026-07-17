@@ -2504,72 +2504,145 @@ static void emit_edge_copies(LLVMBasicBlockRef pred, LLVMBasicBlockRef succ)
             slot_op(lookup(phi)->slot));
 }
 
-/* Label to branch to for the edge pred->succ: the successor itself if the
-   edge carries no phi copies (with lone ret 0/ret 1 successors reached
-   through the -3/-4 "branch means return" encodings), else a fresh stub
-   (recorded for flushing after the terminator) that performs the copies
-   and jumps on. */
-typedef struct edgestub_s {
-    int label;
-    LLVMBasicBlockRef pred, succ;
-} edgestub;
+typedef enum edgekind_e {
+    EDGE_UNUSED,
+    EDGE_DIRECT,
+    EDGE_FALLTHROUGH,
+    EDGE_PHI_STUB,
+    EDGE_INLINE_RETURN
+} edgekind;
 
-static edgestub stubs[MAX_STUBS];
-static int n_stubs;
+typedef struct edgeplan_s {
+    LLVMBasicBlockRef succ;
+    edgekind kind;
+    int copy_phis;
+    int target_label;
+    LLVMValueRef return_value;
+    int stub_label;
+    int queue_order;
+} edgeplan;
 
-static int edge_target_label(LLVMBasicBlockRef pred, LLVMBasicBlockRef succ)
+typedef enum controlkind_e {
+    CONTROL_OTHER,
+    CONTROL_GOTO,
+    CONTROL_COND,
+    CONTROL_SWITCH
+} controlkind;
+
+typedef struct emitblock_s {
+    int bi;
+    LLVMValueRef term;
+    edgeplan *edges;
+    int n_edges;
+    controlkind control;
+    int goto_edge;
+    int branch_edge;
+    int branch_invert;
+    int switch_fallthrough;
+    int n_queued;
+} emitblock;
+
+typedef struct emitplan_s {
+    emitblock *blocks;
+    edgeplan *edges;
+    int n_blocks;
+} emitplan;
+
+/* Plan an edge used as a conditional or switch target. Phi copies require a
+   stub; no-phi return constants use Glulx's special branch-return labels. */
+static void plan_target_edge(edgeplan *ep, LLVMBasicBlockRef pred)
 {
-    blockinfo *sb = block_info(succ);
-    if (phi_count(succ) == 0) {
-        if (sb->retconst == 0) return -3;
-        if (sb->retconst == 1) return -4;
-        return sb->label;
+    blockinfo *sb = block_info(ep->succ);
+    if (phi_count(ep->succ) != 0) {
+        ep->kind = EDGE_PHI_STUB;
+        ep->target_label = sb->label;
+        if (sb->ret_phi)
+            ep->return_value = incoming_for(sb->ret_phi, pred);
+        return;
     }
-    if (n_stubs >= MAX_STUBS) {
-        compiler_error("llvm_lower: stub overflow");
-        return sb->label;
-    }
-    stubs[n_stubs].label = alloc_label();
-    stubs[n_stubs].pred = pred;
-    stubs[n_stubs].succ = succ;
-    return stubs[n_stubs++].label;
+    ep->kind = EDGE_DIRECT;
+    if (sb->retconst == 0) ep->target_label = -3;
+    else if (sb->retconst == 1) ep->target_label = -4;
+    else ep->target_label = sb->label;
 }
 
-static void flush_stubs(void)
+/* Plan an edge emitted as the non-targeted side of a terminator. */
+static void plan_goto_edge(edgeplan *ep, LLVMBasicBlockRef pred,
+    LLVMBasicBlockRef next_bb, int force_jump)
 {
-    int i;
-    for (i = 0; i < n_stubs; i++) {
-        blockinfo *sb = block_info(stubs[i].succ);
-        gen_label(stubs[i].label);
-        if (sb->ret_phi)
-            gen1(return_gc,
-                resolve(incoming_for(sb->ret_phi, stubs[i].pred)));
-        else {
-            emit_edge_copies(stubs[i].pred, stubs[i].succ);
-            gen_jump(sb->label);
+    blockinfo *sb = block_info(ep->succ);
+    if (sb->ret_phi) {
+        ep->kind = EDGE_INLINE_RETURN;
+        ep->return_value = incoming_for(sb->ret_phi, pred);
+        return;
+    }
+    if (sb->ret_inline && phi_count(ep->succ) == 0) {
+        ep->kind = EDGE_INLINE_RETURN;
+        ep->return_value = sb->ret_inline;
+        return;
+    }
+    ep->copy_phis = phi_count(ep->succ) != 0;
+    if (!force_jump && ep->succ == next_bb)
+        ep->kind = EDGE_FALLTHROUGH;
+    else {
+        ep->kind = EDGE_DIRECT;
+        ep->target_label = sb->label;
+    }
+}
+
+/* Stub labels stay lazy so labels allocated by instruction selection retain
+   their existing numbers relative to control-flow labels. */
+static int planned_target_label(emitblock *bp, int edge)
+{
+    edgeplan *ep = &bp->edges[edge];
+    if (ep->kind == EDGE_DIRECT) return ep->target_label;
+    if (ep->kind == EDGE_PHI_STUB) {
+        if (ep->queue_order < 0) {
+            ep->stub_label = alloc_label();
+            ep->queue_order = bp->n_queued++;
+        }
+        return ep->stub_label;
+    }
+    compiler_error("llvm_lower: planned edge is not a branch target");
+    return ep->target_label;
+}
+
+static void emit_planned_edge(edgeplan *ep, LLVMBasicBlockRef pred)
+{
+    switch (ep->kind) {
+    case EDGE_INLINE_RETURN:
+        gen1(return_gc, resolve(ep->return_value));
+        return;
+    case EDGE_FALLTHROUGH:
+        if (ep->copy_phis) emit_edge_copies(pred, ep->succ);
+        return;
+    case EDGE_DIRECT:
+        if (ep->copy_phis) emit_edge_copies(pred, ep->succ);
+        gen_jump(ep->target_label);
+        return;
+    default:
+        compiler_error("llvm_lower: planned edge cannot be emitted as goto");
+        return;
+    }
+}
+
+static void flush_planned_stubs(emitblock *bp, LLVMBasicBlockRef pred)
+{
+    int order, i;
+    for (order = 0; order < bp->n_queued; order++) {
+        for (i = 0; i < bp->n_edges; i++) {
+            edgeplan *ep = &bp->edges[i];
+            if (ep->queue_order != order) continue;
+            gen_label(ep->stub_label);
+            if (ep->return_value)
+                gen1(return_gc, resolve(ep->return_value));
+            else {
+                emit_edge_copies(pred, ep->succ);
+                gen_jump(ep->target_label);
+            }
+            break;
         }
     }
-    n_stubs = 0;
-}
-
-/* An unconditional transfer to succ: a lone "ret <constant>" successor is
-   inlined; otherwise edge copies, then a jump unless succ is the next
-   emitted block in layout order. */
-static void emit_goto(LLVMBasicBlockRef pred, LLVMBasicBlockRef succ,
-    LLVMBasicBlockRef next_bb)
-{
-    blockinfo *sb = block_info(succ);
-    if (sb->ret_phi) {
-        gen1(return_gc, resolve(incoming_for(sb->ret_phi, pred)));
-        return;
-    }
-    if (sb->ret_inline && phi_count(succ) == 0) {
-        gen1(return_gc, resolve(sb->ret_inline));
-        return;
-    }
-    emit_edge_copies(pred, succ);
-    if (succ != next_bb)
-        gen_jump(sb->label);
 }
 
 /* ---- individual instruction emission ------------------------------------ */
@@ -3001,8 +3074,98 @@ static void emit_instruction(LLVMValueRef in)
     }
 }
 
+static void plan_terminator(emitblock *bp, LLVMBasicBlockRef next_bb)
+{
+    LLVMValueRef term = bp->term;
+    int i;
+
+    bp->control = CONTROL_OTHER;
+    bp->goto_edge = -1;
+    bp->branch_edge = -1;
+    bp->switch_fallthrough = -1;
+    for (i = 0; i < bp->n_edges; i++) {
+        bp->edges[i].succ = LLVMGetSuccessor(term, i);
+        bp->edges[i].kind = EDGE_UNUSED;
+        bp->edges[i].stub_label = -1;
+        bp->edges[i].queue_order = -1;
+    }
+
+    if (LLVMGetInstructionOpcode(term) == LLVMBr) {
+        LLVMBasicBlockRef cur = LLVMGetInstructionParent(term);
+        if (!LLVMIsConditional(term)) {
+            bp->control = CONTROL_GOTO;
+            bp->goto_edge = 0;
+            plan_goto_edge(&bp->edges[0], cur, next_bb, FALSE);
+            return;
+        }
+        {   LLVMValueRef cond = LLVMGetCondition(term);
+            LLVMBasicBlockRef then_bb = bp->edges[0].succ;
+            LLVMBasicBlockRef else_bb = bp->edges[1].succ;
+            if (then_bb == else_bb || LLVMIsAConstantInt(cond)
+                || LLVMIsUndef(cond) || LLVMIsPoison(cond)) {
+                int selected = 0;
+                if (then_bb != else_bb
+                    && !(LLVMIsAConstantInt(cond)
+                         && (const_int_value(cond) & 1)))
+                    selected = 1;
+                bp->control = CONTROL_GOTO;
+                bp->goto_edge = selected;
+                plan_goto_edge(&bp->edges[selected], cur, next_bb, FALSE);
+                return;
+            }
+            bp->control = CONTROL_COND;
+            if (then_bb == next_bb) {
+                bp->branch_edge = 1;
+                bp->goto_edge = 0;
+                bp->branch_invert = TRUE;
+            }
+            else {
+                bp->branch_edge = 0;
+                bp->goto_edge = 1;
+                bp->branch_invert = FALSE;
+            }
+            plan_target_edge(&bp->edges[bp->branch_edge], cur);
+            plan_goto_edge(&bp->edges[bp->goto_edge], cur, next_bb,
+                bp->edges[bp->branch_edge].kind == EDGE_PHI_STUB);
+        }
+        return;
+    }
+
+    if (LLVMGetInstructionOpcode(term) == LLVMSwitch) {
+        LLVMBasicBlockRef cur = LLVMGetInstructionParent(term);
+        LLVMBasicBlockRef defbb = bp->edges[0].succ;
+        int nops = LLVMGetNumOperands(term);
+        int c, ft = -1, force_jump = FALSE;
+        bp->control = CONTROL_SWITCH;
+
+        if (phi_count(defbb) == 0) {
+            for (c = 2; c < nops; c += 2) {
+                LLVMBasicBlockRef dest = bp->edges[c / 2].succ;
+                if (phi_count(dest) != 0) { ft = -1; break; }
+                if (dest == next_bb && ft < 0) ft = c / 2;
+            }
+        }
+        for (c = 2; c < nops; c += 2) {
+            int edge = c / 2;
+            if (edge == ft) continue;
+            plan_target_edge(&bp->edges[edge], cur);
+            if (bp->edges[edge].kind == EDGE_PHI_STUB)
+                force_jump = TRUE;
+        }
+        if (ft >= 0) {
+            bp->switch_fallthrough = ft;
+            bp->edges[ft].kind = EDGE_FALLTHROUGH;
+            plan_target_edge(&bp->edges[0], cur);
+        }
+        else {
+            bp->goto_edge = 0;
+            plan_goto_edge(&bp->edges[0], cur, next_bb, force_jump);
+        }
+    }
+}
+
 static void emit_terminator(LLVMValueRef term, LLVMBasicBlockRef cur,
-    LLVMBasicBlockRef next_bb)
+    emitblock *bp)
 {
     switch (LLVMGetInstructionOpcode(term)) {
 
@@ -3053,77 +3216,39 @@ static void emit_terminator(LLVMValueRef term, LLVMBasicBlockRef cur,
         return;
 
     case LLVMBr:
-        if (!LLVMIsConditional(term)) {
-            emit_goto(cur, LLVMGetSuccessor(term, 0), next_bb);
-            flush_stubs();
+        if (bp->control == CONTROL_GOTO) {
+            emit_planned_edge(&bp->edges[bp->goto_edge], cur);
+            flush_planned_stubs(bp, cur);
             return;
         }
         {   LLVMValueRef cond = LLVMGetCondition(term);
-            LLVMBasicBlockRef then_bb = LLVMGetSuccessor(term, 0);
-            LLVMBasicBlockRef else_bb = LLVMGetSuccessor(term, 1);
-
-            if (then_bb == else_bb || LLVMIsAConstantInt(cond)
-                || LLVMIsUndef(cond) || LLVMIsPoison(cond)) {
-                LLVMBasicBlockRef succ = then_bb;
-                if (then_bb != else_bb
-                    && !(LLVMIsAConstantInt(cond)
-                         && (const_int_value(cond) & 1)))
-                    succ = else_bb;
-                emit_goto(cur, succ, next_bb);
-                flush_stubs();
-                return;
-            }
-            if (then_bb == next_bb) {
-                /* Fall through into the then block instead of jumping
-                   around an else-jump. */
-                emit_tree_branch(cond, edge_target_label(cur, else_bb),
-                    TRUE, term);
-                emit_goto(cur, then_bb, n_stubs ? NULL : next_bb);
-            }
-            else {
-                emit_tree_branch(cond, edge_target_label(cur, then_bb),
-                    FALSE, term);
-                /* If a stub is pending it is emitted right below, in the
-                   fallthrough path — so the else edge must jump explicitly. */
-                emit_goto(cur, else_bb, n_stubs ? NULL : next_bb);
-            }
-            flush_stubs();
+            emit_tree_branch(cond,
+                planned_target_label(bp, bp->branch_edge),
+                bp->branch_invert, term);
+            emit_planned_edge(&bp->edges[bp->goto_edge], cur);
+            flush_planned_stubs(bp, cur);
         }
         return;
 
     case LLVMSwitch:
         {   assembly_operand cond = resolve(LLVMGetOperand(term, 0));
-            LLVMBasicBlockRef defbb = LLVMGetSwitchDefaultDest(term);
             int nops = LLVMGetNumOperands(term);
-            int c, ft = -1;
-
-            /* If some case's target is the fallthrough block (and no edge
-               needs phi copies), test that case last, inverted: it falls
-               through instead of jumping. */
-            if (phi_count(defbb) == 0) {
-                for (c = 2; c < nops; c += 2) {
-                    LLVMBasicBlockRef dest =
-                        LLVMValueAsBasicBlock(LLVMGetOperand(term, c + 1));
-                    if (phi_count(dest) != 0) { ft = -1; break; }
-                    if (dest == next_bb && ft < 0) ft = c;
-                }
-            }
+            int c, ft = bp->switch_fallthrough;
             for (c = 2; c < nops; c += 2) {
-                LLVMBasicBlockRef dest =
-                    LLVMValueAsBasicBlock(LLVMGetOperand(term, c + 1));
-                if (c == ft) continue;
+                int edge = c / 2;
+                if (edge == ft) continue;
                 gen_branch2(jeq_gc, cond,
                     resolve(LLVMGetOperand(term, c)),
-                    edge_target_label(cur, dest));
+                    planned_target_label(bp, edge));
             }
             if (ft >= 0) {
                 gen_branch2(jne_gc, cond,
-                    resolve(LLVMGetOperand(term, ft)),
-                    edge_target_label(cur, defbb));
-                return;   /* falls through into next_bb; no stubs pending */
+                    resolve(LLVMGetOperand(term, ft * 2)),
+                    planned_target_label(bp, 0));
+                return;
             }
-            emit_goto(cur, defbb, n_stubs ? NULL : next_bb);
-            flush_stubs();
+            emit_planned_edge(&bp->edges[bp->goto_edge], cur);
+            flush_planned_stubs(bp, cur);
         }
         return;
 
@@ -3143,16 +3268,16 @@ static void emit_terminator(LLVMValueRef term, LLVMBasicBlockRef cur,
    A still jumps to M, while C gains a fallthrough arm and B gains a
    fallthrough merge. This cannot add a transfer on any path. Phi-bearing arms
    are excluded because their incoming edges would require copy stubs. */
-static int build_emit_order(int *order)
+static int build_block_layout(emitblock *blocks)
 {
     int i, n = 0;
     for (i = 0; i < n_blocks; i++)
         if (blkinfo[i].emit_body)
-            order[n++] = i;
+            blocks[n++].bi = i;
 
     for (i = 0; i + 3 < n; i++) {
-        int ai = order[i], bi = order[i + 1];
-        int ci = order[i + 2], mi = order[i + 3];
+        int ai = blocks[i].bi, bi = blocks[i + 1].bi;
+        int ci = blocks[i + 2].bi, mi = blocks[i + 3].bi;
         LLVMBasicBlockRef a = blkinfo[ai].bb, b = blkinfo[bi].bb;
         LLVMBasicBlockRef c = blkinfo[ci].bb, m = blkinfo[mi].bb;
         LLVMValueRef at, bt, ct, cond;
@@ -3180,11 +3305,44 @@ static int build_emit_order(int *order)
         if (LLVMIsAConstantInt(cond) || LLVMIsUndef(cond) || LLVMIsPoison(cond))
             continue;
 
-        order[i + 1] = ci;
-        order[i + 2] = bi;
+        blocks[i + 1].bi = ci;
+        blocks[i + 2].bi = bi;
         i += 2;
     }
     return n;
+}
+
+static void build_emit_plan(emitplan *plan)
+{
+    int i, n_edges = 0, edge_pos = 0;
+    memset(plan, 0, sizeof(*plan));
+    plan->blocks = my_calloc(sizeof(emitblock), n_blocks,
+        "llvm lower emission blocks");
+    plan->n_blocks = build_block_layout(plan->blocks);
+
+    for (i = 0; i < plan->n_blocks; i++) {
+        emitblock *bp = &plan->blocks[i];
+        bp->term = LLVMGetBasicBlockTerminator(blkinfo[bp->bi].bb);
+        bp->n_edges = (int)LLVMGetNumSuccessors(bp->term);
+        n_edges += bp->n_edges;
+    }
+    plan->edges = my_calloc(sizeof(edgeplan), n_edges ? n_edges : 1,
+        "llvm lower emission edges");
+
+    for (i = 0; i < plan->n_blocks; i++) {
+        emitblock *bp = &plan->blocks[i];
+        LLVMBasicBlockRef next_bb = i + 1 < plan->n_blocks
+            ? blkinfo[plan->blocks[i + 1].bi].bb : NULL;
+        bp->edges = &plan->edges[edge_pos];
+        edge_pos += bp->n_edges;
+        plan_terminator(bp, next_bb);
+    }
+}
+
+static void free_emit_plan(emitplan *plan)
+{
+    my_free(&plan->edges, "llvm lower emission edges");
+    my_free(&plan->blocks, "llvm lower emission blocks");
 }
 
 /* ------------------------------------------------------------------------- */
@@ -3196,7 +3354,8 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
 {
     LLVMBasicBlockRef bb;
     LLVMValueRef in;
-    int i, total_slots, n_insts, *emit_order, n_emit;
+    int i, total_slots, n_insts;
+    emitplan plan;
 
     (void)m;
     cur_fn = fn;
@@ -3205,7 +3364,6 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     *insts_in = 0;
     *insts_out = 0;
     last_emit_noreturn = FALSE;
-    n_stubs = 0;
     n_params = (int)LLVMCountParams(fn);
     next_slot = n_params + 1;
 
@@ -3303,19 +3461,17 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     for (i = 1; i < n_blocks; i++)
         blkinfo[i].label = alloc_label();
 
-    emit_order = my_calloc(sizeof(int), n_blocks, "llvm lower block order");
-    n_emit = build_emit_order(emit_order);
-    for (i = 0; i < n_emit; i++) {
-        int bi = emit_order[i];
-        LLVMBasicBlockRef next_bb = i + 1 < n_emit
-            ? blkinfo[emit_order[i + 1]].bb : NULL;
+    build_emit_plan(&plan);
+    for (i = 0; i < plan.n_blocks; i++) {
+        emitblock *bp = &plan.blocks[i];
+        int bi = bp->bi;
         bb = blkinfo[bi].bb;
         if (bi > 0)
             gen_label(blkinfo[bi].label);
         for (in = LLVMGetFirstInstruction(bb); in;
              in = LLVMGetNextInstruction(in)) {
             if (in == LLVMGetBasicBlockTerminator(bb))
-                emit_terminator(in, bb, next_bb);
+                emit_terminator(in, bb, bp);
             else
                 emit_instruction(in);
         }
@@ -3324,7 +3480,7 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     llvm_lower_insts_out += n_emitted;
     *insts_out = n_emitted;
 
-    my_free(&emit_order, "llvm lower block order");
+    free_emit_plan(&plan);
     my_free(&vals, "llvm lower values");
     my_free(&blkinfo, "llvm lower blocks");
     return TRUE;
