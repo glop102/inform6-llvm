@@ -21,9 +21,14 @@ make
 
 The devshell also provides `glulxe` for behavioral tests and
 `glulxe-counted`, a separately patched reference interpreter which reports
-`GLULXE_INSTRUCTION_COUNT=<n>` on stderr. `make bench` uses it to report
-deterministic classic-versus-LLVM dynamic instruction totals alongside timing
-medians. Set `BENCH_RUNS` to change the default five timing runs.
+`GLULXE_INSTRUCTION_COUNT=<n>` on stderr. Pass `--opcode-histogram` to also
+emit `GLULXE_OPCODE_COUNT_0x<opcode>=<n>` records for every executed opcode.
+`make bench` uses it to report deterministic classic-versus-LLVM dynamic
+instruction totals and writes their opcode comparison to
+`tests/life.opcodes.tsv` alongside timing medians. Set `BENCH_RUNS` to change
+the default five timing runs. A dev shell opened before the histogram patch was
+built will continue to provide total counts but skip the opcode TSV; exit and
+re-enter `nix develop` to refresh `glulxe-counted`.
 
 LLVM is optional: the Makefile detects it via `llvm-config` and, when it
 isn't found (or with `make WITH_LLVM=0`), builds `src/llvm_stub.c` in

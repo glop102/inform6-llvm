@@ -29,10 +29,12 @@ The current Life benchmark executes:
 
 ```text
 classic: 56,177,197 instructions
-LLVM:    57,579,709 instructions (+2.50%)
+LLVM:    56,043,709 instructions (-0.24%)
 ```
 
-After alternating execution order, one five-run sample measured medians of
+Before the recurrence-folding improvement described below, LLVM executed
+57,579,709 instructions (`+2.50%`). After alternating execution order, one
+five-run sample of that earlier build measured medians of
 932 ms classic and 941 ms LLVM. This points in the expected direction, but the
 timing delta is not exactly proportional to instruction count and individual
 samples remain noisy. Deterministic dispatch totals are the preferred
@@ -43,18 +45,46 @@ Static emitted counts are less predictive than dynamic counts because cold
 blocks and hot loops are weighted equally. They remain useful for isolated
 microfixtures and explaining where a transformation added bytecode.
 
-## Next Investigation: Opcode Costs
+## Opcode Cost Investigation
 
-The next priority is to explain the Life benchmark's additional 1,402,512
-dispatches and determine how much the opcode mix affects runtime. Total dynamic
-count shows that a regression exists, but not whether LLVM added copies,
-branches, arithmetic, address calculations, or expensive VM operations.
+The initial priority was to explain the Life benchmark's additional 1,402,512
+dispatches and determine how much the opcode mix affected runtime. Total
+dynamic count showed that a regression existed, but not whether LLVM added
+copies, branches, arithmetic, address calculations, or expensive VM operations.
 
-Extend `glulxe-counted` with an optional per-opcode histogram. The normal
-machine-readable output should include the total plus one count for every
-executed opcode, allowing classic and LLVM runs to be compared directly. Keep
-histogram collection optional so the simplest total-count path remains cheap
-and stable.
+`glulxe-counted` now accepts `--opcode-histogram` and emits the total plus one
+machine-readable count for every executed opcode. `tests/run-life.sh` validates
+that the histogram sums to the total and writes the classic/LLVM comparison to
+`tests/life.opcodes.tsv`. Collection remains optional so the simplest
+total-count path stays cheap and stable.
+
+The first Life comparison attributes most of the changed mix to the hot
+`Step` loop:
+
+```text
+opcode  operation  classic     LLVM        delta
+0x040   copy          75,887   3,199,994   +3,124,107
+0x020   jump       1,785,680   3,211,284   +1,425,604
+0x025   jne        2,994,076   4,493,392   +1,499,316
+0x028   jgt              501   1,565,547   +1,565,046
+0x010   add       29,405,083  27,891,973   -1,513,110
+0x011   sub        1,535,509           9   -1,535,500
+0x023   jnz        1,561,007           0   -1,561,007
+0x027   jge        1,611,844           0   -1,611,844
+```
+
+The branch changes are largely predicate and block-layout substitutions. The
+copy increase is more directly actionable: about 3,120,000 executions are
+explained by loop-carried values in `Step`, including two copies per cell from
+an increment shared by a wraparound select and the loop phi. The lowerer's
+edge-folding pass already targeted this shape, but its same-block restriction
+did not accept the post-optimization CFG used by Life.
+
+The edge-folding pass now accepts the narrow cross-block form where an `add` or
+`sub` reads the destination phi and an integer constant. On Life this removes
+3,072,000 copies, adds back 1,536,000 native additions, and moves 24,000 jumps
+onto the rare wraparound path. The net reduction is exactly 1,536,000
+dispatches, enough to put the LLVM build 133,488 instructions below classic.
 
 The histogram is also the prerequisite for a weighted interpreter cost model.
 Per-opcode costs should be measured rather than guessed:
@@ -77,16 +107,44 @@ The expected outcome is a hierarchy of metrics:
 - Weighted dynamic cost: estimates runtime when opcode mixes differ.
 - Repeated wall-clock timing: validates that the model predicts real execution.
 
-After opcode-level attribution, add routine or PC-range profiling to identify
-where the extra operations execute. This requires routine boundaries from the
-compiler or story metadata, but would turn a whole-program delta into a ranked
-list of optimization targets.
+After this source-level attribution, add routine or PC-range profiling to
+identify where extra operations execute. This requires routine boundaries from
+the compiler or story metadata, but would turn a whole-program delta into a
+ranked list of optimization targets.
 
 Benchmark output should eventually have a machine-readable JSON or TSV mode
 recording compiler revision, LLVM and interpreter versions, optimized/captured
 routine counts, static instructions, opcode histogram, weighted cost, dynamic
 total, story size, and timing samples. This will make comparisons across
 commits and LLVM upgrades reproducible.
+
+### Pinned Interpreter Sources
+
+`flake.lock` pins the interpreter sources used by this work, so their current
+Nix source paths are stable until the inputs are updated:
+
+- Glulxe `56ab8743bab565de307bd892c555d8d8897ed517`:
+  `/nix/store/92w52qlngz0llrh5br5r7p55jhvds59y-source`
+- CheapGlk `14d8aaf6e4150669762bd4646a5368e75c1eeee6`:
+  `/nix/store/hv7ys416ficc7v3lm0zibn4mfi0rbdwx-source`
+
+The Glulxe dispatch loop is in `exec.c`; process setup, normal exit, and fatal
+exit handling are in `main.c`; shared declarations are in `glulxe.h`. The
+counting patch applied to these files is
+`patches/glulxe-instruction-count.patch`.
+
+After a lock-file update, resolve the new source paths instead of searching the
+store manually:
+
+```sh
+nix eval --raw .#glulxe.src
+nix eval --raw .#cheapglk.src
+nix eval --raw .#glulxe-counted.src
+```
+
+Built package paths should not be recorded here because they vary by system and
+derivation changes; use `nix build .#glulxe-counted --print-out-paths` when a
+binary path is needed.
 
 ## First Priority: Optimization Tests
 
@@ -456,19 +514,17 @@ whose performance behavior is currently unguarded.
 
 ## Recommended Order of Work
 
-1. Add optional opcode histograms to `glulxe-counted` and compare the classic
-   and LLVM Life instruction mixes.
-2. Measure per-opcode and important operand-mode costs, then validate a
+1. Measure per-opcode and important operand-mode costs, then validate a
    weighted model against repeated whole-program timings.
-3. Add routine or PC-range attribution for the extra Life dispatches.
-4. Add focused regression fixtures for switches, phi stubs, select returns,
+2. Add routine or PC-range attribution for the extra Life dispatches.
+3. Add focused regression fixtures for switches, phi stubs, select returns,
    division canonicalization, and LICM.
-5. Put the real LLVM build and strict optimization suite in Linux CI.
-6. Disable unsafe optimization in the presence of `jumpabs` and correct the
+4. Put the real LLVM build and strict optimization suite in Linux CI.
+5. Disable unsafe optimization in the presence of `jumpabs` and correct the
    removable-read attributes.
-7. Fix the demonstrated instruction-count regressions, beginning with switch
+6. Fix the demonstrated instruction-count regressions, beginning with switch
    ordering and phi-stub fallthrough.
-8. Develop a CFG-weighted profitability estimate before making routine
+7. Develop a CFG-weighted profitability estimate before making routine
    replacement conditional on cost.
 
 The initial optimization-test and dynamic-count infrastructure described above

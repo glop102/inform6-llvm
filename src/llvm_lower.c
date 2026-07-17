@@ -1400,6 +1400,22 @@ static int sinkable_arm(LLVMValueRef sel, valinfo *si, int idx)
     return pure_op_movable(vi, si->pos);
 }
 
+/* A loop recurrence can be rematerialized on a later backedge without
+   re-reading arbitrary state: the phi has one dedicated slot, and Glulx reads
+   arithmetic sources before writing the destination. */
+static int self_recurrence_for_phi(valinfo *vi, LLVMValueRef phi)
+{
+    LLVMValueRef a, b;
+    LLVMOpcode op = LLVMGetInstructionOpcode(vi->v);
+    if (op != LLVMAdd && op != LLVMSub) return FALSE;
+    a = LLVMGetOperand(vi->v, 0);
+    b = LLVMGetOperand(vi->v, 1);
+    if (op == LLVMSub)
+        return a == phi && LLVMIsAConstantInt(b);
+    return (a == phi && LLVMIsAConstantInt(b))
+        || (b == phi && LLVMIsAConstantInt(a));
+}
+
 static void sink_pass(void)
 {
     int p;
@@ -1465,7 +1481,11 @@ static void edge_fold_pass(void)
                     blockinfo *pb;
                     if (LLVMGetIncomingValue(user, i) != vi->v) continue;
                     pb = block_info(LLVMGetIncomingBlock(user, i));
-                    if (!pb || pb != &blkinfo[vi->blk]) { ok = FALSE; break; }
+                    if (!pb || (pb != &blkinfo[vi->blk]
+                            && !self_recurrence_for_phi(vi, user))) {
+                        ok = FALSE;
+                        break;
+                    }
                 }
                 phi_use = user;
             }

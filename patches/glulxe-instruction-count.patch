@@ -1,32 +1,38 @@
 diff --git a/exec.c b/exec.c
-index f2bbf68..dad9c36 100644
+index f2bbf68..6bf5e82 100644
 --- a/exec.c
 +++ b/exec.c
-@@ -90,6 +90,7 @@ void execute_loop()
+@@ -90,6 +90,10 @@ void execute_loop()
      /* Based on the oplist structure, load the actual operand values
         into inst. This moves the PC up to the end of the instruction. */
      parse_operands(inst, oplist);
 +    glulx_dispatched_instruction_count++;
++    if (glulx_report_opcode_histogram
++        && opcode < GLULXE_OPCODE_TABLE_SIZE)
++      glulx_opcode_counts[opcode]++;
  
      /* Perform the opcode. This switch statement is split in two, based
         on some paranoid suspicions about the ability of compilers to
 diff --git a/glulxe.h b/glulxe.h
-index bb7a296..8dc2b66 100644
+index bb7a296..234f07e 100644
 --- a/glulxe.h
 +++ b/glulxe.h
-@@ -167,6 +167,7 @@ typedef struct operandlist_struct {
+@@ -167,6 +167,10 @@ typedef struct operandlist_struct {
  /* Some useful globals */
  
  extern int vm_exited_cleanly;
++#define GLULXE_OPCODE_TABLE_SIZE (0x240)
 +extern uint64_t glulx_dispatched_instruction_count;
++extern uint64_t glulx_opcode_counts[GLULXE_OPCODE_TABLE_SIZE];
++extern int glulx_report_opcode_histogram;
  extern strid_t gamefile;
  extern glui32 gamefile_start, gamefile_len;
  extern char *init_err, *init_err2;
 diff --git a/main.c b/main.c
-index 5a99872..74cc49a 100644
+index 5a99872..9f7b49e 100644
 --- a/main.c
 +++ b/main.c
-@@ -3,9 +3,25 @@
+@@ -3,9 +3,37 @@
      http://eblong.com/zarf/glulx/index.html
  */
  
@@ -38,13 +44,25 @@ index 5a99872..74cc49a 100644
  #include "glulxe.h"
  
 +uint64_t glulx_dispatched_instruction_count = 0;
++uint64_t glulx_opcode_counts[GLULXE_OPCODE_TABLE_SIZE] = { 0 };
++int glulx_report_opcode_histogram = FALSE;
 +static int report_instruction_count = FALSE;
 +
 +static void report_dispatched_instruction_count(void)
 +{
 +  if (report_instruction_count) {
++    glui32 opcode;
++
 +    fprintf(stderr, "GLULXE_INSTRUCTION_COUNT=%" PRIu64 "\n",
 +      glulx_dispatched_instruction_count);
++    if (glulx_report_opcode_histogram) {
++      for (opcode = 0; opcode < GLULXE_OPCODE_TABLE_SIZE; opcode++) {
++        if (glulx_opcode_counts[opcode]) {
++          fprintf(stderr, "GLULXE_OPCODE_COUNT_0x%03X=%" PRIu64 "\n",
++            opcode, glulx_opcode_counts[opcode]);
++        }
++      }
++    }
 +    fflush(stderr);
 +  }
 +}
@@ -52,7 +70,7 @@ index 5a99872..74cc49a 100644
  int vm_exited_cleanly = TRUE;
  strid_t gamefile = NULL; /* The stream containing the Glulx file. */
  glui32 gamefile_start = 0; /* The position within the stream. (This will not 
-@@ -65,6 +81,10 @@ void glk_main()
+@@ -65,6 +93,10 @@ void glk_main()
    }
  
    setup_vm();
@@ -63,7 +81,7 @@ index 5a99872..74cc49a 100644
    if (library_autorestore_hook)
      library_autorestore_hook();
    execute_loop();
-@@ -120,6 +140,8 @@ static winid_t get_error_win()
+@@ -120,6 +152,8 @@ static winid_t get_error_win()
  */
  void fatal_error_handler(char *str, char *arg, int useval, glsi32 val)
  {
@@ -72,3 +90,18 @@ index 5a99872..74cc49a 100644
    winid_t win;
  
    /* If the debugger is compiled in, send the error message to the debug
+diff --git a/unixstrt.c b/unixstrt.c
+index 1ced8d3..3e199b2 100644
+--- a/unixstrt.c
++++ b/unixstrt.c
+@@ -36,2 +36,3 @@ glkunix_argumentlist_t glkunix_arguments[] = {
+   { "--undo", glkunix_arg_ValueFollows, "Number of undo states to store." },
+   { "--rngseed", glkunix_arg_ValueFollows, "Fix initial RNG if nonzero." },
++  { "--opcode-histogram", glkunix_arg_NoValue, "Report per-opcode instruction counts." },
+@@ -111,1 +112,6 @@ int glkunix_startup_code(glkunix_startup_t *data)
++    if (!strcmp(data->argv[ix], "--opcode-histogram")) {
++      glulx_report_opcode_histogram = TRUE;
++      continue;
++    }
++
+ #if GLKUNIX_AUTOSAVE_FEATURES

@@ -5,6 +5,7 @@ inform6-llvm
 tests/*.ulx
 tests/*.z5
 tests/*.log
+tests/life.opcodes.tsv
 tests/inform6-llvm-dump.ll
 result
 result-counted

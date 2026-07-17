@@ -59,12 +59,12 @@ else
     not_lowered=${BASH_REMATCH[4]}
     insts_in=${BASH_REMATCH[5]}
     insts_out=${BASH_REMATCH[6]}
-    if [ "$optimized" -ne 9 ] || [ "$captured" -ne 9 ] ||
+    if [ "$optimized" -ne 10 ] || [ "$captured" -ne 10 ] ||
        [ "$not_lifted" -ne 0 ] || [ "$not_lowered" -ne 0 ]; then
         echo "FAIL  opt (lowering coverage: $stats_line)"
         fail=1
     fi
-    if [ "$insts_in" -ne 95 ] || [ "$insts_out" -gt 101 ]; then
+    if [ "$insts_in" -ne 111 ] || [ "$insts_out" -gt 123 ]; then
         echo "FAIL  opt (aggregate instruction bound: $stats_line)"
         fail=1
     fi
@@ -93,6 +93,7 @@ check_routine Opt_CompareReturn 5  2
 check_routine Opt_SelectReturn  5  4
 check_routine Opt_BooleanTree   5 10
 check_routine Opt_LoopPhi       9 11
+check_routine Opt_InductionSelect 13 19
 check_routine Opt_SwitchOrder  12 14
 
 classic_log="$tmpdir/classic.compile.log"
@@ -186,7 +187,7 @@ if [ -n "$GLULXE_COUNTED" ]; then
         fail=1
     fi
     if [ "$fail" -eq 0 ] &&
-       { [ "$classic_count" -ne 131 ] || [ "$llvm_count" -gt 142 ]; }; then
+       { [ "$classic_count" -ne 206 ] || [ "$llvm_count" -gt 234 ]; }; then
         echo "FAIL  opt (dynamic instruction bound: classic $classic_count, LLVM $llvm_count)"
         fail=1
     fi

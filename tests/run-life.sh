@@ -132,9 +132,19 @@ else
     exit 0
 fi
 
+COUNTED_HISTOGRAM=0
+if "$GLULXE_COUNTED" -help 2>&1 | grep -q -- '--opcode-histogram'; then
+    COUNTED_HISTOGRAM=1
+fi
+
 count_story() {
-    local story=$1 log=$2 status line re
-    if timeout 120 "$GLULXE_COUNTED" "$story" </dev/null >/dev/null 2>"$log"; then
+    local story=$1 log=$2 status line re histogram_re histogram_sum
+    local -a options=()
+    if [ "$COUNTED_HISTOGRAM" -eq 1 ]; then
+        options+=(--opcode-histogram)
+    fi
+    if timeout 120 "$GLULXE_COUNTED" "${options[@]}" "$story" \
+            </dev/null >/dev/null 2>"$log"; then
         :
     else
         status=$?
@@ -148,6 +158,44 @@ count_story() {
         return 1
     fi
     COUNTED_RESULT=${BASH_REMATCH[1]}
+    if [ "$COUNTED_HISTOGRAM" -eq 0 ]; then
+        return 0
+    fi
+    histogram_re='^GLULXE_OPCODE_COUNT_0x[0-9A-F]+=([0-9]+)$'
+    if ! grep -aqE "$histogram_re" "$log"; then
+        echo "FAIL  life ($story has no opcode histogram)"
+        return 1
+    fi
+    histogram_sum=$(grep -aE "$histogram_re" "$log" |
+        awk -F= '{ sum += $2 } END { print sum + 0 }')
+    if [ "$histogram_sum" -ne "$COUNTED_RESULT" ]; then
+        echo "FAIL  life ($story opcode histogram sums to $histogram_sum, expected $COUNTED_RESULT)"
+        return 1
+    fi
+}
+
+write_opcode_comparison() {
+    local classic_log=$1 llvm_log=$2 output=$3
+    {
+        printf 'opcode\tclassic\tllvm\tdelta\n'
+        awk -F= '
+            /^GLULXE_OPCODE_COUNT_0x[0-9A-F]+=[0-9]+$/ {
+                opcode = $1
+                sub(/^GLULXE_OPCODE_COUNT_/, "", opcode)
+                if (FNR == NR) classic[opcode] = $2
+                else llvm[opcode] = $2
+                seen[opcode] = 1
+            }
+            END {
+                for (number = 0; number < 576; number++) {
+                    opcode = sprintf("0x%03X", number)
+                    if (opcode in seen)
+                        print opcode "\t" classic[opcode] + 0 "\t" \
+                            llvm[opcode] + 0 "\t" llvm[opcode] - classic[opcode]
+                }
+            }
+        ' "$classic_log" "$llvm_log"
+    } >"$output"
 }
 
 COUNTED_RESULT=0
@@ -159,3 +207,9 @@ delta=$((llvm_count - classic_count))
 percent=$(awk -v delta="$delta" -v base="$classic_count" \
     'BEGIN { printf "%+.2f%%", 100 * delta / base }')
 echo "      dynamic: classic $classic_count, llvm $llvm_count ($percent)"
+if [ "$COUNTED_HISTOGRAM" -eq 1 ]; then
+    write_opcode_comparison life.classic.count.log life.llvm.count.log life.opcodes.tsv
+    echo "      opcodes: life.opcodes.tsv"
+else
+    echo "      opcodes: skipped (glulxe-counted lacks --opcode-histogram; refresh the dev shell)"
+fi

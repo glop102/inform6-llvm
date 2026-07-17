@@ -35,6 +35,15 @@ Array opt_cells --> 2;
     return x;
 ];
 
+[ Opt_InductionSelect i next sum;
+    for (i = 0: i < 8: i++) {
+        if (i == 7) next = 0; else next = i + 1;
+        if (next & 1) opt_g = opt_g + next;
+        sum = sum + next;
+    }
+    return sum;
+];
+
 [ Opt_SwitchOrder x;
     switch (x) {
         10: return 101;
@@ -66,6 +75,7 @@ Array opt_cells --> 2;
           Opt_BooleanTree(1, 3, 2), " ",
           Opt_BooleanTree(3, 2, 0), " ",
           Opt_LoopPhi(4, 0), " ",
+          Opt_InductionSelect(), " ",
           Opt_SwitchOrder(10), " ",
           Opt_SwitchOrder(30), " ",
           Opt_SwitchOrder(50), " ",
