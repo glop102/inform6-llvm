@@ -29,7 +29,7 @@ The current Life benchmark executes:
 
 ```text
 classic: 56,177,197 instructions
-LLVM:    56,043,709 instructions (-0.24%)
+LLVM:    54,609,633 instructions (-2.79%)
 ```
 
 Before the recurrence-folding improvement described below, LLVM executed
@@ -40,6 +40,9 @@ timing delta is not exactly proportional to instruction count and individual
 samples remain noisy. Deterministic dispatch totals are the preferred
 regression gate; repeated timing medians remain an important secondary check
 for changes in opcode mix or other costs which the unweighted counter misses.
+After recurrence folding and block layout, one alternating nine-run sample
+measured medians of 864 ms classic and 849 ms LLVM (ranges 849-910 ms and
+824-932 ms respectively).
 
 Static emitted counts are less predictive than dynamic counts because cold
 blocks and hot loops are weighted equally. They remain useful for isolated
@@ -85,6 +88,15 @@ The edge-folding pass now accepts the narrow cross-block form where an `add` or
 3,072,000 copies, adds back 1,536,000 native additions, and moves 24,000 jumps
 onto the rare wraparound path. The net reduction is exactly 1,536,000
 dispatches, enough to put the LLVM build 133,488 instructions below classic.
+
+The remaining excess jumps came from the `Step` cell-state diamond. LLVM placed
+the live arm, dead arm, secondary `n == 2` test, and merge in that order, which
+forced the common dead arm to jump over the secondary test. The lowerer now
+recognizes this local four-block shape and emits the secondary test before the
+dead arm. This is pathwise non-worsening: the live arm retains its merge jump,
+the secondary test gains a fallthrough arm, and the dead arm falls through to
+the merge after performing its phi copies. It removes another 1,434,076 Life
+dispatches and leaves only 15,528 more LLVM `jump` executions than classic.
 
 The histogram is also the prerequisite for a weighted interpreter cost model.
 Per-opcode costs should be measured rather than guessed:

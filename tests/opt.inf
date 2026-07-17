@@ -44,6 +44,19 @@ Array opt_cells --> 2;
     return sum;
 ];
 
+[ Opt_BranchLayout n c reps i pop index;
+    for (i = 0: i < reps: i++) {
+        index = i & 1;
+        if (n == 3 || (n == 2 && c)) {
+            @astoreb opt_cells index 1;
+            pop++;
+        }
+        else
+            @astoreb opt_cells index 0;
+    }
+    return pop;
+];
+
 [ Opt_SwitchOrder x;
     switch (x) {
         10: return 101;
@@ -76,6 +89,10 @@ Array opt_cells --> 2;
           Opt_BooleanTree(3, 2, 0), " ",
           Opt_LoopPhi(4, 0), " ",
           Opt_InductionSelect(), " ",
+          Opt_BranchLayout(0, 0, 4), " ",
+          Opt_BranchLayout(2, 0, 4), " ",
+          Opt_BranchLayout(3, 0, 4), " ",
+          Opt_BranchLayout(2, 1, 4), " ",
           Opt_SwitchOrder(10), " ",
           Opt_SwitchOrder(30), " ",
           Opt_SwitchOrder(50), " ",

@@ -3133,6 +3133,60 @@ static void emit_terminator(LLVMValueRef term, LLVMBasicBlockRef cur,
     }
 }
 
+/* Arrange a side test between two arms which join the same following block:
+
+       A, B, C, M       A, C, B, M
+       A -> M           C -> A or B
+       B -> M     =>    B -> M (fallthrough)
+       C -> A or B
+
+   A still jumps to M, while C gains a fallthrough arm and B gains a
+   fallthrough merge. This cannot add a transfer on any path. Phi-bearing arms
+   are excluded because their incoming edges would require copy stubs. */
+static int build_emit_order(int *order)
+{
+    int i, n = 0;
+    for (i = 0; i < n_blocks; i++)
+        if (blkinfo[i].emit_body)
+            order[n++] = i;
+
+    for (i = 0; i + 3 < n; i++) {
+        int ai = order[i], bi = order[i + 1];
+        int ci = order[i + 2], mi = order[i + 3];
+        LLVMBasicBlockRef a = blkinfo[ai].bb, b = blkinfo[bi].bb;
+        LLVMBasicBlockRef c = blkinfo[ci].bb, m = blkinfo[mi].bb;
+        LLVMValueRef at, bt, ct, cond;
+        LLVMBasicBlockRef cs0, cs1;
+
+        if (ai == 0 || phi_count(a) != 0 || phi_count(b) != 0)
+            continue;
+        at = LLVMGetBasicBlockTerminator(a);
+        bt = LLVMGetBasicBlockTerminator(b);
+        ct = LLVMGetBasicBlockTerminator(c);
+        if (!at || !bt || !ct
+            || LLVMGetInstructionOpcode(at) != LLVMBr
+            || LLVMGetInstructionOpcode(bt) != LLVMBr
+            || LLVMGetInstructionOpcode(ct) != LLVMBr
+            || LLVMIsConditional(at) || LLVMIsConditional(bt)
+            || !LLVMIsConditional(ct))
+            continue;
+        if (LLVMGetSuccessor(at, 0) != m || LLVMGetSuccessor(bt, 0) != m)
+            continue;
+        cs0 = LLVMGetSuccessor(ct, 0);
+        cs1 = LLVMGetSuccessor(ct, 1);
+        if (!((cs0 == a && cs1 == b) || (cs0 == b && cs1 == a)))
+            continue;
+        cond = LLVMGetCondition(ct);
+        if (LLVMIsAConstantInt(cond) || LLVMIsUndef(cond) || LLVMIsPoison(cond))
+            continue;
+
+        order[i + 1] = ci;
+        order[i + 2] = bi;
+        i += 2;
+    }
+    return n;
+}
+
 /* ------------------------------------------------------------------------- */
 /*   Driver                                                                  */
 /* ------------------------------------------------------------------------- */
@@ -3142,7 +3196,7 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
 {
     LLVMBasicBlockRef bb;
     LLVMValueRef in;
-    int i, total_slots, n_insts;
+    int i, total_slots, n_insts, *emit_order, n_emit;
 
     (void)m;
     cur_fn = fn;
@@ -3249,16 +3303,15 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     for (i = 1; i < n_blocks; i++)
         blkinfo[i].label = alloc_label();
 
-    for (i = 0; i < n_blocks; i++) {
-        LLVMBasicBlockRef next_bb = NULL;
-        int j;
-        if (!blkinfo[i].emit_body)
-            continue;
-        for (j = i + 1; j < n_blocks; j++)
-            if (blkinfo[j].emit_body) { next_bb = blkinfo[j].bb; break; }
-        bb = blkinfo[i].bb;
-        if (i > 0)
-            gen_label(blkinfo[i].label);
+    emit_order = my_calloc(sizeof(int), n_blocks, "llvm lower block order");
+    n_emit = build_emit_order(emit_order);
+    for (i = 0; i < n_emit; i++) {
+        int bi = emit_order[i];
+        LLVMBasicBlockRef next_bb = i + 1 < n_emit
+            ? blkinfo[emit_order[i + 1]].bb : NULL;
+        bb = blkinfo[bi].bb;
+        if (bi > 0)
+            gen_label(blkinfo[bi].label);
         for (in = LLVMGetFirstInstruction(bb); in;
              in = LLVMGetNextInstruction(in)) {
             if (in == LLVMGetBasicBlockTerminator(bb))
@@ -3271,6 +3324,7 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     llvm_lower_insts_out += n_emitted;
     *insts_out = n_emitted;
 
+    my_free(&emit_order, "llvm lower block order");
     my_free(&vals, "llvm lower values");
     my_free(&blkinfo, "llvm lower blocks");
     return TRUE;
