@@ -10,13 +10,12 @@
 #include <llvm-c/Core.h>
 
 /* Lower the optimized IR function back to Glulx. On success, the capture
-   buffer in asm.c has been rewritten with the lowered instruction stream
-   (and the routine header's locals count patched if needed) and TRUE is
-   returned; asm.c then replays the buffer through the classic encoder.
-   On failure nothing has been touched and the caller falls back to
-   replaying the original capture. */
+   buffer in asm.c has been rewritten with the lowered instruction stream,
+   insts_in/out hold its static before/after counts, and TRUE is returned;
+   asm.c then replays the buffer through the classic encoder. On failure
+   nothing has been touched and the caller falls back to the original. */
 extern int llvm_lower_routine(LLVMModuleRef mod, LLVMValueRef fn,
-    const char **fail_reason);
+    const char **fail_reason, int *insts_in, int *insts_out);
 
 /* Static instruction counts over all successfully lowered routines
    (captured stream vs. lowered stream), for the statistics line. */

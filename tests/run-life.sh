@@ -28,8 +28,20 @@ if ! $I6 -G '$LLVM=2' life.inf life.llvm.ulx >/dev/null 2>&1; then
     echo "FAIL  life (llvm compile failed)"; exit 1
 fi
 
-timeout 120 $GLULXE life.classic.ulx < /dev/null > life.classic.log 2>&1
-timeout 120 $GLULXE life.llvm.ulx    < /dev/null > life.llvm.log 2>&1
+if timeout 120 "$GLULXE" life.classic.ulx < /dev/null > life.classic.log 2>&1; then
+    :
+else
+    status=$?
+    echo "FAIL  life (classic interpreter exited $status; see life.classic.log)"
+    exit 1
+fi
+if timeout 120 "$GLULXE" life.llvm.ulx < /dev/null > life.llvm.log 2>&1; then
+    :
+else
+    status=$?
+    echo "FAIL  life (llvm interpreter exited $status; see life.llvm.log)"
+    exit 1
+fi
 
 if ! diff <(grep -v '^Elapsed:' life.classic.log) \
           <(grep -v '^Elapsed:' life.llvm.log) >/dev/null; then

@@ -21,6 +21,17 @@ else
 fi
 fail=0
 
+run_story() {
+    local seconds=$1 story=$2 input=$3 log=$4 status
+    if timeout "$seconds" "$GLULXE" "$story" < "$input" > "$log" 2>&1; then
+        return 0
+    else
+        status=$?
+    fi
+    echo "FAIL  $(basename "$story") (interpreter exited $status; see $log)"
+    return 1
+}
+
 check() {
     local name=$1 input=$2; shift 2
     local flags=("$@")
@@ -30,8 +41,12 @@ check() {
     if ! $I6 "${flags[@]}" '$LLVM=2' "$name.inf" "$name.llvm.ulx" >/dev/null 2>&1; then
         echo "FAIL  $name (llvm compile failed)"; fail=1; return
     fi
-    timeout 30 $GLULXE "$name.classic.ulx" < "$input" > "$name.classic.log" 2>&1
-    timeout 30 $GLULXE "$name.llvm.ulx" < "$input" > "$name.llvm.log" 2>&1
+    if ! run_story 30 "$name.classic.ulx" "$input" "$name.classic.log"; then
+        fail=1; return
+    fi
+    if ! run_story 30 "$name.llvm.ulx" "$input" "$name.llvm.log"; then
+        fail=1; return
+    fi
     if cmp -s "$name.classic.log" "$name.llvm.log"; then
         echo "ok    $name"
     else
@@ -49,8 +64,8 @@ check() {
 # layout-sensitive checks:
 #   - "jumpabs test=": test_jumpabs jumps to test_jumpabs_2+5, running
 #     another routine's (optimized) body inside its own stack frame
-#   - "token=": @catch tokens are stack addresses, and optimized frames
-#     are larger (one local slot per SSA value)
+#   - "token=": @catch tokens are stack addresses, and optimized frame
+#     layouts differ
 check_glulxercise() {
     local name=glulxercise
     if ! $I6 -G '$LLVM=0' "$name.inf" "$name.classic.ulx" >/dev/null 2>&1; then
@@ -59,8 +74,12 @@ check_glulxercise() {
     if ! $I6 -G '$LLVM=2' "$name.inf" "$name.llvm.ulx" >/dev/null 2>&1; then
         echo "FAIL  $name (llvm compile failed)"; fail=1; return
     fi
-    timeout 60 $GLULXE "$name.classic.ulx" < "$name.walk" > "$name.classic.log" 2>&1
-    timeout 60 $GLULXE "$name.llvm.ulx" < "$name.walk" > "$name.llvm.log" 2>&1
+    if ! run_story 60 "$name.classic.ulx" "$name.walk" "$name.classic.log"; then
+        fail=1; return
+    fi
+    if ! run_story 60 "$name.llvm.ulx" "$name.walk" "$name.llvm.log"; then
+        fail=1; return
+    fi
     # the logs contain raw high-bit bytes (char-output tests), so grep -a
     if ! grep -aq 'Goodbye' "$name.classic.log" || \
        ! grep -aq 'Goodbye' "$name.llvm.log"; then
@@ -72,11 +91,19 @@ check_glulxercise() {
         echo "FAIL  $name (classic build fails its own checks; see $name.classic.log)"
         fail=1; return
     fi
-    local bad
+    local bad fail_count jumpabs_count token_count
     bad=$(grep -a 'FAIL' "$name.llvm.log" | grep -av -e 'token=' -e 'jumpabs test=')
-    if [ -n "$bad" ]; then
+    fail_count=$(grep -ac 'FAIL' "$name.llvm.log")
+    jumpabs_count=$(grep -ac 'jumpabs test=.*FAIL' "$name.llvm.log")
+    token_count=$(grep -ac 'token=.*FAIL' "$name.llvm.log")
+    if [ -n "$bad" ] || [ "$fail_count" -ne 11 ] ||
+       [ "$jumpabs_count" -ne 1 ] || [ "$token_count" -ne 10 ]; then
         echo "FAIL  $name (llvm build fails non-layout-sensitive checks; see $name.llvm.log)"
-        echo "$bad" | head -5 | sed 's/^/      /'
+        if [ -n "$bad" ]; then
+            printf '%s\n' "$bad" | while IFS= read -r line; do
+                printf '      %s\n' "$line"
+            done
+        fi
         fail=1; return
     fi
     echo "ok    $name"

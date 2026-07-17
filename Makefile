@@ -45,6 +45,7 @@ $(BUILDDIR):
 
 test: inform6-llvm
 	tests/run-m1.sh
+	tests/run-opt.sh
 	tests/run-m3.sh
 
 bench: inform6-llvm

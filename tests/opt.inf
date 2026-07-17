@@ -1,0 +1,73 @@
+! Focused LLVM optimization-count fixture. Keep routines small and independent
+! so run-opt.sh can enforce narrow per-routine instruction ceilings.
+
+Constant Story "LLVM optimization fixture";
+
+Global opt_g = 3;
+Array opt_cells --> 2;
+
+[ Opt_StoreFusion x;
+    opt_g = opt_g + x;
+    opt_cells-->0 = opt_cells-->0 + opt_g;
+    return opt_g + opt_cells-->0;
+];
+
+[ Opt_CompareReturn a b;
+    return (a < b);
+];
+
+[ Opt_SelectReturn c a b r;
+    if (c) r = a; else r = b;
+    return r;
+];
+
+[ Opt_BooleanTree a b c;
+    if (a < b && (b < c || ~~(c == 0))) return 1;
+    return 0;
+];
+
+[ Opt_LoopPhi n x;
+    while (n > 0) {
+        if ((n & 1) ~= 0) x = x + n;
+        else x = x - 1;
+        n--;
+    }
+    return x;
+];
+
+[ Opt_SwitchOrder x;
+    switch (x) {
+        10: return 101;
+        20: return 102;
+        30: return 103;
+        40: return 104;
+        50: return 105;
+        default: return 199;
+    }
+];
+
+[ Main win dummy;
+    @setiosys 2 0;
+    @copy 0 sp;
+    @copy 3 sp;
+    @copy 0 sp;
+    @copy 0 sp;
+    @copy 0 sp;
+    @glk $0023 5 win;
+    @copy win sp;
+    @glk $002F 1 dummy;
+
+    print Opt_StoreFusion(4), " ",
+          Opt_CompareReturn(1, 2), " ",
+          Opt_CompareReturn(2, 1), " ",
+          Opt_SelectReturn(1, 7, 9), " ",
+          Opt_SelectReturn(0, 7, 9), " ",
+          Opt_BooleanTree(1, 2, 3), " ",
+          Opt_BooleanTree(1, 3, 2), " ",
+          Opt_BooleanTree(3, 2, 0), " ",
+          Opt_LoopPhi(4, 0), " ",
+          Opt_SwitchOrder(10), " ",
+          Opt_SwitchOrder(30), " ",
+          Opt_SwitchOrder(50), " ",
+          Opt_SwitchOrder(99), "^done.^";
+];

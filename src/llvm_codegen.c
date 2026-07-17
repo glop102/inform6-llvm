@@ -1062,8 +1062,13 @@ extern int llvm_pipeline_routine(void)
     }
 
     {   const char *why = NULL;
-        if (llvm_lower_routine(m, fn, &why))
+        int insts_in = 0, insts_out = 0;
+        if (llvm_lower_routine(m, fn, &why, &insts_in, &insts_out)) {
             no_routines_lowered++;
+            if (LLVM_CODEGEN >= 3)
+                printf("LLVM: routine %s: %d instructions -> %d\n",
+                    llvm_current_routine_name(), insts_in, insts_out);
+        }
         else {
             no_routines_unlowered++;
             if (LLVM_CODEGEN >= 3)

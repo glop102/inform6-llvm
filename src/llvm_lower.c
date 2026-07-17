@@ -3118,7 +3118,7 @@ static void emit_terminator(LLVMValueRef term, LLVMBasicBlockRef cur,
 /* ------------------------------------------------------------------------- */
 
 extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
-    const char **fail_reason)
+    const char **fail_reason, int *insts_in, int *insts_out)
 {
     LLVMBasicBlockRef bb;
     LLVMValueRef in;
@@ -3128,6 +3128,8 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     cur_fn = fn;
     lower_failed = FALSE;
     lower_fail_reason = NULL;
+    *insts_in = 0;
+    *insts_out = 0;
     last_emit_noreturn = FALSE;
     n_stubs = 0;
     n_params = (int)LLVMCountParams(fn);
@@ -3217,8 +3219,10 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     }
 
     for (i = 0; i < llvm_event_count; i++)
-        if (!llvm_events[i].is_label)
+        if (!llvm_events[i].is_label) {
             llvm_lower_insts_in++;
+            (*insts_in)++;
+        }
     n_emitted = 0;
 
     llvm_buffer_reset();
@@ -3245,6 +3249,7 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     }
 
     llvm_lower_insts_out += n_emitted;
+    *insts_out = n_emitted;
 
     my_free(&vals, "llvm lower values");
     my_free(&blkinfo, "llvm lower blocks");
