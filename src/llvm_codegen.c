@@ -56,7 +56,7 @@
 #define MAX_SYMBOLIC_STACK 64
 
 static LLVMContextRef llctx;        /* created lazily, lives all compile     */
-static FILE *dump_file;             /* $LLVM=2 dump stream, opened lazily    */
+static FILE *dump_file;             /* $LLVM=3 dump stream, opened lazily    */
 
 static int no_routines_lifted;      /* statistics                            */
 static int no_routines_bailed;

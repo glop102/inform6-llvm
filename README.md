@@ -26,9 +26,8 @@ emit `GLULXE_OPCODE_COUNT_0x<opcode>=<n>` records for every executed opcode.
 `make bench` uses it to report deterministic classic-versus-LLVM dynamic
 instruction totals and writes their opcode comparison to
 `tests/life.opcodes.tsv` alongside timing medians. Set `BENCH_RUNS` to change
-the default five timing runs. A dev shell opened before the histogram patch was
-built will continue to provide total counts but skip the opcode TSV; exit and
-re-enter `nix develop` to refresh `glulxe-counted`.
+the default five timing runs. Older counted interpreters which do not support
+histograms still provide total counts but skip the opcode TSV.
 
 LLVM is optional: the Makefile detects it via `llvm-config` and, when it
 isn't found (or with `make WITH_LLVM=0`), builds `src/llvm_stub.c` in
@@ -50,12 +49,13 @@ option (Glulx only) and is **on by default**:
 ./inform6-llvm -G '$LLVM=3' game.inf game.ulx    # + dump IR to inform6-llvm-dump.ll
 ```
 
-With `$LLVM=0` the compiler behaves exactly like upstream. `$LLVM=1`
-routes every routine through the capture buffer but replays it without
-optimizing (for testing the seam — output stays byte-identical). The
-default, `$LLVM=2`, is the full pipeline; `$LLVM=3` additionally dumps
-each routine's IR before and after optimization and reports routines the
-pipeline could not handle.
+With `$LLVM=0` eligible code uses the classic path. `$LLVM=1` routes each
+eligible Glulx routine through the capture buffer but replays it without
+optimizing; debug-file builds, asterisk-traced routines, and Infix builds
+bypass capture. Captured output stays byte-identical to `$LLVM=0`. The default,
+`$LLVM=2`, is the full pipeline; `$LLVM=3` additionally dumps each routine's IR
+before and after optimization and reports routines the pipeline could not
+handle.
 
 ## Architecture
 
@@ -67,7 +67,8 @@ and records each routine as instruction and label events. At routine end:
 2. LLVM runs `mem2reg`, `instcombine`, `simplifycfg`, `reassociate`, LICM, GVN,
    DCE, and a final CFG simplification.
 3. `src/llvm_lower.c` validates the optimized shape, assigns Glulx
-   representations, and lowers it back into the capture buffer.
+   representations, chooses block layout, and constructs a block/edge emission
+   plan before lowering it back into the capture buffer.
 4. `src/asm.c` replays either the optimized or original stream through the
    classic encoder, preserving branch shortening, labels, and backpatching.
 
@@ -85,9 +86,9 @@ The lowerer is designed around interpreter costs rather than native register
 allocation. Values can resolve directly as global operands, ride the VM stack
 when consumed once in LIFO order, or occupy reusable local slots. It also
 coalesces phis, sinks speculated select arms, reconstructs short-circuit
-conditions, folds stores and returns, and shapes branches for Glulx encodings.
-`loop-rotate` is deliberately excluded because it increased dynamic work in
-benchmarks.
+conditions, folds stores and returns, and plans fallthroughs, inline returns,
+and phi-copy stubs before emitting branches. `loop-rotate` is deliberately
+excluded because it increased dynamic work in benchmarks.
 
 ## Status
 
@@ -166,7 +167,7 @@ default language include is capitalized "English", while the library ships
 - Add Linux CI which requires the real LLVM pipeline, `glulxe`, and
   `glulxe-counted` instead of permitting local dependency skips.
 - Use dynamic counts to reduce interpreted work in the optimization benchmark;
-  see [REVIEW.md](REVIEW.md) for current measurements and candidate causes.
+  the focused fixture remains above classic even though Life is now below it.
 - Validate a larger game corpus both ways, recording behavior, optimization
   coverage, story size, static instructions, and dynamic instructions.
 - Resolve the correctness and LLVM-effect-model findings in the review.

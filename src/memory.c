@@ -281,7 +281,7 @@ int DICT_IMPLICIT_SINGULAR; /* 0: no, 1: yes */
 int DICT_TRUNCATE_FLAG; /* 0: no, 1: yes */
 int LONG_DICT_FLAG_BUG; /* 0: no bug, 1: bug (default for historic reasons) */
 int TRANSCRIPT_FORMAT; /* 0: classic, 1: prefixed */
-int LLVM_CODEGEN; /* (glulx) 0: classic codegen, 1: route routines through LLVM */
+int LLVM_CODEGEN; /* Glulx: 0 classic, 1 capture, 2 optimize, 3 diagnostics */
 
 /* ------------------------------------------------------------------------- */
 /*   Memory control from the command line                                    */

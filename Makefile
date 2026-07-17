@@ -52,7 +52,7 @@ bench: inform6-llvm
 	tests/run-life.sh
 
 clean-tests:
-	rm -f tests/*.ulx tests/*.z5 tests/*.log tests/inform6-llvm-dump.ll
+	rm -f tests/*.ulx tests/*.z5 tests/*.log tests/inform6-llvm-dump.ll tests/life.opcodes.tsv
 
 clean: clean-tests
 	rm -rf $(BUILDDIR) inform6-llvm
