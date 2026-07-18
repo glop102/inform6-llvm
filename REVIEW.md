@@ -185,13 +185,14 @@ addressed the most serious harness gaps:
 - `tests/captureReplayTest.nix` exercises only Glulx; there is no Z-machine baseline for
   assembler changes shared with the capture seam.
 
-The focused fixture currently requires 11 of 11 captured routines to lower,
-with zero lift or lowering bailouts. It checks exactly 136 aggregate input
-instructions, at most 152 emitted instructions, and exactly 362 classic dynamic
-dispatches with an LLVM ceiling of 395. Its named static checks cover store
+The focused fixture currently requires 12 of 12 captured routines to lower,
+with zero lift or lowering bailouts. It checks exactly 156 aggregate input
+instructions, at most 175 emitted instructions, and exactly 396 classic dynamic
+dispatches with an LLVM ceiling of 444. Its named static checks cover store
 fusion, comparison and select returns, boolean trees, loop phis, recurrence
-folding, four-block layout, and switch order. Broader fixtures still need
-coverage assertions so corpus routines cannot silently stop optimizing.
+folding, four-block layout, switch order, and shared-target switch cases.
+Broader fixtures still need coverage assertions so corpus routines cannot
+silently stop optimizing.
 
 ### Recommended Test Gate
 
@@ -331,18 +332,15 @@ broad transcript coverage.
 
 ## Instruction-Count Findings
 
-### Switch Fallthrough Can Penalize a Hot Case
+### Switch Fallthrough Preserves Earlier Case Order
 
-In `plan_terminator()` at `src/llvm_lower.c:3134-3163`, the first switch case
-targeting the next block is selected as the fallthrough case;
-`emit_terminator()` emits it last and inverted at
-`src/llvm_lower.c:3233-3248`. This saves a jump on that path but moves the case
-behind every other comparison.
-
-For a 63-case switch, a common first case can change from one comparison to 63
-comparisons. Without branch-frequency information, the safer minimal choice is
-to move only the last eligible case, which cannot increase the number of
-comparisons needed by preceding cases.
+`plan_terminator()` at `src/llvm_lower.c:3134-3165` selects the last switch case
+targeting the next block as the fallthrough case; `emit_terminator()` emits it
+last and inverted at `src/llvm_lower.c:3235-3250`. Selecting the last eligible
+case cannot increase the number of comparisons needed by preceding cases when
+branch frequency is unknown. `Opt_SwitchShared` guards this policy dynamically:
+selecting the first shared-target case exceeds the focused fixture's LLVM
+dispatch ceiling by two instructions.
 
 ### Signed Division Can Expand Into Unsigned Emulation
 
@@ -375,7 +373,7 @@ During emission planning, a conditional target requiring a phi-copy stub causes
 `plan_terminator()` to force a jump on the opposite edge at
 `src/llvm_lower.c:3117-3129`. That edge is planned as `EDGE_DIRECT` rather than
 `EDGE_FALLTHROUGH`, and `emit_terminator()` emits its explicit jump before
-flushing the stub at `src/llvm_lower.c:3224-3230`.
+flushing the stub at `src/llvm_lower.c:3226-3232`.
 
 This adds one dispatch whenever the non-stub fallthrough edge is taken. Stub
 placement or a final `jump L; L:` peephole should remove it.
@@ -384,7 +382,7 @@ placement or a final `jump L; L:` peephole should remove it.
 
 `ret_select_pass()` accepts only selects whose arms are both immediate values
 at `src/llvm_lower.c:1631-1661`. The fused return emitter already resolves
-ordinary operands at `src/llvm_lower.c:3183-3203`.
+ordinary operands at `src/llvm_lower.c:3185-3205`.
 
 For `return condition ? a : b`, the current lowering can materialize the select
 in a slot and then return it. Direct conditional returns avoid one or two
@@ -431,7 +429,7 @@ silently reduce coverage.
 
 Successfully lowered routines replace the captured stream unconditionally
 through `src/llvm_codegen.c:1063-1077`; the lowerer resets and rewrites the
-capture buffer at `src/llvm_lower.c:3442-3486`. The current aggregate statistic
+capture buffer at `src/llvm_lower.c:3444-3488`. The current aggregate statistic
 records static counts but does not influence acceptance.
 
 A blanket rule rejecting output whenever its static count exceeds the classic
@@ -554,14 +552,13 @@ baselines, but no longer describe the complete guarded state.
    weighted model against repeated whole-program timings.
 2. Add routine or PC-range attribution for Life opcode differences and
    remaining locally excessive dispatches.
-3. Extend focused coverage for switch hot-case ordering and non-immediate
-   select returns, and add fixtures for phi-stub fallthrough, division
-   canonicalization, and LICM.
+3. Extend focused coverage for non-immediate select returns, and add fixtures
+   for phi-stub fallthrough, division canonicalization, and LICM.
 4. Put the real LLVM build and strict optimization suite in Linux CI.
 5. Disable unsafe optimization in the presence of `jumpabs` and correct the
    removable-read attributes.
-6. Fix the demonstrated instruction-count regressions, beginning with switch
-   ordering and phi-stub fallthrough.
+6. Fix the demonstrated instruction-count regressions, beginning with
+   phi-stub fallthrough.
 7. Develop a generic CFG profitability estimate based on loop structure and
    measured target costs before making routine replacement conditional on cost.
 

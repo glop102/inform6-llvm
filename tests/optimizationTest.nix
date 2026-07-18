@@ -39,12 +39,12 @@ writeShellApplication {
         not_lowered=''${BASH_REMATCH[4]}
         insts_in=''${BASH_REMATCH[5]}
         insts_out=''${BASH_REMATCH[6]}
-        if [ "$optimized" -ne 11 ] || [ "$captured" -ne 11 ] || \
+        if [ "$optimized" -ne 12 ] || [ "$captured" -ne 12 ] || \
            [ "$not_lifted" -ne 0 ] || [ "$not_lowered" -ne 0 ]; then
             echo "FAIL  optimization (lowering coverage: $stats_line)"
             fail=1
         fi
-        if [ "$insts_in" -ne 136 ] || [ "$insts_out" -gt 152 ]; then
+        if [ "$insts_in" -ne 156 ] || [ "$insts_out" -gt 175 ]; then
             echo "FAIL  optimization (aggregate instruction bound: $stats_line)"
             fail=1
         fi
@@ -76,6 +76,7 @@ writeShellApplication {
     check_routine Opt_InductionSelect 13 19
     check_routine Opt_BranchLayout 13 17
     check_routine Opt_SwitchOrder 12 14
+    check_routine Opt_SwitchShared 8 11
 
     run_story() {
         local story=$1 log=$2 status
@@ -129,7 +130,7 @@ writeShellApplication {
         fail=1
     fi
     if [ "$fail" -eq 0 ] && \
-       { [ "$classic_count" -ne 362 ] || [ "$llvm_count" -gt 395 ]; }; then
+       { [ "$classic_count" -ne 396 ] || [ "$llvm_count" -gt 444 ]; }; then
         echo "FAIL  optimization (dynamic instruction bound: classic $classic_count, LLVM $llvm_count)"
         fail=1
     fi

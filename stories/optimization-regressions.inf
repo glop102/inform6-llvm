@@ -68,6 +68,13 @@ Array opt_cells --> 2;
     }
 ];
 
+[ Opt_SwitchShared x;
+    switch (x) {
+        10, 20, 30, 40, 50: return 101;
+        default: return 199;
+    }
+];
+
 [ Main win dummy;
     @setiosys 2 0;
     @copy 0 sp;
@@ -96,5 +103,9 @@ Array opt_cells --> 2;
           Opt_SwitchOrder(10), " ",
           Opt_SwitchOrder(30), " ",
           Opt_SwitchOrder(50), " ",
-          Opt_SwitchOrder(99), "^done.^";
+          Opt_SwitchOrder(99), " ",
+          Opt_SwitchShared(10), " ",
+          Opt_SwitchShared(30), " ",
+          Opt_SwitchShared(50), " ",
+          Opt_SwitchShared(99), "^done.^";
 ];

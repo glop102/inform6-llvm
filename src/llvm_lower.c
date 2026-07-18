@@ -3142,7 +3142,9 @@ static void plan_terminator(emitblock *bp, LLVMBasicBlockRef next_bb)
             for (c = 2; c < nops; c += 2) {
                 LLVMBasicBlockRef dest = bp->edges[c / 2].succ;
                 if (phi_count(dest) != 0) { ft = -1; break; }
-                if (dest == next_bb && ft < 0) ft = c / 2;
+                /* Moving the last eligible case cannot delay an earlier
+                   case merely to create the fallthrough. */
+                if (dest == next_bb) ft = c / 2;
             }
         }
         for (c = 2; c < nops; c += 2) {
