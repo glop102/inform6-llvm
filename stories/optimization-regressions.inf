@@ -1,5 +1,5 @@
 ! Focused LLVM optimization-count fixture. Keep routines small and independent
-! so run-opt.sh can enforce narrow per-routine instruction ceilings.
+! so tests/optimizationTest.nix can enforce narrow instruction ceilings.
 
 Constant Story "LLVM optimization fixture";
 

@@ -57,7 +57,7 @@ dynamic count showed that a regression existed, but not whether LLVM added
 copies, branches, arithmetic, address calculations, or expensive VM operations.
 
 `glulxe-counted` now accepts `--opcode-histogram` and emits the total plus one
-machine-readable count for every executed opcode. `tests/run-life.sh` validates
+machine-readable count for every executed opcode. `tests/lifeBenchmark.nix` validates
 that the histogram sums to the total and writes the classic/LLVM comparison to
 `tests/life.opcodes.tsv`. Collection remains optional so the simplest
 total-count path stays cheap and stable.
@@ -166,12 +166,12 @@ The initial review found useful behavioral coverage but almost no
 optimization-quality regression coverage. The first test-suite work has since
 addressed the most serious harness gaps:
 
-- `tests/run-m1.sh` proves that capture/replay remains byte-identical.
-- `tests/run-opt.sh` requires a real LLVM build in strict mode, asserts that a
+- `tests/captureReplayTest.nix` proves that capture/replay remains byte-identical.
+- `tests/optimizationTest.nix` uses a real LLVM build and asserts that a
   focused fixture lifts and lowers completely, and enforces aggregate,
   per-routine static, and dynamic instruction ceilings.
-- `tests/run-m3.sh` compares classic and optimized interpreter transcripts.
-- `tests/run-life.sh` alternates execution order, reports timing median/min/max,
+- `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
+- `tests/lifeBenchmark.nix` alternates execution order, reports timing median/min/max,
   and reports deterministic dynamic instruction totals.
 - Interpreter and timeout statuses are checked explicitly.
 - The `glulxercise` gate asserts the exact count of known layout-sensitive
@@ -182,7 +182,7 @@ addressed the most serious harness gaps:
 - Missing `glulxe` causes the behavioral and benchmark scripts to exit
   successfully without testing anything. Missing Inform library files also
   turn the Cloak checks into successful skips.
-- `tests/run-m1.sh` exercises only Glulx; there is no Z-machine baseline for
+- `tests/captureReplayTest.nix` exercises only Glulx; there is no Z-machine baseline for
   assembler changes shared with the capture seam.
 
 The focused fixture currently requires 11 of 11 captured routines to lower,
@@ -220,7 +220,8 @@ always be paired with lifted/lowered coverage assertions.
 
 ### Initial Microbenchmark Plan and Current Coverage
 
-The initial review proposed the following fixture areas. `tests/opt.inf` now
+The initial review proposed the following fixture areas.
+`stories/optimization-regressions.inf` now
 covers store fusion, comparison and immediate select returns, boolean trees,
 loop phis, recurrence folding and loop-rotation sensitivity, four-block layout,
 and switch ordering. The list retains covered areas to show the intended
@@ -287,7 +288,7 @@ allows it to jump into the interior of a routine, but LLVM may remove or
 reorder that routine's instructions and change its local-frame layout.
 
 The compliance suite already observes this mismatch and suppresses it at
-`tests/run-m3.sh:48-53` and `tests/run-m3.sh:75-80`. Programs using `jumpabs`
+`tests/complianceTest.nix`. Programs using `jumpabs`
 can therefore silently change behavior under the default LLVM level. A routine
 containing `jumpabs` should not be optimized. Because one routine can jump into
 another, a conservative implementation may need to disable routine rewriting
@@ -521,7 +522,7 @@ gains on additional VM dispatches.
 
 ## Documentation and Maintenance Notes
 
-- The M1 identity script currently tests only Glulx.
+- The capture/replay identity test currently covers only Glulx.
 - Corpus-scale dual compilation, behavioral comparison, code-size measurement,
   and dynamic-instruction reporting remain open.
 - Compile-time `lookup()` scans remain quadratic in routine size. This does not

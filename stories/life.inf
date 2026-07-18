@@ -18,7 +18,7 @@
 !
 ! Timing uses glk_current_time when available and is printed as the
 ! final "Elapsed:" line -- strip that line when diffing transcripts
-! (see run-life.sh).
+! (see tests/lifeBenchmark.nix).
 
 Constant GRIDW 64;
 Constant GRIDH 48;

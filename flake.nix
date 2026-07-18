@@ -4,7 +4,7 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
-    # Headless Glulx interpreter for transcript-comparison tests (M3+):
+    # Headless Glulx interpreter for transcript-comparison tests:
     # glulxe (the reference interpreter) linked against CheapGlk (stdio Glk).
     cheapglk = {
       url = "github:erkyrath/cheapglk";
@@ -23,21 +23,39 @@
 
   outputs = inputs@{ self, nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachDefaultSystem (system:
-      (pkgs:
-        let
-          glulxe-counted = pkgs.glulxe.overrideAttrs (old: {
-            pname = "glulxe-counted";
-            patches = (old.patches or [ ]) ++ [
-              ./patches/glulxe-instruction-count.patch
-            ];
-            postInstall = (old.postInstall or "") + ''
-              mv "$out/bin/glulxe" "$out/bin/glulxe-counted"
-            '';
-          });
-        in {
+      (pkgs: {
         packages = {
           inherit (pkgs) cheapglk glulxe;
-          inherit glulxe-counted;
+          inherit (pkgs) glulxe-counted inform6-llvm;
+          default = pkgs.inform6-llvm;
+        };
+
+        legacyPackages = {
+          inherit (pkgs) compiledStories testApps benchmarkApps;
+        };
+
+        apps = {
+          tests = {
+            type = "app";
+            program = pkgs.lib.getExe (pkgs.writeShellApplication {
+              name = "inform6-llvm-tests";
+              text = ''
+                ${pkgs.lib.getExe pkgs.testApps.captureReplay}
+                ${pkgs.lib.getExe pkgs.testApps.optimization}
+                ${pkgs.lib.getExe pkgs.testApps.compliance}
+              '';
+            });
+          };
+
+          benchmarks = {
+            type = "app";
+            program = pkgs.lib.getExe (pkgs.writeShellApplication {
+              name = "inform6-llvm-benchmarks";
+              text = ''
+                ${pkgs.lib.getExe pkgs.benchmarkApps.life}
+              '';
+            });
+          };
         };
 
         devShells.default = pkgs.mkShell {
@@ -59,7 +77,7 @@
 
             # Glulx interpreter for running compiled story files in tests
             pkgs.glulxe
-            glulxe-counted
+            pkgs.glulxe-counted
           ];
 
           shellHook = ''

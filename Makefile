@@ -43,13 +43,11 @@ $(BUILDDIR)/llvm_codegen.o $(BUILDDIR)/llvm_lower.o: \
 $(BUILDDIR):
 	mkdir -p $(BUILDDIR)
 
-test: inform6-llvm
-	tests/run-m1.sh
-	tests/run-opt.sh
-	tests/run-m3.sh
+test:
+	nix run .#tests
 
-bench: inform6-llvm
-	tests/run-life.sh
+bench:
+	nix run .#benchmarks
 
 clean-tests:
 	rm -f tests/*.ulx tests/*.z5 tests/*.log tests/inform6-llvm-dump.ll tests/life.opcodes.tsv

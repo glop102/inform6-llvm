@@ -12,7 +12,13 @@ sources moved under `./src/` and the LLVM modules added alongside them.
 
 ## Building
 
-A Nix devshell provides the toolchain (LLVM 21, clang, make):
+A Nix package builds the compiler directly:
+
+```
+nix build
+```
+
+For source development, the devshell provides LLVM 21, clang, and make:
 
 ```
 nix develop
@@ -108,22 +114,33 @@ optimization roadmap.
 ## Tests
 
 ```
-make test         # build and run the test suite (Glulx only)
-make bench        # run the Game of Life benchmark (tests/run-life.sh)
-make clean-tests  # remove test artifacts (.ulx, logs, IR dumps)
+nix run .#tests              # build the stories, then run all test gates
+nix run .#benchmarks         # build and run the Game of Life benchmark
+
+make test                    # alias for nix run .#tests
+make bench                   # alias for nix run .#benchmarks
 ```
 
-`run-m1.sh` checks that `$LLVM=1` capture/replay output is byte-identical to
-classic Glulx output. `run-opt.sh` requires complete lowering of a focused
-fixture and enforces aggregate, per-routine static, and optional dynamic
-instruction ceilings. Set `REQUIRE_LLVM=1`, `REQUIRE_GLULXE=1`, and
-`REQUIRE_GLULXE_COUNTED=1` for a strict environment. `run-m3.sh` compiles each
-test both ways, runs both stories under `glulxe`, and requires identical
-behavior.
+The Nix apps are the reproducible path: each source under `stories/` is
+compiled in its own derivation, and the runners receive the resulting `.ulx`
+files together with the pinned interpreters. These derivations are grouped by
+compiler mode under `compiledStories.classic`, `compiledStories.capture`, and
+`compiledStories.llvm`; for example,
+`nix build .#compiledStories.llvm.glulxercise`. A compiled-story derivation's
+output is the `.ulx` file directly. Test and benchmark runners remain in the
+flake apps rather than the story packages.
+
+`tests/captureReplayTest.nix` checks that `$LLVM=1` output is byte-identical to
+classic Glulx output. `tests/optimizationTest.nix` requires complete lowering
+of a focused fixture and enforces aggregate, per-routine static, and dynamic
+instruction ceilings. `tests/complianceTest.nix` runs its mapped classic and
+LLVM stories under `glulxe` and requires identical behavior. Each test selects
+its own stories from `compiledStories` during evaluation; `stories/default.nix`
+only defines the compilation machinery and outputs.
 
 Two compliance tests exercise the API surface beyond ordinary game code:
 
-- `veneer.inf` calls every veneer routine the Glulx compiler can emit
+- `veneer-compliance.inf` calls every veneer routine the Glulx compiler can emit
   (property/class machinery, strict-mode checks, print rules, class
   messages, `glk()`, dynamic strings, actions) with layout-independent
   output, compared transcript-for-transcript.
@@ -131,15 +148,16 @@ Two compliance tests exercise the API surface beyond ordinary game code:
   (public domain, from <https://eblong.com/zarf/glulx/>), driven by
   `glulxercise.walk`. It is self-checking, so instead of a transcript
   diff the classic build must pass every check and the LLVM build may fail only
-  the exact known layout-sensitive checks documented in `run-m3.sh` and
+  the exact known layout-sensitive checks documented in
+  `tests/complianceTest.nix` and
   [REVIEW.md](REVIEW.md).
 
 `life.inf` is a Game of Life benchmark: 500 generations on a 64x48
 torus, self-timed via `glk_current_time`. On an interpreter with Glk
 graphics (Gargoyle, WinGlulxe, ...) it draws each cell as a filled square in a
 graphics window; under the headless CheapGlk glulxe it falls back to text
-rendering. `run-life.sh` (also `make bench`) compiles it both ways, requires
-identical simulation output, alternates execution order, and reports timing
+rendering. `tests/lifeBenchmark.nix` receives the precompiled stories from the Nix app,
+requires identical simulation output, alternates execution order, and reports timing
 median, minimum, maximum, and dynamic instruction totals. It runs each version
 five times by default; set `BENCH_RUNS` to change this.
 
@@ -162,8 +180,9 @@ default language include is capitalized "English", while the library ships
   [erkyrath/inform6-testing](https://github.com/erkyrath/inform6-testing)
   (the upstream compiler's regression suite): compile its tests both ways
   and gate on behavior, replacing the bespoke `cloak.inf` + `tests/lib`
-  setup. The small local tests (`hello`, `torture`, `m3`, `veneer`,
-  `glulxercise`) stay as quick gates.
+  setup. The local `computation-roundtrip`, `veneer-compliance`,
+  `glulxercise`, `optimization-regressions`, and
+  `metaclass-region-regression` fixtures stay as quick targeted gates.
 - Add Linux CI which requires the real LLVM pipeline, `glulxe`, and
   `glulxe-counted` instead of permitting local dependency skips.
 - Use dynamic counts to reduce interpreted work in the optimization benchmark;

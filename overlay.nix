@@ -1,6 +1,15 @@
-# Overlay providing the headless Glulx interpreter used by the test suite:
-# glulxe (the reference interpreter) linked against CheapGlk (stdio Glk).
-flakeInputs: final: prev: {
+# Project packages, compiled stories, and their test and benchmark consumers.
+flakeInputs: final: prev:
+let
+  testApps = {
+    captureReplay = final.callPackage ./tests/captureReplayTest.nix { };
+    compliance = final.callPackage ./tests/complianceTest.nix { };
+    optimization = final.callPackage ./tests/optimizationTest.nix { };
+  };
+  benchmarkApps = {
+    life = final.callPackage ./tests/lifeBenchmark.nix { };
+  };
+in {
   cheapglk = final.stdenv.mkDerivation {
     pname = "cheapglk";
     version = flakeInputs.cheapglk.shortRev or "unstable";
@@ -36,4 +45,50 @@ flakeInputs: final: prev: {
       runHook postInstall
     '';
   };
+
+  glulxe-counted = final.glulxe.overrideAttrs (old: {
+    pname = "glulxe-counted";
+    patches = (old.patches or [ ]) ++ [
+      ./patches/glulxe-instruction-count.patch
+    ];
+    postInstall = (old.postInstall or "") + ''
+      mv "$out/bin/glulxe" "$out/bin/glulxe-counted"
+    '';
+  });
+
+  inform6-llvm = final.stdenv.mkDerivation {
+    pname = "inform6-llvm";
+    version = "unstable";
+    src = final.lib.fileset.toSource {
+      root = ./.;
+      fileset = final.lib.fileset.unions [
+        ./Makefile
+        ./src
+      ];
+    };
+    nativeBuildInputs = [
+      final.gnumake
+      final.llvmPackages_21.clang
+      final.llvmPackages_21.llvm.dev
+    ];
+    buildInputs = [ final.llvmPackages_21.llvm ];
+    makeFlags = [
+      "CC=${final.llvmPackages_21.clang}/bin/clang"
+      "LLVM_CONFIG=${final.llvmPackages_21.llvm.dev}/bin/llvm-config"
+      "WITH_LLVM=1"
+    ];
+    installPhase = ''
+      runHook preInstall
+      install -Dm755 inform6-llvm "$out/bin/inform6-llvm"
+      runHook postInstall
+    '';
+    meta.mainProgram = "inform6-llvm";
+  };
+
+  compiledStories = final.callPackage ./stories {
+    inform6lib = flakeInputs.inform6lib;
+  };
+
+  inherit testApps benchmarkApps;
+
 }

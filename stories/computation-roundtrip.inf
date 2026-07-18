@@ -1,8 +1,8 @@
-! M3 round-trip test: computational results printed through a bare Glk
+! Computational round-trip test: results printed through a bare Glk
 ! window. Compiled classic vs LLVM and run under glulxe; the transcripts
 ! must be identical.
 
-Constant Story "M3";
+Constant Story "Computation round-trip";
 
 Global counter = 0;
 Global mask = $ff00;
@@ -72,6 +72,12 @@ Array numbers --> 12;
     return x;
 ];
 
+[ Unreachable x;
+    return 5;
+    x = x + 1;   ! deliberately dead code (tests label stripping)
+    return x;
+];
+
 [ Deep a b c d e;
     return Arith(a, b) + Arith(c, d) - e + Fib(6);
 ];
@@ -121,6 +127,7 @@ Array numbers --> 12;
     new_line;
     print "loops: ", Loops(), "^";
     print "labels: ", Labels(2), " ", Labels(9), "^";
+    print "unreachable: ", Unreachable(), "^";
     print "deep: ", Deep(1, 2, 3, 4, 5), "^";
     print "negatives: ", Negatives(7), " ", Negatives(-9), "^";
     counter = counter + 3;
