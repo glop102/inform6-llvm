@@ -1,0 +1,43 @@
+Constant Story "Direct IR Phase 1";
+
+[ Direct_Constant;
+    return 7;
+];
+
+[ Direct_Parameter x;
+    return x;
+];
+
+[ Direct_Assignment x;
+    x = 11;
+    return x;
+];
+
+[ Direct_Branch x;
+    jump Done;
+    .Done;
+    return x;
+];
+
+[ Direct_Inline x;
+    @copy 7 x;
+    return x;
+];
+
+[ Main win dummy;
+    @setiosys 2 0;
+    @copy 0 sp;
+    @copy 3 sp;
+    @copy 0 sp;
+    @copy 0 sp;
+    @copy 0 sp;
+    @glk $0023 5 win;
+    @copy win sp;
+    @glk $002F 1 dummy;
+
+    print Direct_Constant(), " ",
+          Direct_Parameter(9), " ",
+          Direct_Assignment(3), " ",
+          Direct_Branch(13), " ",
+          Direct_Inline(2), "^done.^";
+];

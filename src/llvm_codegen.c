@@ -62,6 +62,15 @@ static int no_routines_lifted;      /* statistics                            */
 static int no_routines_bailed;
 static int no_routines_lowered;
 static int no_routines_unlowered;
+static int no_routines_direct;
+static int no_routines_direct_fallback;
+
+static int llvm_diagnostics_enabled(void)
+{
+    const char *value = getenv("I6_LLVM_DIAGNOSTICS");
+    return LLVM_CODEGEN == 3
+        || (value && value[0] && strcmp(value, "0") != 0);
+}
 
 /* The optimization pipeline (new pass manager syntax). Deliberately no
    inlining or IPO: one IR function per routine. licm hoists loop-invariant
@@ -109,6 +118,19 @@ static int            symstack_depth;
 
 static int            lift_failed;
 static const char    *bail_reason;
+
+enum direct_state_e {
+    DIRECT_INACTIVE, DIRECT_BUILDING, DIRECT_REJECTED, DIRECT_READY
+};
+static enum direct_state_e direct_state;
+static LLVMModuleRef direct_mod;
+static LLVMBuilderRef direct_bld;
+static LLVMValueRef direct_fn;
+static LLVMValueRef *direct_locals;
+static int direct_local_count;
+static LLVMBasicBlockRef *direct_labels;
+static int direct_label_count;
+static const char *direct_reason;
 
 static void bail(const char *why)
 {   if (!lift_failed) {
@@ -964,31 +986,242 @@ static void unmerge_pointer_selects(LLVMValueRef f)
 /*   Entry points (called from asm.c)                                        */
 /* ------------------------------------------------------------------------- */
 
+static void direct_dispose_ir(void)
+{
+    if (direct_bld) {
+        LLVMDisposeBuilder(direct_bld);
+        direct_bld = NULL;
+    }
+    if (direct_mod) {
+        LLVMDisposeModule(direct_mod);
+        direct_mod = NULL;
+    }
+    free(direct_locals);
+    direct_locals = NULL;
+    free(direct_labels);
+    direct_labels = NULL;
+    direct_fn = NULL;
+    direct_local_count = 0;
+    direct_label_count = 0;
+}
+
+extern void llvm_direct_reject(const char *reason)
+{
+    if (direct_state != DIRECT_BUILDING)
+        return;
+    direct_reason = reason;
+    direct_dispose_ir();
+    direct_state = DIRECT_REJECTED;
+}
+
 extern void llvm_direct_routine_begin(const char *name, int local_count,
     int embedded_flag, int stack_arguments)
 {
-    (void)name;
-    (void)local_count;
     (void)embedded_flag;
-    (void)stack_arguments;
+    direct_state = DIRECT_INACTIVE;
+    direct_reason = NULL;
+    if (LLVM_CODEGEN != 4)
+        return;
+    if (stack_arguments) {
+        direct_state = DIRECT_REJECTED;
+        direct_reason = "stack-argument routine";
+        return;
+    }
+
+    if (!llctx)
+        llctx = LLVMContextCreate();
+    i32t = LLVMInt32TypeInContext(llctx);
+    direct_mod = LLVMModuleCreateWithNameInContext(name, llctx);
+    LLVMSetDataLayout(direct_mod, "e-p:32:32-i32:32-n32");
+    {   LLVMTypeRef *params = local_count
+            ? malloc((size_t)local_count * sizeof(*params)) : NULL;
+        LLVMTypeRef ft;
+        int i;
+        if (local_count && !params)
+            fatalerror("Out of memory creating direct LLVM parameters");
+        for (i = 0; i < local_count; i++)
+            params[i] = i32t;
+        ft = LLVMFunctionType(i32t, params, (unsigned)local_count, FALSE);
+        direct_fn = LLVMAddFunction(direct_mod, name, ft);
+        free(params);
+    }
+    direct_bld = LLVMCreateBuilderInContext(llctx);
+    LLVMPositionBuilderAtEnd(direct_bld,
+        LLVMAppendBasicBlockInContext(llctx, direct_fn, "entry"));
+    direct_local_count = local_count;
+    direct_locals = local_count
+        ? calloc((size_t)local_count + 1, sizeof(*direct_locals)) : NULL;
+    if (local_count && !direct_locals)
+        fatalerror("Out of memory creating direct LLVM locals");
+    {   int i;
+        for (i = 1; i <= local_count; i++) {
+            direct_locals[i] = LLVMBuildAlloca(direct_bld, i32t, "local");
+            LLVMBuildStore(direct_bld,
+                LLVMGetParam(direct_fn, (unsigned)(i-1)), direct_locals[i]);
+        }
+    }
+    direct_state = DIRECT_BUILDING;
 }
 
 extern void llvm_direct_routine_finish(int embedded_flag,
     int fallthrough_reachable)
 {
-    (void)embedded_flag;
-    (void)fallthrough_reachable;
+    LLVMBasicBlockRef bb;
+    if (direct_state != DIRECT_BUILDING)
+        return;
+    if (getenv("I6_LLVM_DIRECT_FAIL")
+        && strcmp(getenv("I6_LLVM_DIRECT_FAIL"), "lower") != 0) {
+        llvm_direct_reject("forced direct failure");
+        return;
+    }
+    bb = LLVMGetInsertBlock(direct_bld);
+    if (fallthrough_reachable) {
+        if (!bb || LLVMGetBasicBlockTerminator(bb)) {
+            llvm_direct_reject("invalid fallthrough block");
+            return;
+        }
+        LLVMBuildRet(direct_bld, LLVMConstInt(i32t,
+            embedded_flag ? 0 : 1, FALSE));
+    }
+    else if (!bb || !LLVMGetBasicBlockTerminator(bb)) {
+        llvm_direct_reject("unterminated unreachable block");
+        return;
+    }
+    LLVMDisposeBuilder(direct_bld);
+    direct_bld = NULL;
+    direct_state = DIRECT_READY;
 }
 
 extern void llvm_direct_routine_abandon(void)
 {
+    if (LLVM_CODEGEN == 4 && direct_state != DIRECT_INACTIVE) {
+        no_routines_direct_fallback++;
+        if (llvm_diagnostics_enabled())
+            printf("LLVM-BACKEND\tname=%s\tbackend=classic-fallback"
+                   "\tstage=direct-abandon\tinput=-1\temitted=-1"
+                   "\treason=source-errors\n",
+                llvm_current_routine_name());
+    }
+    direct_dispose_ir();
+    direct_state = DIRECT_INACTIVE;
+    direct_reason = NULL;
+}
+
+static int direct_can_emit(void)
+{
+    LLVMBasicBlockRef bb;
+    if (direct_state != DIRECT_BUILDING)
+        return FALSE;
+    bb = LLVMGetInsertBlock(direct_bld);
+    if (!bb || LLVMGetBasicBlockTerminator(bb)) {
+        llvm_direct_reject("operation after terminator");
+        return FALSE;
+    }
+    return TRUE;
+}
+
+extern void llvm_direct_note_statement(int statement_code)
+{
+    if (direct_state != DIRECT_BUILDING)
+        return;
+    if (statement_code != RETURN_CODE && statement_code != RTRUE_CODE
+        && statement_code != RFALSE_CODE && statement_code != JUMP_CODE)
+        llvm_direct_reject("unsupported statement");
+}
+
+extern void llvm_direct_store_local_constant(int destination, int32 value)
+{
+    if (!direct_can_emit()) return;
+    if (destination < 1 || destination > direct_local_count) {
+        llvm_direct_reject("invalid local assignment");
+        return;
+    }
+    LLVMBuildStore(direct_bld, LLVMConstInt(i32t, (uint32_t)value, FALSE),
+        direct_locals[destination]);
+}
+
+extern void llvm_direct_store_local(int destination, int source)
+{
+    LLVMValueRef value;
+    if (!direct_can_emit()) return;
+    if (destination < 1 || destination > direct_local_count
+        || source < 1 || source > direct_local_count) {
+        llvm_direct_reject("invalid local assignment");
+        return;
+    }
+    value = LLVMBuildLoad2(direct_bld, i32t, direct_locals[source], "value");
+    LLVMBuildStore(direct_bld, value, direct_locals[destination]);
+}
+
+extern void llvm_direct_return_constant(int32 value)
+{
+    if (!direct_can_emit()) return;
+    LLVMBuildRet(direct_bld, LLVMConstInt(i32t, (uint32_t)value, FALSE));
+}
+
+extern void llvm_direct_return_local(int source)
+{
+    LLVMValueRef value;
+    if (!direct_can_emit()) return;
+    if (source < 1 || source > direct_local_count) {
+        llvm_direct_reject("invalid local return");
+        return;
+    }
+    value = LLVMBuildLoad2(direct_bld, i32t, direct_locals[source], "value");
+    LLVMBuildRet(direct_bld, value);
+}
+
+static LLVMBasicBlockRef direct_label_block(int label)
+{
+    int i;
+    if (label < 0) {
+        llvm_direct_reject("invalid source label");
+        return NULL;
+    }
+    if (label >= direct_label_count) {
+        int new_count = label + 1;
+        LLVMBasicBlockRef *new_labels = realloc(direct_labels,
+            (size_t)new_count * sizeof(*new_labels));
+        if (!new_labels)
+            fatalerror("Out of memory creating direct LLVM labels");
+        direct_labels = new_labels;
+        for (i = direct_label_count; i < new_count; i++)
+            direct_labels[i] = NULL;
+        direct_label_count = new_count;
+    }
+    if (!direct_labels[label])
+        direct_labels[label] = LLVMAppendBasicBlockInContext(
+            llctx, direct_fn, "label");
+    return direct_labels[label];
+}
+
+extern void llvm_direct_jump(int label)
+{
+    LLVMBasicBlockRef target;
+    if (!direct_can_emit()) return;
+    target = direct_label_block(label);
+    if (target)
+        LLVMBuildBr(direct_bld, target);
+}
+
+extern void llvm_direct_bind_label(int label)
+{
+    LLVMBasicBlockRef current, target;
+    if (direct_state != DIRECT_BUILDING)
+        return;
+    target = direct_label_block(label);
+    if (!target) return;
+    current = LLVMGetInsertBlock(direct_bld);
+    if (current && !LLVMGetBasicBlockTerminator(current))
+        LLVMBuildBr(direct_bld, target);
+    LLVMPositionBuilderAtEnd(direct_bld, target);
 }
 
 /* $LLVM=3: dump the routine's IR, tagged with the pipeline phase. */
 static void dump_module(LLVMModuleRef m, const char *phase)
 {
     char *ir;
-    if (LLVM_CODEGEN < 3)
+    if (!llvm_diagnostics_enabled())
         return;
     if (!dump_file)
         dump_file = fopen("inform6-llvm-dump.ll", "w");
@@ -1005,11 +1238,88 @@ static void dump_module(LLVMModuleRef m, const char *phase)
 static void report_backend(const char *backend, const char *stage,
     int insts_in, int insts_out)
 {
-    if (LLVM_CODEGEN < 3)
+    if (!llvm_diagnostics_enabled())
         return;
     printf("LLVM-BACKEND\tname=%s\tbackend=%s\tstage=%s"
-           "\tinput=%d\temitted=%d\n",
+           "\tinput=%d\temitted=%d\treason=-\n",
         llvm_current_routine_name(), backend, stage, insts_in, insts_out);
+}
+
+static void direct_fallback(const char *stage, const char *detail)
+{
+    const char *p = detail ? detail : "unknown";
+    no_routines_direct_fallback++;
+    if (llvm_diagnostics_enabled()) {
+        printf("LLVM-BACKEND\tname=%s\tbackend=classic-fallback\tstage=%s"
+               "\tinput=-1\temitted=-1\treason=",
+            llvm_current_routine_name(), stage);
+        for (; *p; p++)
+            putchar((*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p);
+        putchar('\n');
+        printf("! LLVM direct: bailed on %s: %s\n",
+            llvm_current_routine_name(), detail ? detail : "unknown");
+    }
+    direct_dispose_ir();
+    direct_state = DIRECT_INACTIVE;
+    direct_reason = NULL;
+}
+
+static void process_direct_routine(void)
+{
+    char *errmsg = NULL;
+    const char *why = NULL;
+    int insts_in = 0, insts_out = 0;
+
+    if (LLVMVerifyModule(direct_mod, LLVMReturnStatusAction, &errmsg)) {
+        direct_fallback("direct-verify", errmsg ? errmsg : "verification failed");
+        LLVMDisposeMessage(errmsg);
+        return;
+    }
+    LLVMDisposeMessage(errmsg);
+    dump_module(direct_mod, "direct-pre-opt");
+
+    {   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+        LLVMErrorRef err = LLVMRunPasses(
+            direct_mod, LLVM_PASS_PIPELINE, NULL, opts);
+        LLVMDisposePassBuilderOptions(opts);
+        if (err) {
+            char *msg = LLVMGetErrorMessage(err);
+            direct_fallback("direct-optimize", msg ? msg : "pass failure");
+            LLVMDisposeErrorMessage(msg);
+            return;
+        }
+    }
+
+    unmerge_pointer_selects(direct_fn);
+    errmsg = NULL;
+    if (LLVMVerifyModule(direct_mod, LLVMReturnStatusAction, &errmsg)) {
+        direct_fallback("direct-post-verify",
+            errmsg ? errmsg : "post-optimization verification failed");
+        LLVMDisposeMessage(errmsg);
+        return;
+    }
+    LLVMDisposeMessage(errmsg);
+    dump_module(direct_mod, "direct-post-opt");
+
+    if (getenv("I6_LLVM_DIRECT_FAIL")
+        && strcmp(getenv("I6_LLVM_DIRECT_FAIL"), "lower") == 0) {
+        direct_fallback("direct-lower", "forced direct lowering failure");
+        return;
+    }
+
+    if (!llvm_lower_routine(direct_mod, direct_fn, &why,
+            &insts_in, &insts_out)) {
+        direct_fallback("direct-lower", why ? why : "lowering failed");
+        return;
+    }
+    report_backend("direct", "lower", insts_in, insts_out);
+    no_routines_direct++;
+    if (llvm_diagnostics_enabled())
+        printf("LLVM: direct routine %s: %d instructions -> %d\n",
+            llvm_current_routine_name(), insts_in, insts_out);
+    direct_dispose_ir();
+    direct_state = DIRECT_INACTIVE;
+    direct_reason = NULL;
 }
 
 /* Process the captured routine. Lift it to IR, optimize, and lower it
@@ -1023,6 +1333,16 @@ extern int llvm_pipeline_routine(void)
     LLVMModuleRef m;
     char *errmsg = NULL;
 
+    if (LLVM_CODEGEN == 4) {
+        if (direct_state == DIRECT_READY)
+            process_direct_routine();
+        else if (direct_state == DIRECT_REJECTED)
+            direct_fallback("direct-build", direct_reason);
+        else if (direct_state == DIRECT_BUILDING)
+            direct_fallback("direct-finish", "builder was not finalized");
+        return FALSE;
+    }
+
     /* Level 1: capture and replay only — prove the seam, change nothing. */
     if (LLVM_CODEGEN < 2)
         return FALSE;
@@ -1034,7 +1354,7 @@ extern int llvm_pipeline_routine(void)
     if (!m) {
         no_routines_bailed++;
         report_backend("classic-fallback", "lift", -1, -1);
-        if (LLVM_CODEGEN >= 3)
+        if (llvm_diagnostics_enabled())
             printf("! LLVM: bailed on %s: %s\n",
                 llvm_current_routine_name(),
                 bail_reason ? bail_reason : "unknown");
@@ -1074,6 +1394,19 @@ extern int llvm_pipeline_routine(void)
 
     unmerge_pointer_selects(fn);
 
+    errmsg = NULL;
+    if (LLVMVerifyModule(m, LLVMReturnStatusAction, &errmsg)) {
+        printf("! LLVM: post-optimization verifier rejected %s: %s\n",
+            llvm_current_routine_name(), errmsg ? errmsg : "");
+        LLVMDisposeMessage(errmsg);
+        LLVMDisposeModule(m);
+        mod = NULL;
+        no_routines_unlowered++;
+        report_backend("classic-fallback", "post-verify", -1, -1);
+        return FALSE;
+    }
+    LLVMDisposeMessage(errmsg);
+
     dump_module(m, "post-opt");
 
     /* Debugging aid: I6_LLVM_LIMIT=<n> lowers only the first n lifted
@@ -1100,14 +1433,14 @@ extern int llvm_pipeline_routine(void)
         if (llvm_lower_routine(m, fn, &why, &insts_in, &insts_out)) {
             no_routines_lowered++;
             report_backend("lifted", "lower", insts_in, insts_out);
-            if (LLVM_CODEGEN >= 3)
+            if (llvm_diagnostics_enabled())
                 printf("LLVM: routine %s: %d instructions -> %d\n",
                     llvm_current_routine_name(), insts_in, insts_out);
         }
         else {
             no_routines_unlowered++;
             report_backend("classic-fallback", "lower", insts_in, -1);
-            if (LLVM_CODEGEN >= 3)
+            if (llvm_diagnostics_enabled())
                 printf("! LLVM: could not lower %s: %s\n",
                     llvm_current_routine_name(), why ? why : "unknown");
         }
@@ -1120,6 +1453,8 @@ extern int llvm_pipeline_routine(void)
 
 extern void llvm_codegen_free(void)
 {
+    direct_dispose_ir();
+    direct_state = DIRECT_INACTIVE;
     if (LLVM_CODEGEN && (no_routines_lifted || no_routines_bailed)) {
         printf("LLVM: optimized %d of %d captured routines "
             "(%d not lifted, %d not lowered); "
@@ -1129,10 +1464,19 @@ extern void llvm_codegen_free(void)
             no_routines_bailed, no_routines_unlowered,
             llvm_lower_insts_in, llvm_lower_insts_out);
     }
+    if (no_routines_direct || no_routines_lowered || no_routines_bailed
+        || no_routines_unlowered || no_routines_direct_fallback) {
+        printf("LLVM: backends direct=%d lifted=%d fallback=%d\n",
+            no_routines_direct, no_routines_lowered,
+            no_routines_bailed + no_routines_unlowered
+                + no_routines_direct_fallback);
+    }
     no_routines_lifted = 0;
     no_routines_bailed = 0;
     no_routines_lowered = 0;
     no_routines_unlowered = 0;
+    no_routines_direct = 0;
+    no_routines_direct_fallback = 0;
     llvm_lower_insts_in = 0;
     llvm_lower_insts_out = 0;
     if (dump_file) {

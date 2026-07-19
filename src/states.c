@@ -757,6 +757,7 @@ static int parse_named_label_statements()
             symbols[token_value].flags |= USED_SFLAG;
             assemble_label_no(label);
             define_symbol_label(token_value);
+            llvm_direct_bind_label(label);
         }
         else
         {   if (symbols[token_value].type != LABEL_T) {
@@ -767,6 +768,7 @@ static int parse_named_label_statements()
             {   symbols[token_value].flags &= (~(CHANGE_SFLAG));
                 assemble_label_no(symbols[token_value].value);
                 define_symbol_label(token_value);
+                llvm_direct_bind_label(symbols[token_value].value);
             }
             else error_named("Duplicate definition of label:", token_text);
         }
@@ -1784,29 +1786,34 @@ static void parse_statement_g(int break_label, int continue_label)
     ASSERT_GLULX();
 
     if ((token_type == SEP_TT) && (token_value == HASH_SEP))
-    {   parse_directive(TRUE);
+    {   llvm_direct_reject("directive in routine");
+        parse_directive(TRUE);
         parse_statement(break_label, continue_label); return;
     }
 
     if ((token_type == SEP_TT) && (token_value == AT_SEP))
-    {   parse_assembly(); return;
+    {   llvm_direct_reject("inline assembly");
+        parse_assembly(); return;
     }
 
     if ((token_type == SEP_TT) && (token_value == SEMICOLON_SEP)) return;
 
     if ((token_type == SEP_TT) && (token_value == OPEN_BRACE_SEP))
     {
+        llvm_direct_reject("code block");
         put_token_back();
         parse_code_block(break_label, continue_label, 0);
         return;
     }
 
     if (token_type == DQ_TT)
-    {   parse_print_g(TRUE); return;
+    {   llvm_direct_reject("print statement");
+        parse_print_g(TRUE); return;
     }
 
     if ((token_type == SEP_TT) && (token_value == LESS_SEP))
-    {   parse_action(); goto StatementTerminator; }
+    {   llvm_direct_reject("action statement");
+        parse_action(); goto StatementTerminator; }
 
     if (token_type == EOF_TT)
     {   ebf_curtoken_error("statement"); return; }
@@ -1816,12 +1823,14 @@ static void parse_statement_g(int break_label, int continue_label)
     if (token_type != STATEMENT_TT)
     {   put_token_back();
         AO = parse_expression(VOID_CONTEXT);
+        llvm_direct_expression_statement(AO);
         code_generate(AO, VOID_CONTEXT, -1);
         if (vivc_flag) { panic_mode_error_recovery(); return; }
         goto StatementTerminator;
     }
 
     statements.enabled = FALSE;
+    llvm_direct_note_statement(token_value);
 
     switch(token_value)
     {
@@ -2333,7 +2342,9 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case JUMP_CODE:
-                 assembleg_jump(parse_label());
+                 ln = parse_label();
+                 llvm_direct_jump(ln);
+                 assembleg_jump(ln);
                  break;
 
     /*  -------------------------------------------------------------------- */
@@ -2563,12 +2574,14 @@ static void parse_statement_g(int break_label, int continue_label)
         case RETURN_CODE:
             get_next_token();
             if ((token_type == SEP_TT) && (token_value == SEMICOLON_SEP)) {
+                llvm_direct_return_constant(1);
                 assembleg_1(return_gc, one_operand); 
                 return; 
             }
             put_token_back();
-            AO = code_generate(parse_expression(RETURN_Q_CONTEXT),
-                QUANTITY_CONTEXT, -1);
+            AO = parse_expression(RETURN_Q_CONTEXT);
+            llvm_direct_return_expression(AO);
+            AO = code_generate(AO, QUANTITY_CONTEXT, -1);
             assembleg_1(return_gc, AO);
             break;
             
@@ -2577,6 +2590,7 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case RFALSE_CODE:   
+            llvm_direct_return_constant(0);
             assembleg_1(return_gc, zero_operand); 
             break;
 
@@ -2585,6 +2599,7 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case RTRUE_CODE:   
+            llvm_direct_return_constant(1);
             assembleg_1(return_gc, one_operand); 
             break;
 
@@ -2801,6 +2816,7 @@ extern void parse_statement_singleexpr(assembly_operand AO)
     if (execution_never_reaches_here)
         execution_never_reaches_here |= EXECSTATE_ENTIRE;
 
+    llvm_direct_expression_statement(AO);
     code_generate(AO, VOID_CONTEXT, -1);
     
     if (vivc_flag) {

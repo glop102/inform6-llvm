@@ -537,7 +537,8 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
         }
 
         if ((token_type == STATEMENT_TT) && (token_value == SDEFAULT_CODE))
-        {   if (default_clause_made)
+        {   llvm_direct_reject("top-level switch default");
+            if (default_clause_made)
                 error("Multiple 'default' clauses defined in same 'switch'");
             default_clause_made = TRUE;
 
@@ -573,6 +574,7 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
         {   get_next_token();
             if (switch_sign() > 0)
             {   assembly_operand AO;
+                llvm_direct_reject("top-level switch case");
                 if (default_clause_made)
                     error("'default' must be the last 'switch' case");
 

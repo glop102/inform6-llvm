@@ -1,0 +1,5 @@
+Constant Story "Direct IR error fixture";
+
+[ Broken x;
+    x = ;
+];

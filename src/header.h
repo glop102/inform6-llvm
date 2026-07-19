@@ -2275,12 +2275,26 @@ extern void  llvm_direct_routine_begin(const char *name, int local_count,
 extern void  llvm_direct_routine_finish(int embedded_flag,
                  int fallthrough_reachable);
 extern void  llvm_direct_routine_abandon(void);
+extern void  llvm_direct_reject(const char *reason);
+extern void  llvm_direct_note_statement(int statement_code);
+extern void  llvm_direct_store_local_constant(int destination, int32 value);
+extern void  llvm_direct_store_local(int destination, int source);
+extern void  llvm_direct_return_constant(int32 value);
+extern void  llvm_direct_return_local(int source);
+extern void  llvm_direct_jump(int label);
+extern void  llvm_direct_bind_label(int label);
+extern void  llvm_direct_expression_statement(assembly_operand AO);
+extern void  llvm_direct_return_expression(assembly_operand AO);
 extern void  llvm_codegen_free(void);
 extern void  llvm_buffer_reset(void);
 extern void  llvm_buffer_append_instruction(const assembly_instruction *a);
 extern void  llvm_buffer_append_label(int n);
 extern int   llvm_patch_routine_locals(int newcount);
 extern int32 glulx_opcode_by_name(const char *name);
+extern int   asm_parser_take_sequence_point(void);
+extern void  asm_parser_note_opcode(int terminates_flow);
+extern void  asm_parser_note_branch(int32 label);
+extern void  asm_parser_note_label(void);
 
 extern void print_operand(const assembly_operand *o, int annotate);
 extern char *variable_name(int32 i);

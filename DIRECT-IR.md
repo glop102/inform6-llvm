@@ -38,7 +38,7 @@ The project is successful when:
 ## Status
 
 - [x] Phase 0: pin upstream Inform and move classic Glulx comparisons to it.
-- [ ] Phase 1: establish direct routine lifecycle and lower trivial functions.
+- [x] Phase 1: establish direct routine lifecycle and lower trivial functions.
 - [ ] Phase 2: generate straight-line expressions directly.
 - [ ] Phase 3: generate structured control flow directly.
 - [ ] Phase 4: add calls, memory operations, VM effects, and inline assembly.
@@ -497,6 +497,10 @@ Exit gate:
 
 Provide a machine-readable diagnostics mode before corpus migration. One record
 per routine should include:
+
+During migration this mode is selected with `I6_LLVM_DIAGNOSTICS=1`, separately
+from the `$LLVM=4` direct-backend selection, so ordinary direct compiles do not
+emit one record per routine.
 
 - Routine identity.
 - Selected backend: direct, lifted, or classic fallback.

@@ -3246,6 +3246,66 @@ static void generate_code_from(int n, int void_flag)
     ET[n].down = -1;
 }
 
+static int direct_constant_operand(assembly_operand AO)
+{
+    if (AO.marker != 0)
+        return FALSE;
+    return AO.type == ZEROCONSTANT_OT || AO.type == BYTECONSTANT_OT
+        || AO.type == HALFCONSTANT_OT || AO.type == CONSTANT_OT;
+}
+
+static int direct_local_operand(assembly_operand AO)
+{
+    return AO.type == LOCALVAR_OT && AO.value >= 1
+        && AO.value <= no_locals;
+}
+
+extern void llvm_direct_return_expression(assembly_operand AO)
+{
+    if (direct_constant_operand(AO))
+        llvm_direct_return_constant(AO.value);
+    else if (direct_local_operand(AO))
+        llvm_direct_return_local(AO.value);
+    else
+        llvm_direct_reject("unsupported return expression");
+}
+
+extern void llvm_direct_expression_statement(assembly_operand AO)
+{
+    int root, destination, source;
+    assembly_operand dst, src;
+
+    if (AO.type != EXPRESSION_OT) {
+        llvm_direct_reject("unsupported expression statement");
+        return;
+    }
+    root = AO.value;
+    destination = ET[root].down;
+    if (ET[root].operator_number != SETEQUALS_OP || ET[root].up != -1
+        || ET[root].right != -1 || destination < 0) {
+        llvm_direct_reject("unsupported expression operator");
+        return;
+    }
+    source = ET[destination].right;
+    if (source < 0 || ET[source].right != -1
+        || ET[destination].down != -1 || ET[source].down != -1) {
+        llvm_direct_reject("unsupported assignment expression");
+        return;
+    }
+    dst = ET[destination].value;
+    src = ET[source].value;
+    if (!direct_local_operand(dst)) {
+        llvm_direct_reject("unsupported assignment destination");
+        return;
+    }
+    if (direct_constant_operand(src))
+        llvm_direct_store_local_constant(dst.value, src.value);
+    else if (direct_local_operand(src))
+        llvm_direct_store_local(dst.value, src.value);
+    else
+        llvm_direct_reject("unsupported assignment source");
+}
+
 assembly_operand code_generate(assembly_operand AO, int context, int label)
 {
     /*  Used in three contexts: VOID_CONTEXT, CONDITION_CONTEXT and

@@ -283,6 +283,35 @@ static void mark_label_used(int label)
     labeluse[label] += 1;
 }
 
+/* Parser-visible assembly bookkeeping. Shadow capture is the sole source-time
+   writer while direct IR is being introduced; final replay recomputes the
+   selected output stream after resetting the encoder state. */
+extern int asm_parser_take_sequence_point(void)
+{
+    if (veneer_mode)
+        sequence_point_follows = FALSE;
+    if (!sequence_point_follows)
+        return FALSE;
+    sequence_point_follows = FALSE;
+    return TRUE;
+}
+
+extern void asm_parser_note_opcode(int terminates_flow)
+{
+    execution_never_reaches_here = (terminates_flow
+        ? EXECSTATE_UNREACHABLE : EXECSTATE_REACHABLE);
+}
+
+extern void asm_parser_note_branch(int32 label)
+{
+    mark_label_used(label);
+}
+
+extern void asm_parser_note_label(void)
+{
+    execution_never_reaches_here = EXECSTATE_REACHABLE;
+}
+
 /* Decrement the counter. We do this in the transfer_routine phase as
    branches are optimized away.
 */
@@ -1091,11 +1120,6 @@ static void llvm_capture_instruction(const assembly_instruction *AI)
         ev->custom_no = opco.no;
     }
 
-    sequence_point_follows = FALSE;
-    execution_never_reaches_here =
-        ((opco.flags & Rf) ? EXECSTATE_UNREACHABLE : EXECSTATE_REACHABLE);
-    if ((opco.flags & Br) && (AI->operand_count == opco.no))
-        mark_label_used(AI->operand[AI->operand_count-1].value);
 }
 
 static void llvm_capture_label(int n)
@@ -1112,7 +1136,6 @@ static void llvm_capture_label(int n)
     ev->exec_state = execution_never_reaches_here & ~EXECSTATE_ENTIRE;
     ev->seq_point = FALSE;
 
-    execution_never_reaches_here = EXECSTATE_REACHABLE;
 }
 
 /* Replay the captured routine through the classic encoder, then reset the
@@ -1170,11 +1193,17 @@ extern void llvm_buffer_reset(void)
 }
 
 extern void llvm_buffer_append_instruction(const assembly_instruction *AI2)
-{   llvm_capture_instruction(AI2);
+{   opcodeg opco = internal_number_to_opcode_g(AI2->internal_number);
+    llvm_capture_instruction(AI2);
+    (void) asm_parser_take_sequence_point();
+    asm_parser_note_opcode((opco.flags & Rf) != 0);
+    if ((opco.flags & Br) && AI2->operand_count == opco.no)
+        asm_parser_note_branch(AI2->operand[AI2->operand_count-1].value);
 }
 
 extern void llvm_buffer_append_label(int n)
 {   llvm_capture_label(n);
+    asm_parser_note_label();
 }
 
 /* Reverse lookup for the opaque-call naming scheme (@i6.<opcode name>). */
@@ -1290,9 +1319,8 @@ extern void assemblez_instruction(const assembly_instruction *AI)
 
     no_instructions++;
 
-    if (veneer_mode) sequence_point_follows = FALSE;
-    if (sequence_point_follows)
-    {   sequence_point_follows = FALSE; at_seq_point = TRUE;
+    if (asm_parser_take_sequence_point())
+    {   at_seq_point = TRUE;
         if (debugfile_switch)
         {
             ensure_memory_list_available(&sequence_points_memlist, next_sequence_point+1);
@@ -1312,7 +1340,7 @@ extern void assemblez_instruction(const assembly_instruction *AI)
     }
 
     operand_rules = opco.op_rules;
-    execution_never_reaches_here = ((opco.flags & Rf) ? EXECSTATE_UNREACHABLE : EXECSTATE_REACHABLE);
+    asm_parser_note_opcode((opco.flags & Rf) != 0);
 
     if (opco.flags2_set != 0) flags2_requirements[opco.flags2_set] = 1;
 
@@ -1344,7 +1372,7 @@ extern void assemblez_instruction(const assembly_instruction *AI)
 
     if (operand_rules==LABEL)
     {   j = (AI->operand[0]).value;
-        mark_label_used(j);
+        asm_parser_note_branch(j);
         byteout(j/256, JUMP_MV); byteout(j%256, 0);
         goto Instruction_Done;
     }
@@ -1450,7 +1478,7 @@ extern void assemblez_instruction(const assembly_instruction *AI)
     if (AI->branch_label_number != -1)
     {   int32 addr, long_form;
         int branch_on_true = (AI->branch_flag)?1:0;
-        mark_label_used(AI->branch_label_number);
+        asm_parser_note_branch(AI->branch_label_number);
         switch (AI->branch_label_number)
         {   case -2: addr = 2; branch_on_true = 0; long_form = 0; break;
                                                  /* branch nowhere, carry on */
@@ -1670,10 +1698,17 @@ extern void assembleg_instruction(const assembly_instruction *AI)
     }
 
     if (llvm_capturing && !llvm_replaying) {
+        opcodeg capture_opco = internal_number_to_opcode_g(AI->internal_number);
         if (LLVM_CODEGEN >= 2 && AI->internal_number == jumpabs_gc)
             warning("LLVM optimization does not preserve generated code "
                 "addresses used by @jumpabs");
         llvm_capture_instruction(AI);
+        (void) asm_parser_take_sequence_point();
+        asm_parser_note_opcode((capture_opco.flags & Rf) != 0);
+        if ((capture_opco.flags & Br)
+            && AI->operand_count == capture_opco.no)
+            asm_parser_note_branch(
+                AI->operand[AI->operand_count-1].value);
         return;
     }
 
@@ -1681,9 +1716,8 @@ extern void assembleg_instruction(const assembly_instruction *AI)
 
     no_instructions++;
 
-    if (veneer_mode) sequence_point_follows = FALSE;
-    if (sequence_point_follows)
-    {   sequence_point_follows = FALSE; at_seq_point = TRUE;
+    if (asm_parser_take_sequence_point())
+    {   at_seq_point = TRUE;
         if (debugfile_switch)
         {
             ensure_memory_list_available(&sequence_points_memlist, next_sequence_point+1);
@@ -1697,7 +1731,7 @@ extern void assembleg_instruction(const assembly_instruction *AI)
 
     opco = internal_number_to_opcode_g(AI->internal_number);
 
-    execution_never_reaches_here = ((opco.flags & Rf) ? EXECSTATE_UNREACHABLE : EXECSTATE_REACHABLE);
+    asm_parser_note_opcode((opco.flags & Rf) != 0);
 
     if (opco.op_rules & GOP_Unicode) {
         uses_unicode_features = TRUE;
@@ -1767,7 +1801,7 @@ extern void assembleg_instruction(const assembly_instruction *AI)
                 compiler_error("Assembling branch without BRANCH_MV marker");
                 goto OpcodeSyntaxError; 
             }
-            mark_label_used(k);
+            asm_parser_note_branch(k);
             if (k == -2) {
                 k = 2; /* branch no-op */
                 type = BYTECONSTANT_OT;
@@ -1988,14 +2022,14 @@ extern void assemble_label_no(int n)
 
     if (llvm_capturing && !llvm_replaying) {
         llvm_capture_label(n);
-        return;
     }
-
-    if (asm_trace_level > 0)
-        printf("%5d  +%05lx    .L%d\n", ErrorReport.line_number,
-            ((long int) zmachine_pc), n);
-    set_label_offset(n, zmachine_pc);
-    execution_never_reaches_here = EXECSTATE_REACHABLE;
+    else {
+        if (asm_trace_level > 0)
+            printf("%5d  +%05lx    .L%d\n", ErrorReport.line_number,
+                ((long int) zmachine_pc), n);
+        set_label_offset(n, zmachine_pc);
+    }
+    asm_parser_note_label();
 }
 
 /* This is the same as assemble_label_no, except we only set up the label

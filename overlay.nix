@@ -4,6 +4,7 @@ let
   testApps = {
     captureReplay = final.callPackage ./tests/captureReplayTest.nix { };
     compliance = final.callPackage ./tests/complianceTest.nix { };
+    directIr = final.callPackage ./tests/directIrTest.nix { };
     optimization = final.callPackage ./tests/optimizationTest.nix { };
     zMachine = final.callPackage ./tests/zMachineTest.nix { };
   };
@@ -62,6 +63,14 @@ in {
     version = "6.45-${flakeInputs.inform6-upstream.shortRev or "d1066bc"}";
     src = flakeInputs.inform6-upstream;
     nativeBuildInputs = [ final.gnumake ];
+    # Fortified glibc realpath() aborts whenever its destination buffer is
+    # smaller than PATH_MAX; upstream's debug-file writer (-k) uses a
+    # PATHLEN=512 buffer, so every -k compile dies under fortify. Keep the
+    # oracle source unpatched and drop the hardening flag instead.
+    # _DEFAULT_SOURCE keeps realpath() declared under the makefile's strict
+    # --std=c11 once the fortify wrapper header no longer declares it.
+    hardeningDisable = [ "fortify" ];
+    env.NIX_CFLAGS_COMPILE = "-D_DEFAULT_SOURCE";
     installPhase = ''
       runHook preInstall
       install -Dm755 inform6 "$out/bin/inform6"

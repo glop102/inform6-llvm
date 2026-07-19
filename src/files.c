@@ -92,7 +92,11 @@ extern void load_sourcefile(char *filename_given, int same_directory_flag)
 
     char name[PATHLEN];
 #ifdef HAS_REALPATH
+#ifdef PC_WIN32
     char absolute_name[PATHLEN];
+#else
+    char *absolute_name;
+#endif
 #endif
     int x = 0;
     FILE *handle;
@@ -114,11 +118,19 @@ extern void load_sourcefile(char *filename_given, int same_directory_flag)
         debug_file_print_with_entities(filename_given);
         debug_file_printf("</given-path>");
 #ifdef HAS_REALPATH
+#ifdef PC_WIN32
         if (realpath(name, absolute_name))
+#else
+        absolute_name = realpath(name, NULL);
+        if (absolute_name)
+#endif
         {   debug_file_printf("<resolved-path>");
             debug_file_print_with_entities(absolute_name);
             debug_file_printf("</resolved-path>");
         }
+#ifndef PC_WIN32
+        free(absolute_name);
+#endif
 #endif
         debug_file_printf("<language>Inform 6</language>");
         debug_file_printf("</source>");

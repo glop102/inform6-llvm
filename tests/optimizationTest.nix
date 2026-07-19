@@ -56,8 +56,8 @@ writeShellApplication {
         fail=1
     fi
 
-    backend_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=lifted\tstage=lower\tinput=[0-9]+\temitted=[0-9]+$'
-    fallback_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=classic-fallback\tstage=limit\tinput=-1\temitted=-1$'
+    backend_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=lifted\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    fallback_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=classic-fallback\tstage=limit\tinput=-1\temitted=-1\treason=-$'
     if [ "$(grep -acE "$backend_re" ${compileLog})" -ne 12 ] || \
        grep -aq $'\tbackend=classic-fallback\t' ${compileLog}; then
         echo "FAIL  optimization (backend-origin records do not cover lifted routines)"
@@ -66,6 +66,11 @@ writeShellApplication {
     if [ "$(grep -acE "$fallback_re" ${fallbackLog})" -ne 12 ] || \
        grep -aq $'\tbackend=lifted\t' ${fallbackLog}; then
         echo "FAIL  optimization (backend-origin records do not cover forced fallback)"
+        fail=1
+    fi
+    if [ "$(grep -ac '^LLVM: backends direct=0 lifted=12 fallback=0$' \
+        ${compileLog})" -ne 1 ]; then
+        echo "FAIL  optimization (aggregate backend totals are incorrect)"
         fail=1
     fi
 

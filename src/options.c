@@ -413,9 +413,11 @@ static optiont alloptions[] = {
   IR, optimize, and lower back to Glulx bytecode; 3 is level 2 plus a \n\
   dump of each routine's IR (before and after optimization) to \n\
   inform6-llvm-dump.ll and reports of routines the pipeline could not \n\
-  handle.\n",
+  handle; 4 enables the experimental direct-IR backend with per-routine \n\
+  classic fallback. Set I6_LLVM_DIAGNOSTICS=1 for IR dumps and per-routine \n\
+  machine-readable backend records.\n",
         OPTUSE_GLULX,
-        { OPTLIM_TOMAX, 3 },
+        { OPTLIM_TOMAX, 4 },
         DEFAULTVALS(0, 2),
     },
 
@@ -969,4 +971,3 @@ extern int set_current_option_precedence(optionindex_e optnum, int32 val)
     
     return TRUE;
 }
-

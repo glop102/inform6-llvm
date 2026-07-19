@@ -177,8 +177,16 @@ addressed the most serious harness gaps:
   per-routine static, and dynamic instruction ceilings. It also compares
   classic and LLVM behavior for an unused faulting read.
 - `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
+- `tests/directIrTest.nix` requires constant return, parameter return, local
+  assignment, and source-label branch routines to lower from direct IR. It
+  compares behavior with upstream, checks exact direct/fallback diagnostics,
+  and verifies byte-identical shadow replay after forced builder and lowering
+  failures.
 - `tests/zMachineTest.nix` requires byte-identical Z5 output from pinned
-  upstream Inform and the fork for a focused shared-assembler fixture.
+  upstream Inform and the fork for a focused shared-assembler fixture. It also
+  extracts Z and Glulx debug sequence-point locations from fork and pinned
+  upstream `-k` compiles of the same fixture and requires them to match, so
+  locations cannot move unnoticed and no golden values need maintenance.
 - `tests/lifeBenchmark.nix` alternates execution order, reports timing median/min/max,
   and reports deterministic dynamic instruction totals.
 - Interpreter and timeout statuses are checked explicitly.
@@ -192,6 +200,16 @@ addressed the most serious harness gaps:
   no-LLVM stub.
 - The Z-machine baseline is intentionally focused; it does not yet run a broad
   Z-machine corpus or interpreter-level compliance suite.
+
+Direct IR remains an explicit migration mode at `$LLVM=4`; the production
+default continues to use the lifter. Phase 1 direct generation accepts only
+marker-free scalar returns, simple local assignments, and unconditional source
+branches. All other source forms reject the direct attempt and replay shadow
+assembly. Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
+`I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,
+lifted, and fallback totals. Debug-file generation now uses allocated Unix
+`realpath` output so long source paths do not trigger fortified-libc buffer
+checks.
 
 The focused fixture currently requires 12 of 12 captured routines to lower,
 with zero lift or lowering bailouts. It checks exactly 156 aggregate input

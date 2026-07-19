@@ -35,6 +35,18 @@ extern void llvm_direct_routine_abandon(void)
 {
 }
 
+extern void llvm_direct_reject(const char *reason) { (void)reason; }
+extern void llvm_direct_note_statement(int statement_code)
+{ (void)statement_code; }
+extern void llvm_direct_store_local_constant(int destination, int32 value)
+{ (void)destination; (void)value; }
+extern void llvm_direct_store_local(int destination, int source)
+{ (void)destination; (void)source; }
+extern void llvm_direct_return_constant(int32 value) { (void)value; }
+extern void llvm_direct_return_local(int source) { (void)source; }
+extern void llvm_direct_jump(int label) { (void)label; }
+extern void llvm_direct_bind_label(int label) { (void)label; }
+
 extern int llvm_pipeline_routine(void)
 {
     any_routine_captured = TRUE;
