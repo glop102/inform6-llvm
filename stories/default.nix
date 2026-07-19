@@ -5,6 +5,7 @@ let
   storyNames = [
     "cloak"
     "computation-roundtrip"
+    "faulting-read"
     "glulxercise"
     "life"
     "metaclass-region-regression"

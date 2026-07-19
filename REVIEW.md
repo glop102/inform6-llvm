@@ -165,7 +165,8 @@ addressed the most serious harness gaps:
 - `tests/captureReplayTest.nix` proves that capture/replay remains byte-identical.
 - `tests/optimizationTest.nix` uses a real LLVM build and asserts that a
   focused fixture lifts and lowers completely, and enforces aggregate,
-  per-routine static, and dynamic instruction ceilings.
+  per-routine static, and dynamic instruction ceilings. It also compares
+  classic and LLVM behavior for an unused faulting read.
 - `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
 - `tests/lifeBenchmark.nix` alternates execution order, reports timing median/min/max,
   and reports deterministic dynamic instruction totals.
@@ -248,7 +249,7 @@ reports rather than gates its dynamic count.
 ### `jumpabs` Is Unsafe Under Per-Routine Optimization
 
 `jumpabs` is classified as non-returning at `src/asm.c:802` and is lifted as an
-opaque call followed by `unreachable` at `src/llvm_codegen.c:747-756`. Glulx
+opaque call followed by `unreachable` at `src/llvm_codegen.c:743-753`. Glulx
 allows it to jump into the interior of a routine, but LLVM may remove or
 reorder that routine's instructions and change its local-frame layout.
 
@@ -258,17 +259,6 @@ can therefore silently change behavior under the default LLVM level. A routine
 containing `jumpabs` should not be optimized. Because one routine can jump into
 another, a conservative implementation may need to disable routine rewriting
 for the entire story when `jumpabs` is present.
-
-### Potentially Faulting Reads Can Be Removed
-
-`mark_fn_as_readonly()` applies `memory(read)`, `nounwind`, and `willreturn` at
-`src/llvm_codegen.c:159-168`. It is used for dereferences and readonly Glulx
-operations listed at `src/llvm_codegen.c:203-209`.
-
-An unused read can consequently be removed even when an invalid address should
-produce an observable VM fault. Inline assembly makes the assumption that all
-addresses are compiler-generated and valid unsafe. `willreturn` is also not
-necessarily true for malformed cyclic data passed to `linkedsearch`.
 
 ### Poison, Undef, and Freeze Semantics Need Proof
 
@@ -287,7 +277,7 @@ should reject poison-dependent values instead of silently choosing zero.
 ### Opcode Effect Classification Is Correctness-Critical
 
 The pure, readonly, and inaccessible-memory opcode lists at
-`src/llvm_codegen.c:191-240` control GVN, LICM, DCE, sinking, and the lowerer's
+`src/llvm_codegen.c:188-237` control GVN, LICM, DCE, sinking, and the lowerer's
 global-clobber analysis. A mistaken entry can reorder operations across a VM
 callback or observable state change. Stream opcodes are correctly excluded
 because filter I/O can invoke arbitrary code, but the classification needs
@@ -299,7 +289,7 @@ broad transcript coverage.
 ### Signed Division Can Expand Into Unsigned Emulation
 
 Safe constant signed division is lifted directly at
-`src/llvm_codegen.c:583-596`. InstCombine can prove that a dividend is
+`src/llvm_codegen.c:579-593`. InstCombine can prove that a dividend is
 nonnegative and rewrite `sdiv` as `udiv`. Glulx has a native signed division
 instruction but no native unsigned division instruction.
 
@@ -382,7 +372,7 @@ silently reduce coverage.
 ## Profitability Model
 
 Successfully lowered routines replace the captured stream unconditionally
-through `src/llvm_codegen.c:1063-1077`; the lowerer resets and rewrites the
+through `src/llvm_codegen.c:1060-1074`; the lowerer resets and rewrites the
 capture buffer at `src/llvm_lower.c:3444-3488`. The current aggregate statistic
 records static counts but does not influence acceptance.
 
@@ -473,21 +463,17 @@ gains on additional VM dispatches.
 
 ## Recommended Order of Work
 
-1. Preserve potentially faulting reads. Add a focused invalid-read regression,
-   then remove declaration attributes which let LLVM discard the operation;
-   separately avoid claiming `willreturn` for searches over malformed data.
-2. Disable unsafe optimization in the presence of `jumpabs`. This is broader
-   than the read fix because a jump can target a different, previously emitted
-   routine.
-3. Add focused fixtures for phi-stub fallthrough, unsigned-division
+1. Disable unsafe optimization in the presence of `jumpabs`. A jump can target
+   a different, previously emitted routine, so this needs a story-wide policy.
+2. Add focused fixtures for phi-stub fallthrough, unsigned-division
    canonicalization, and zero-trip or conditional LICM before changing those
    transformations.
-4. Fix demonstrated instruction-count regressions, beginning with phi-stub
+3. Fix demonstrated instruction-count regressions, beginning with phi-stub
    fallthrough, and tighten the existing `Opt_SelectReturn` ceiling when
    ordinary-arm return fusion is implemented.
-5. Put the real LLVM build and strict optimization suite in Linux CI.
-6. Measure per-opcode and important operand-mode costs, then validate a
+4. Put the real LLVM build and strict optimization suite in Linux CI.
+5. Measure per-opcode and important operand-mode costs, then validate a
    weighted model against repeated whole-program timings.
-7. Add routine or PC-range attribution for remaining Life opcode differences.
-8. Develop a generic CFG profitability estimate based on loop structure and
+6. Add routine or PC-range attribution for remaining Life opcode differences.
+7. Develop a generic CFG profitability estimate based on loop structure and
    measured target costs before making routine replacement conditional on cost.

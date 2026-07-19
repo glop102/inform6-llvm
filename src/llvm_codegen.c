@@ -156,15 +156,12 @@ static void mark_fn_as_constant(LLVMValueRef f)
     add_fn_attr(f, "speculatable", 0);
 }
 
-/* A function that reads memory but never writes it, faults on bad
-   addresses (so not speculatable, but dead calls may still be removed —
-   the deref/aload addresses the compiler emits are valid), and always
-   returns. GVN can merge identical calls with no intervening writes. */
+/* A function that reads memory but never writes it. Do not mark these calls
+   nounwind or willreturn: invalid addresses produce observable VM faults, and
+   searches over malformed data may not terminate. */
 static void mark_fn_as_readonly(LLVMValueRef f)
 {
     add_fn_attr(f, "memory", MEMATTR_READONLY);
-    add_fn_attr(f, "nounwind", 0);
-    add_fn_attr(f, "willreturn", 0);
 }
 
 /* Touches VM state outside the memory map (the RNG): calls stay ordered

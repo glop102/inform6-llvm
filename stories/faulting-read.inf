@@ -1,0 +1,5 @@
+Constant Story "LLVM faulting read fixture";
+
+[ Main value;
+    @aload $80000000 0 value;
+];

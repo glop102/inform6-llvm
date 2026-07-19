@@ -10,6 +10,8 @@ let
   '';
   classic = compiledStories.classic.optimization-regressions;
   llvm = compiledStories.llvm.optimization-regressions;
+  faultClassic = compiledStories.classic.faulting-read;
+  faultLlvm = compiledStories.llvm.faulting-read;
 in
 writeShellApplication {
   name = "inform6-llvm-test-optimization";
@@ -97,6 +99,43 @@ writeShellApplication {
     fi
     if [ "$fail" -eq 0 ] && ! grep -aq '^done\.$' "$work/llvm.log"; then
         echo "FAIL  optimization (completion marker missing)"
+        fail=1
+    fi
+
+    run_faulting_story() {
+        local story=$1 log=$2 status
+        if timeout 30 glulxe "$story" </dev/null >"$log" 2>&1; then
+            status=0
+        else
+            status=$?
+        fi
+        if [ "$status" -eq 124 ]; then
+            echo "FAIL  optimization ($(basename "$story") timed out)"
+            return 1
+        fi
+        FAULT_STATUS=$status
+    }
+
+    FAULT_STATUS=0
+    if run_faulting_story ${faultClassic} "$work/fault-classic.log"; then
+        classic_fault_status=$FAULT_STATUS
+    else
+        fail=1
+    fi
+    if run_faulting_story ${faultLlvm} "$work/fault-llvm.log"; then
+        llvm_fault_status=$FAULT_STATUS
+    else
+        fail=1
+    fi
+    if [ "$fail" -eq 0 ] && \
+       { [ "$classic_fault_status" -ne "$llvm_fault_status" ] || \
+         ! cmp -s "$work/fault-classic.log" "$work/fault-llvm.log"; }; then
+        echo "FAIL  optimization (classic and LLVM fault behavior differs)"
+        fail=1
+    fi
+    if [ "$fail" -eq 0 ] && \
+       ! grep -aq 'Memory access out of range' "$work/fault-llvm.log"; then
+        echo "FAIL  optimization (expected memory fault missing)"
         fail=1
     fi
 
