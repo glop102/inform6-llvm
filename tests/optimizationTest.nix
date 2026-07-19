@@ -8,6 +8,12 @@ let
     ${lib.getExe inform6-llvm} -G '$LLVM=3' \
       ${../stories/optimization-regressions.inf} opt.ulx >"$out" 2>&1
   '';
+  fallbackLog = runCommand "optimization-fallback.compile.log" { } ''
+    work=$(mktemp -d)
+    cd "$work"
+    I6_LLVM_LIMIT=0 ${lib.getExe inform6-llvm} -G '$LLVM=3' \
+      ${../stories/optimization-regressions.inf} opt.ulx >"$out" 2>&1
+  '';
   jumpabsLlvmLog = runCommand "jumpabs-warning-llvm.compile.log" { } ''
     work=$(mktemp -d)
     cd "$work"
@@ -47,6 +53,19 @@ writeShellApplication {
         echo "FAIL  optimization (unexpected LLVM bailout)"
         grep -aE '^! LLVM: (bailed on|could not lower) ' ${compileLog} |
             while IFS= read -r line; do printf '      %s\n' "$line"; done
+        fail=1
+    fi
+
+    backend_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=lifted\tstage=lower\tinput=[0-9]+\temitted=[0-9]+$'
+    fallback_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=classic-fallback\tstage=limit\tinput=-1\temitted=-1$'
+    if [ "$(grep -acE "$backend_re" ${compileLog})" -ne 12 ] || \
+       grep -aq $'\tbackend=classic-fallback\t' ${compileLog}; then
+        echo "FAIL  optimization (backend-origin records do not cover lifted routines)"
+        fail=1
+    fi
+    if [ "$(grep -acE "$fallback_re" ${fallbackLog})" -ne 12 ] || \
+       grep -aq $'\tbackend=lifted\t' ${fallbackLog}; then
+        echo "FAIL  optimization (backend-origin records do not cover forced fallback)"
         fail=1
     fi
 

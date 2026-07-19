@@ -37,7 +37,7 @@ The project is successful when:
 
 ## Status
 
-- [ ] Phase 0: pin upstream Inform and move classic Glulx comparisons to it.
+- [x] Phase 0: pin upstream Inform and move classic Glulx comparisons to it.
 - [ ] Phase 1: establish direct routine lifecycle and lower trivial functions.
 - [ ] Phase 2: generate straight-line expressions directly.
 - [ ] Phase 3: generate structured control flow directly.

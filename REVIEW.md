@@ -184,7 +184,10 @@ addressed the most serious harness gaps:
 - Interpreter and timeout statuses are checked explicitly.
 - The `glulxercise` gate asserts the exact count of known layout-sensitive
   failures rather than accepting an unlimited substring match.
-- Level 3 compiler output includes per-routine captured/emitted static counts.
+- Level 3 compiler output includes per-routine captured/emitted static counts
+  and `LLVM-BACKEND` TSV records identifying lifted output or categorized
+  classic fallback. The focused test also forces the lowering limit to zero
+  and asserts that every captured routine reports fallback.
 - The real LLVM pipeline is not exercised by CI; the Windows build uses the
   no-LLVM stub.
 - The Z-machine baseline is intentionally focused; it does not yet run a broad

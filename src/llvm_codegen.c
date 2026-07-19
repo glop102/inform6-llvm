@@ -980,6 +980,18 @@ static void dump_module(LLVMModuleRef m, const char *phase)
     LLVMDisposeMessage(ir);
 }
 
+/* Stable per-routine record for migration coverage tests. Keep the free-form
+   failure detail in the existing human diagnostics above this TSV layer. */
+static void report_backend(const char *backend, const char *stage,
+    int insts_in, int insts_out)
+{
+    if (LLVM_CODEGEN < 3)
+        return;
+    printf("LLVM-BACKEND\tname=%s\tbackend=%s\tstage=%s"
+           "\tinput=%d\temitted=%d\n",
+        llvm_current_routine_name(), backend, stage, insts_in, insts_out);
+}
+
 /* Process the captured routine. Lift it to IR, optimize, and lower it
    back into the capture buffer; if any stage can't cope, the buffer is
    left holding the original instruction stream. Always returns FALSE:
@@ -1001,6 +1013,7 @@ extern int llvm_pipeline_routine(void)
     m = lift_routine();
     if (!m) {
         no_routines_bailed++;
+        report_backend("classic-fallback", "lift", -1, -1);
         if (LLVM_CODEGEN >= 3)
             printf("! LLVM: bailed on %s: %s\n",
                 llvm_current_routine_name(),
@@ -1015,6 +1028,7 @@ extern int llvm_pipeline_routine(void)
         LLVMDisposeModule(m);
         mod = NULL;
         no_routines_bailed++;
+        report_backend("classic-fallback", "verify", -1, -1);
         return FALSE;
     }
     LLVMDisposeMessage(errmsg);
@@ -1033,6 +1047,7 @@ extern int llvm_pipeline_routine(void)
             LLVMDisposeModule(m);
             mod = NULL;
             no_routines_unlowered++;
+            report_backend("classic-fallback", "optimize", -1, -1);
             return FALSE;
         }
     }
@@ -1052,6 +1067,7 @@ extern int llvm_pipeline_routine(void)
             LLVMDisposeModule(m);
             mod = NULL;
             no_routines_unlowered++;
+            report_backend("classic-fallback", "limit", -1, -1);
             return FALSE;
         }
         if (limit >= 0 && no_routines_lifted == limit)
@@ -1063,12 +1079,14 @@ extern int llvm_pipeline_routine(void)
         int insts_in = 0, insts_out = 0;
         if (llvm_lower_routine(m, fn, &why, &insts_in, &insts_out)) {
             no_routines_lowered++;
+            report_backend("lifted", "lower", insts_in, insts_out);
             if (LLVM_CODEGEN >= 3)
                 printf("LLVM: routine %s: %d instructions -> %d\n",
                     llvm_current_routine_name(), insts_in, insts_out);
         }
         else {
             no_routines_unlowered++;
+            report_backend("classic-fallback", "lower", insts_in, -1);
             if (LLVM_CODEGEN >= 3)
                 printf("! LLVM: could not lower %s: %s\n",
                     llvm_current_routine_name(), why ? why : "unknown");
