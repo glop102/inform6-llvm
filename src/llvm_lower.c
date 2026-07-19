@@ -2722,11 +2722,44 @@ typedef struct emitplan_s {
     int n_blocks;
 } emitplan;
 
+/* How an edge into a return block can be emitted: with Glulx's
+   return-0/return-1 branch encodings, as an inline "return v", or it is
+   not a return edge at all. */
+enum { RETEDGE_NONE, RETEDGE_BRANCH, RETEDGE_VALUE };
+static int edge_return_kind(LLVMBasicBlockRef pred, LLVMBasicBlockRef succ)
+{
+    blockinfo *sb = block_info(succ);
+    LLVMValueRef v;
+    if (sb->ret_phi)
+        v = incoming_for(sb->ret_phi, pred);
+    else if (sb->ret_inline && phi_count(succ) == 0)
+        v = sb->ret_inline;
+    else
+        return RETEDGE_NONE;
+    if (v && LLVMIsAConstantInt(v)) {
+        int32 c = const_int_value(v);
+        if (c == 0 || c == 1) return RETEDGE_BRANCH;
+    }
+    return RETEDGE_VALUE;
+}
+
 /* Plan an edge used as a conditional or switch target. Phi copies require a
-   stub; no-phi return constants use Glulx's special branch-return labels. */
+   stub; return constants of 0 or 1 use Glulx's special branch-return labels
+   whether the return block is a lone constant return or a merged ret-phi. */
 static void plan_target_edge(edgeplan *ep, LLVMBasicBlockRef pred)
 {
     blockinfo *sb = block_info(ep->succ);
+    if (sb->ret_phi) {
+        LLVMValueRef v = incoming_for(sb->ret_phi, pred);
+        if (v && LLVMIsAConstantInt(v)) {
+            int32 c = const_int_value(v);
+            if (c == 0 || c == 1) {
+                ep->kind = EDGE_DIRECT;
+                ep->target_label = (c == 0) ? -3 : -4;
+                return;
+            }
+        }
+    }
     if (phi_count(ep->succ) != 0) {
         ep->kind = EDGE_PHI_STUB;
         ep->target_label = sb->label;
@@ -3295,15 +3328,45 @@ static void plan_terminator(emitblock *bp, LLVMBasicBlockRef next_bb)
                 return;
             }
             bp->control = CONTROL_COND;
-            if (then_bb == next_bb) {
-                bp->branch_edge = 1;
-                bp->goto_edge = 0;
-                bp->branch_invert = TRUE;
-            }
-            else {
-                bp->branch_edge = 0;
-                bp->goto_edge = 1;
-                bp->branch_invert = FALSE;
+            {   int then_ret = edge_return_kind(cur, then_bb);
+                int else_ret = edge_return_kind(cur, else_bb);
+                /* Return edges pick their cheapest role: a 0/1 return
+                   is one instruction as the branch (the rfalse/rtrue
+                   encodings), any other return is one instruction as
+                   the goto (an inline "return v"); otherwise prefer the
+                   natural fallthrough. */
+                if (then_ret == RETEDGE_BRANCH) {
+                    bp->branch_edge = 0;
+                    bp->goto_edge = 1;
+                    bp->branch_invert = FALSE;
+                }
+                else if (else_ret == RETEDGE_BRANCH) {
+                    bp->branch_edge = 1;
+                    bp->goto_edge = 0;
+                    bp->branch_invert = TRUE;
+                }
+                else if (then_ret == RETEDGE_VALUE
+                         && else_ret == RETEDGE_NONE) {
+                    bp->branch_edge = 1;
+                    bp->goto_edge = 0;
+                    bp->branch_invert = TRUE;
+                }
+                else if (else_ret == RETEDGE_VALUE
+                         && then_ret == RETEDGE_NONE) {
+                    bp->branch_edge = 0;
+                    bp->goto_edge = 1;
+                    bp->branch_invert = FALSE;
+                }
+                else if (then_bb == next_bb) {
+                    bp->branch_edge = 1;
+                    bp->goto_edge = 0;
+                    bp->branch_invert = TRUE;
+                }
+                else {
+                    bp->branch_edge = 0;
+                    bp->goto_edge = 1;
+                    bp->branch_invert = FALSE;
+                }
             }
             plan_target_edge(&bp->edges[bp->branch_edge], cur);
             plan_goto_edge(&bp->edges[bp->goto_edge], cur, next_bb,
@@ -3495,9 +3558,66 @@ static int build_block_layout(emitblock *blocks)
     return n;
 }
 
-static void build_emit_plan(emitplan *plan)
+/* A return block whose every incoming edge is inlined (a goto-side
+   "return v", an rfalse/rtrue branch encoding, or a ret-phi stub) has no
+   remaining reference; dropping its body may create new fallthroughs, so
+   re-plan until stable. TRUE if any body was dropped. */
+static int drop_unreferenced_returns(emitplan *plan)
+{
+    int i, k, changed = FALSE;
+    for (i = 0; i < plan->n_blocks; i++) {
+        blockinfo *sb = &blkinfo[plan->blocks[i].bi];
+        if (!sb->emit_body || plan->blocks[i].bi == 0) continue;
+        if (!sb->ret_inline && !sb->ret_phi) continue;
+        {   int referenced = FALSE;
+            for (k = 0; k < plan->n_blocks && !referenced; k++) {
+                emitblock *bp = &plan->blocks[k];
+                int e;
+                for (e = 0; e < bp->n_edges; e++) {
+                    edgeplan *ep = &bp->edges[e];
+                    if (ep->succ != sb->bb) continue;
+                    if (ep->kind == EDGE_FALLTHROUGH
+                        || (ep->kind == EDGE_DIRECT && ep->target_label >= 0)
+                        || (ep->kind == EDGE_PHI_STUB && !ep->return_value)) {
+                        referenced = TRUE;
+                        break;
+                    }
+                }
+            }
+            if (!referenced) {
+                sb->emit_body = FALSE;
+                changed = TRUE;
+            }
+        }
+    }
+    return changed;
+}
+
+static void plan_layout_pass(emitplan *plan)
 {
     int i, n_edges = 0, edge_pos = 0;
+    plan->n_blocks = build_block_layout(plan->blocks);
+
+    for (i = 0; i < plan->n_blocks; i++) {
+        emitblock *bp = &plan->blocks[i];
+        bp->term = LLVMGetBasicBlockTerminator(blkinfo[bp->bi].bb);
+        bp->n_edges = (int)LLVMGetNumSuccessors(bp->term);
+        n_edges += bp->n_edges;
+    }
+
+    for (i = 0; i < plan->n_blocks; i++) {
+        emitblock *bp = &plan->blocks[i];
+        LLVMBasicBlockRef next_bb = i + 1 < plan->n_blocks
+            ? blkinfo[plan->blocks[i + 1].bi].bb : NULL;
+        bp->edges = &plan->edges[edge_pos];
+        edge_pos += bp->n_edges;
+        plan_terminator(bp, next_bb);
+    }
+}
+
+static void build_emit_plan(emitplan *plan)
+{
+    int i, n_edges = 0, edge_pos = 0, guard;
     memset(plan, 0, sizeof(*plan));
     plan->blocks = my_calloc(sizeof(emitblock), n_blocks,
         "llvm lower emission blocks");
@@ -3512,13 +3632,11 @@ static void build_emit_plan(emitplan *plan)
     plan->edges = my_calloc(sizeof(edgeplan), n_edges ? n_edges : 1,
         "llvm lower emission edges");
 
-    for (i = 0; i < plan->n_blocks; i++) {
-        emitblock *bp = &plan->blocks[i];
-        LLVMBasicBlockRef next_bb = i + 1 < plan->n_blocks
-            ? blkinfo[plan->blocks[i + 1].bi].bb : NULL;
-        bp->edges = &plan->edges[edge_pos];
-        edge_pos += bp->n_edges;
-        plan_terminator(bp, next_bb);
+    (void)edge_pos;
+    for (guard = 0; guard < 8; guard++) {
+        plan_layout_pass(plan);
+        if (!drop_unreferenced_returns(plan))
+            break;
     }
 }
 

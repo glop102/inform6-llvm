@@ -4072,6 +4072,8 @@ S (store), SS (two stores), R (execution never continues)");
         int32 start_pc = zcode_ha_size;
         int bytecount = 0;
         int isword = (token_value == DARROW_SEP);
+        /* Raw code bytes have no instruction-level meaning to translate. */
+        llvm_direct_reject("raw code bytes");
         while (1) {
             assembly_operand AO;
             /* This isn't the start of a statement, but it's safe to
@@ -4189,10 +4191,14 @@ S (store), SS (two stores), R (execution never continues)");
     }
 
     if (!error_flag) {
-        if (is_macro)
+        if (is_macro) {
+            llvm_direct_glulx_macro(&AI, O.code);
             assembleg_macro(&AI);
-        else
+        }
+        else {
+            llvm_direct_glulx_assembly(&AI);
             assembleg_instruction(&AI);
+        }
     }
 
     if (error_flag) {

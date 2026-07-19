@@ -330,6 +330,32 @@ Global Direct_Global = 5;
     return random(2, 4, 6);
 ];
 
+! Not called at runtime: catch tokens and throw edges have no direct IR
+! representation and must reject explicitly.
+[ Direct_Catch x;
+    @catch x ?Caught;
+    @throw 1 x;
+    .Caught;
+    return x;
+];
+
+! Not called at runtime: explicit stack rearrangement cannot be modeled
+! by the symbolic stack.
+[ Direct_StackAsm x;
+    @copy 5 sp;
+    @copy 6 sp;
+    @stkswap;
+    @copy sp x;
+    @copy sp 0;
+    return x;
+];
+
+! Not called at runtime: custom opcodes have no trusted direct effects.
+[ Direct_CustomAsm x;
+    @"S2:112" 1 x;
+    return x;
+];
+
 [ Main win dummy;
     @setiosys 2 0;
     @copy 0 sp;

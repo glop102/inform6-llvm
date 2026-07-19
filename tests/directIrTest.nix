@@ -133,8 +133,8 @@ writeShellApplication {
     trap 'rm -rf "$work"' EXIT HUP INT TERM
     fail=0
 
-    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|Logical|If|IfElse|ShortCircuit|LogicalBranches|LogicalNegation|While|Do|DoReturn|For|ForInc|Switch|SwitchLoop|NestedSwitch|Infinite|Unreachable|UnreachableLoop|SharedReturn|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap|CalleePair|CalleeSum|Note|Call|CallNested|CallOrder|CallWide|CallWideMixed|CallCondition|CallIndirect|CallVoid)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 58 ]; then
+    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|Logical|If|IfElse|ShortCircuit|LogicalBranches|LogicalNegation|While|Do|DoReturn|For|ForInc|Switch|SwitchLoop|NestedSwitch|Infinite|Unreachable|UnreachableLoop|SharedReturn|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap|Inline|CalleePair|CalleeSum|Note|Call|CallNested|CallOrder|CallWide|CallWideMixed|CallCondition|CallIndirect|CallVoid)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 59 ]; then
         echo "FAIL  direct-ir (supported routines did not all use direct IR)"
         fail=1
     fi
@@ -142,7 +142,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (quiet direct mode emitted per-routine diagnostics)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=59 lifted=0 fallback=12$' \
+    if [ "$(grep -ac '^LLVM: backends direct=67 lifted=0 fallback=7$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (aggregate backend totals are incorrect)"
         fail=1
@@ -190,6 +190,7 @@ writeShellApplication {
     check_routine Direct_UnreachableLoop 1 1
     check_routine Direct_SharedReturn 4 4
     check_routine Direct_GlobalInc 6 2
+    check_routine Direct_Inline 2 1
     check_routine Direct_CalleePair 3 3
     check_routine Direct_CalleeSum 9 9
     check_routine Direct_Note 3 3
@@ -206,19 +207,24 @@ writeShellApplication {
         echo "FAIL  direct-ir (random() did not fall back with its reason)"
         fail=1
     fi
-    if ! grep -aq $'name=Main\tbackend=classic-fallback\tstage=direct-build' \
+    if ! grep -aq $'name=Main\tbackend=direct\tstage=lower' \
         ${direct}/compile.log; then
-        echo "FAIL  direct-ir (unsupported routine did not report fallback)"
+        echo "FAIL  direct-ir (Main with inline assembly did not use direct IR)"
         fail=1
     fi
-    if ! grep -aq $'name=Direct_Inline\tbackend=classic-fallback\tstage=direct-build' \
+    if ! grep -aq $'name=Direct_Catch\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=catch/throw' \
         ${direct}/compile.log; then
-        echo "FAIL  direct-ir (inline assembly did not force fallback)"
+        echo "FAIL  direct-ir (catch/throw did not reject with its reason)"
         fail=1
     fi
-    if ! grep -aq $'name=Direct_Inline\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=inline assembly' \
+    if ! grep -aq $'name=Direct_StackAsm\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=explicit stack-manipulation opcode' \
         ${direct}/compile.log; then
-        echo "FAIL  direct-ir (inline assembly fallback reason is missing)"
+        echo "FAIL  direct-ir (stack manipulation did not reject with its reason)"
+        fail=1
+    fi
+    if ! grep -aq $'name=Direct_CustomAsm\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=custom opcode' \
+        ${direct}/compile.log; then
+        echo "FAIL  direct-ir (custom opcode did not reject with its reason)"
         fail=1
     fi
     timeout 30 glulxe ${upstream} </dev/null >"$work/upstream.log" 2>&1 || fail=1
@@ -249,7 +255,7 @@ writeShellApplication {
     upstream_count=$COUNTED_RESULT
     run_counted ${direct}/story.ulx "$work/direct.count"
     direct_count=$COUNTED_RESULT
-    if [ "$upstream_count" -ne 756 ] || [ "$direct_count" -gt 718 ]; then
+    if [ "$upstream_count" -ne 756 ] || [ "$direct_count" -gt 719 ]; then
         echo "FAIL  direct-ir (dynamic instruction bound: upstream $upstream_count, direct $direct_count)"
         fail=1
     fi
@@ -327,7 +333,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (strict memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=46 lifted=0 fallback=22$' \
+    if [ "$(grep -ac '^LLVM: backends direct=60 lifted=0 fallback=8$' \
         ${memoryStrictDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (strict memory backend totals are incorrect)"
         fail=1
@@ -336,7 +342,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (unchecked memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=43 lifted=0 fallback=15$' \
+    if [ "$(grep -ac '^LLVM: backends direct=52 lifted=0 fallback=6$' \
         ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (unchecked memory backend totals are incorrect)"
         fail=1
@@ -365,7 +371,7 @@ writeShellApplication {
     mem_strict_upstream=$COUNTED_RESULT
     run_counted ${memoryStrictDirect}/story.ulx "$work/mem-strict-direct.count"
     mem_strict_direct=$COUNTED_RESULT
-    if [ "$mem_strict_upstream" -ne 1420 ] || [ "$mem_strict_direct" -gt 1409 ]; then
+    if [ "$mem_strict_upstream" -ne 1420 ] || [ "$mem_strict_direct" -gt 1412 ]; then
         echo "FAIL  direct-ir (strict memory dynamic bound: upstream $mem_strict_upstream, direct $mem_strict_direct)"
         fail=1
     fi
@@ -373,7 +379,7 @@ writeShellApplication {
     mem_loose_upstream=$COUNTED_RESULT
     run_counted ${memoryLooseDirect}/story.ulx "$work/mem-loose-direct.count"
     mem_loose_direct=$COUNTED_RESULT
-    if [ "$mem_loose_upstream" -ne 839 ] || [ "$mem_loose_direct" -gt 798 ]; then
+    if [ "$mem_loose_upstream" -ne 839 ] || [ "$mem_loose_direct" -gt 811 ]; then
         echo "FAIL  direct-ir (unchecked memory dynamic bound: upstream $mem_loose_upstream, direct $mem_loose_direct)"
         fail=1
     fi
@@ -400,7 +406,7 @@ writeShellApplication {
         fail=1
     fi
     if [ "$(grep -ac $'backend=classic-fallback\tstage=direct-lower' \
-        ${forcedLowerFallback}/compile.log)" -ne 59 ]; then
+        ${forcedLowerFallback}/compile.log)" -ne 67 ]; then
         echo "FAIL  direct-ir (forced lowering fallback diagnostics are incomplete)"
         fail=1
     fi

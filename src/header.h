@@ -2299,6 +2299,10 @@ extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
                  llvm_direct_value *arguments, int count);
 extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
                  llvm_direct_value *arguments, int count);
+extern void  llvm_direct_glulx_assembly(const assembly_instruction *ai);
+extern void  llvm_direct_glulx_macro(const assembly_instruction *ai,
+                 int macro_code);
+extern void  llvm_direct_note_control_flow(void);
 extern llvm_direct_value llvm_direct_store_local_value(int destination,
                  llvm_direct_value value);
 extern llvm_direct_value llvm_direct_store_global_value(int destination,

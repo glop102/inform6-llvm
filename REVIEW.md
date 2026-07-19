@@ -379,10 +379,51 @@ alignment boundary whenever generated code size changes, so address-valued
 results (`parent(o)`, bare `(the) o` without a library) must be compared
 against known objects instead of printed.
 
-After statements, Life direct coverage is 11 of 15 routines (adding
+After statements, Life direct coverage was 11 of 15 routines (adding
 `PrintGrid`, `PrintElapsed`, `WaitKey`) at 54,616,168 dynamic dispatches
-(-2.78%); the remaining fallbacks are `Main` and the inline-assembly
+(-2.78%); the remaining fallbacks were `Main` and the inline-assembly
 routines assigned to the next slice.
+
+The fourth Phase 4 slice translates inline assembly. Parsed
+`assembly_instruction` records translate under the lifter's rules — native
+IR for arithmetic, safe divisions, constant shifts, sign extensions, and
+copies; explicit control flow for the branch family, `@jump`, and
+`@return`; typed opaque calls with graded effects for everything else,
+non-returning opcodes ending their block. Operands naming `sp` ride a
+parse-time symbolic stack of SSA values, consumed by `call`/`glk`
+constant-count argument peeling and the `@push`/`@pull`/`@dload`/`@dstore`
+macros. Because a symbolic value has no runtime stack presence, the stack
+must be empty wherever control flow diverges or joins (source labels,
+jumps, conditions, switch selectors, inline branches); violations reject.
+Custom `@"..."` opcodes, `@catch`/`@throw`, explicit stack rearrangement
+(`@stkswap` family), and raw `@ ->` code bytes reject with focused-fixture
+reasons. With this, `Main` startup code, `glk` invocations, and most
+veneer routines compile directly; the remaining fallbacks are
+stack-argument routines (`Glk__Wrap`, `CA__Pr`, `Cl__Ms`), routines
+containing directives, and the compiler-generated `Main__`/`Symb__Tab`
+stubs.
+
+Direct veneer coverage exposed a lowering cost: `simplifycfg` tail-merges
+every `return` into one ret-phi block, and the planner emitted each
+conditional edge into it as a stub plus a forced jump. Edge planning now
+classifies return edges: a constant 0/1 return uses Glulx's rfalse/rtrue
+branch encodings from either side of a conditional, any other return
+prefers the goto side as an inline `return v`, and only the leftover cases
+stub. Return blocks that lose their last reference drop their bodies, with
+planning re-run to a fixpoint since each drop can create new fallthroughs.
+`jump-threading` joined the pass pipeline: strict-mode guards join through
+a boolean phi that the consuming condition immediately re-tests, and
+threading restores classic's direct jumps to each outcome. These lowering
+changes serve the lifted path equally: the focused optimization fixture
+improved from 468 to 463 dynamic dispatches against classic's 422.
+
+The strict memory fixture initially regressed from 1,409 to 1,597 dynamic
+dispatches when its veneer routines began compiling directly; after the
+edge-planning and threading work it stands at 1,412 against upstream's
+1,420, with the unchecked mode at 811 against 839. On Life, direct mode
+covers 12 of 15 routines (adding `Main`) and reaches 54,592,173 dynamic
+dispatches (-2.82%), overtaking the lifted production path's -2.80% for
+the first time.
 
 Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,

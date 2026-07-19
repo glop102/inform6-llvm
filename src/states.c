@@ -1868,8 +1868,7 @@ static void parse_statement_g(int break_label, int continue_label)
     }
 
     if ((token_type == SEP_TT) && (token_value == AT_SEP))
-    {   llvm_direct_reject("inline assembly");
-        parse_assembly(); return;
+    {   parse_assembly(); return;
     }
 
     if ((token_type == SEP_TT) && (token_value == SEMICOLON_SEP)) return;

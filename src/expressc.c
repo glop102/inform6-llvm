@@ -4284,6 +4284,7 @@ extern void llvm_direct_condition_expression(assembly_operand AO, int label)
     llvm_direct_block true_block, false_block;
 
     if (!llvm_direct_can_generate()) return;
+    llvm_direct_note_control_flow();
     fallthrough_block = llvm_direct_new_block();
     if (label == -3 || label == -4) {
         branch_block = llvm_direct_new_block();
@@ -4312,6 +4313,7 @@ extern void llvm_direct_condition_expression(assembly_operand AO, int label)
 extern void llvm_direct_switch_begin(assembly_operand AO)
 {
     llvm_direct_value value;
+    llvm_direct_note_control_flow();
     if (direct_switch_depth >= DIRECT_SWITCH_DEPTH) {
         llvm_direct_reject("direct switch nesting too deep");
         return;

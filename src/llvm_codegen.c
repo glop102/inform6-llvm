@@ -86,7 +86,7 @@ static int llvm_diagnostics_enabled(void)
    coalescing of the increment with its phi's slot. */
 #define LLVM_PASS_PIPELINE \
     "function(mem2reg,instcombine,simplifycfg,reassociate," \
-    "loop-mssa(licm),gvn,dce,simplifycfg)"
+    "loop-mssa(licm),gvn,jump-threading,dce,simplifycfg)"
 
 /* Per-routine state. */
 static LLVMModuleRef  mod;
@@ -132,6 +132,40 @@ static LLVMBasicBlockRef *direct_labels;
 static int direct_label_count;
 static int direct_suspended;
 static const char *direct_reason;
+
+/* Inline assembly's "sp" operands ride a parse-time symbolic stack of
+   SSA values. It must be empty wherever control flow diverges or joins,
+   because a symbolic value has no runtime stack presence and classic's
+   real stack could otherwise carry a value along only one path. */
+#define DIRECT_SYMSTACK_MAX 64
+static LLVMValueRef direct_symstack[DIRECT_SYMSTACK_MAX];
+static int direct_symstack_depth;
+
+static LLVMValueRef direct_sympop(void)
+{
+    if (direct_symstack_depth <= 0) {
+        llvm_direct_reject("sp read with empty symbolic stack");
+        return NULL;
+    }
+    return direct_symstack[--direct_symstack_depth];
+}
+
+static void direct_sympush(LLVMValueRef v)
+{
+    if (direct_symstack_depth >= DIRECT_SYMSTACK_MAX) {
+        llvm_direct_reject("symbolic stack overflow");
+        return;
+    }
+    direct_symstack[direct_symstack_depth++] = v;
+}
+
+/* Enforce the empty-stack rule at control-flow points. TRUE if OK. */
+static int direct_symstack_empty(void)
+{
+    if (direct_symstack_depth == 0) return TRUE;
+    llvm_direct_reject("VM stack value carried across control flow");
+    return FALSE;
+}
 
 static void bail(const char *why)
 {   if (!lift_failed) {
@@ -251,7 +285,9 @@ extern int llvm_opcode_no_ram_write(const char *opname)
 
 static void mark_opaque_fn_attrs(LLVMValueRef f, const char *opname)
 {
-    if (name_in_list(opname, pure_opcodes))
+    if (strcmp(opname, "deref") == 0)
+        mark_fn_as_readonly(f);
+    else if (name_in_list(opname, pure_opcodes))
         mark_fn_as_constant(f);
     else if (name_in_list(opname, readonly_opcodes))
         mark_fn_as_readonly(f);
@@ -1022,6 +1058,7 @@ extern void llvm_direct_routine_begin(const char *name, int local_count,
     direct_state = DIRECT_INACTIVE;
     direct_reason = NULL;
     direct_suspended = 0;
+    direct_symstack_depth = 0;
     llvm_direct_expression_reset();
     if (LLVM_CODEGEN != 4)
         return;
@@ -1621,6 +1658,7 @@ extern void llvm_direct_jump(int label)
 {
     LLVMBasicBlockRef target;
     if (!direct_can_emit()) return;
+    if (!direct_symstack_empty()) return;
     target = direct_label_block(label);
     if (target)
         LLVMBuildBr(direct_bld, target);
@@ -1631,6 +1669,7 @@ extern void llvm_direct_bind_label(int label)
     LLVMBasicBlockRef current, target;
     if (direct_state != DIRECT_BUILDING || direct_suspended)
         return;
+    if (!direct_symstack_empty()) return;
     target = direct_label_block(label);
     if (!target) return;
     current = LLVMGetInsertBlock(direct_bld);
@@ -1656,6 +1695,416 @@ extern void llvm_direct_resolve_label(int label, int used)
     LLVMPositionBuilderAtEnd(builder, target);
     LLVMBuildUnreachable(builder);
     LLVMDisposeBuilder(builder);
+}
+
+/* ------------------------------------------------------------------------- */
+/*   Direct translation of parsed inline Glulx assembly                       */
+/*                                                                           */
+/*   Inline instructions arrive as assembly_instruction records exactly as   */
+/*   the lifter sees captured ones, and translate under the same rules:      */
+/*   native IR where semantics provably match, typed opaque i6.<opcode>      */
+/*   calls otherwise, explicit control flow for branches and returns.        */
+/*   Operands naming "sp" use a parse-time symbolic stack of SSA values;     */
+/*   it must be empty wherever control flow diverges or joins, because a     */
+/*   symbolic value has no runtime stack presence and classic's real stack   */
+/*   could otherwise carry a value along only one path.                      */
+/* ------------------------------------------------------------------------- */
+
+static LLVMValueRef direct_asm_operand(const assembly_operand *op)
+{
+    switch (op->type) {
+    case CONSTANT_OT:
+    case HALFCONSTANT_OT:
+    case BYTECONSTANT_OT:
+        return llvm_direct_constant(op->value, op->marker, op->symindex);
+    case ZEROCONSTANT_OT:
+        return LLVMConstInt(i32t, 0, FALSE);
+    case LOCALVAR_OT:
+        if (op->value == 0)
+            return direct_sympop();
+        if (op->value < 1 || op->value > direct_local_count) {
+            llvm_direct_reject("inline local out of range");
+            return NULL;
+        }
+        return LLVMBuildLoad2(direct_bld, i32t, direct_locals[op->value],
+            "asm");
+    case GLOBALVAR_OT:
+        return LLVMBuildLoad2(direct_bld, i32t,
+            direct_global_var(op->value - MAX_LOCAL_VARIABLES), "asm");
+    case DEREFERENCE_OT:
+        {   LLVMValueRef addr = llvm_direct_constant(op->value, op->marker,
+                op->symindex);
+            if (!addr) return NULL;
+            return direct_opaque_call_ex("i6.deref", &addr, 1, FALSE);
+        }
+    default:
+        llvm_direct_reject("unsupported inline operand");
+        return NULL;
+    }
+}
+
+static void direct_asm_store(const assembly_operand *op, LLVMValueRef v)
+{
+    if (!v) return;
+    switch (op->type) {
+    case ZEROCONSTANT_OT:
+        return;                       /* discard */
+    case LOCALVAR_OT:
+        if (op->value == 0) {
+            direct_sympush(v);
+            return;
+        }
+        if (op->value < 1 || op->value > direct_local_count) {
+            llvm_direct_reject("inline local out of range");
+            return;
+        }
+        LLVMBuildStore(direct_bld, v, direct_locals[op->value]);
+        return;
+    case GLOBALVAR_OT:
+        LLVMBuildStore(direct_bld, v,
+            direct_global_var(op->value - MAX_LOCAL_VARIABLES));
+        return;
+    case DEREFERENCE_OT:
+        {   LLVMValueRef args[2];
+            args[0] = llvm_direct_constant(op->value, op->marker,
+                op->symindex);
+            args[1] = v;
+            if (!args[0]) return;
+            (void)direct_opaque_call_ex("i6.deref.store", args, 2, TRUE);
+        }
+        return;
+    default:
+        llvm_direct_reject("unsupported inline store operand");
+        return;
+    }
+}
+
+/* Opaque form: sources become arguments, a store operand receives the
+   result, stack-passed extras follow the sources. */
+static void direct_asm_opaque(const assembly_instruction *ai, int flags,
+    LLVMValueRef *extra, int n_extra)
+{
+    char name[64];
+    LLVMValueRef args[16], result;
+    int n_src = ai->operand_count - ((flags & OPFLAG_STORE) ? 1 : 0);
+    int i, n_args = 0;
+
+    if (flags & OPFLAG_STORE2) {
+        llvm_direct_reject("inline opcode with two stores");
+        return;
+    }
+    if (n_src + n_extra > 16) {
+        llvm_direct_reject("inline opcode with too many operands");
+        return;
+    }
+    for (i = 0; i < n_src; i++) {
+        args[n_args] = direct_asm_operand(&ai->operand[i]);
+        if (!args[n_args++]) return;
+    }
+    for (i = 0; i < n_extra; i++)
+        args[n_args++] = extra[i];
+    sprintf(name, "i6.%.32s%s", glulx_opcode_name(ai->internal_number),
+        n_extra ? ".s" : "");
+    result = direct_opaque_call_ex(name, args, n_args,
+        !(flags & OPFLAG_STORE));
+    if (flags & OPFLAG_STORE)
+        direct_asm_store(&ai->operand[ai->operand_count - 1], result);
+    if (flags & OPFLAG_RETURNS)
+        LLVMBuildUnreachable(direct_bld);
+}
+
+static void direct_asm_binop(const assembly_instruction *ai, LLVMOpcode opc)
+{
+    LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
+    LLVMValueRef b = direct_asm_operand(&ai->operand[1]);
+    if (!a || !b) return;
+    direct_asm_store(&ai->operand[2], LLVMBuildBinOp(direct_bld, opc, a, b,
+        "asm"));
+}
+
+static void direct_asm_condbranch(const assembly_instruction *ai,
+    LLVMIntPredicate pred, int with_zero)
+{
+    LLVMValueRef a, b, cond;
+    LLVMBasicBlockRef then_bb, else_bb;
+    int32 target = ai->operand[ai->operand_count - 1].value;
+
+    a = direct_asm_operand(&ai->operand[0]);
+    b = with_zero ? LLVMConstInt(i32t, 0, FALSE)
+        : direct_asm_operand(&ai->operand[1]);
+    if (!a || !b) return;
+    if (!direct_symstack_empty()) return;
+    then_bb = direct_label_block((int)target);
+    if (!then_bb) return;
+    cond = LLVMBuildICmp(direct_bld, pred, a, b, "asm.cond");
+    else_bb = LLVMAppendBasicBlockInContext(llctx, direct_fn, "asm.next");
+    LLVMBuildCondBr(direct_bld, cond, then_bb, else_bb);
+    LLVMPositionBuilderAtEnd(direct_bld, else_bb);
+}
+
+/* If the operand is an unmarked integer constant, put its value in *v. */
+static int direct_asm_constant(const assembly_operand *op, int32 *v)
+{
+    if (op->marker) return FALSE;
+    switch (op->type) {
+    case ZEROCONSTANT_OT:
+        *v = 0; return TRUE;
+    case CONSTANT_OT:
+    case HALFCONSTANT_OT:
+    case BYTECONSTANT_OT:
+        *v = op->value; return TRUE;
+    }
+    return FALSE;
+}
+
+extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
+{
+    int flags, opct;
+
+    if (!direct_can_emit()) return;
+    if (ai->internal_number == -1) {
+        llvm_direct_reject("custom opcode");
+        return;
+    }
+    flags = glulx_opcode_flags(ai->internal_number);
+    opct = glulx_opcode_operand_count(ai->internal_number);
+    if (ai->operand_count != opct) {
+        llvm_direct_reject("inline operand count mismatch");
+        return;
+    }
+
+    switch (ai->internal_number) {
+
+    case nop_gc:
+        return;
+
+    case add_gc:    direct_asm_binop(ai, LLVMAdd); return;
+    case sub_gc:    direct_asm_binop(ai, LLVMSub); return;
+    case mul_gc:    direct_asm_binop(ai, LLVMMul); return;
+    case bitand_gc: direct_asm_binop(ai, LLVMAnd); return;
+    case bitor_gc:  direct_asm_binop(ai, LLVMOr);  return;
+    case bitxor_gc: direct_asm_binop(ai, LLVMXor); return;
+
+    /* Division: only visibly safe constant divisors are native (zero
+       faults; INT_MIN / -1 overflows; both are LLVM UB). */
+    case div_gc:
+    case mod_gc:
+        {   int32 dv;
+            if (direct_asm_constant(&ai->operand[1], &dv)
+                && dv != 0 && dv != -1)
+                direct_asm_binop(ai, ai->internal_number == div_gc
+                    ? LLVMSDiv : LLVMSRem);
+            else
+                direct_asm_opaque(ai, flags, NULL, 0);
+        }
+        return;
+
+    /* Shifts: Glulx defines counts >= 32; LLVM gives poison. Constant
+       counts fold to their defined results, variables stay opaque. */
+    case shiftl_gc:
+    case sshiftr_gc:
+    case ushiftr_gc:
+        {   int32 cnt;
+            if (!direct_asm_constant(&ai->operand[1], &cnt)) {
+                direct_asm_opaque(ai, flags, NULL, 0);
+                return;
+            }
+            if ((uint32_t)cnt < 32) {
+                direct_asm_binop(ai,
+                    ai->internal_number == shiftl_gc ? LLVMShl
+                    : ai->internal_number == sshiftr_gc ? LLVMAShr
+                    : LLVMLShr);
+                return;
+            }
+            {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
+                LLVMValueRef r;
+                if (!a) return;
+                if (ai->internal_number == sshiftr_gc)
+                    r = LLVMBuildAShr(direct_bld, a,
+                        LLVMConstInt(i32t, 31, FALSE), "asm");
+                else
+                    r = LLVMConstInt(i32t, 0, FALSE);
+                direct_asm_store(&ai->operand[2], r);
+            }
+        }
+        return;
+
+    case neg_gc:
+        {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
+            if (!a) return;
+            direct_asm_store(&ai->operand[1],
+                LLVMBuildNeg(direct_bld, a, "asm"));
+        }
+        return;
+    case bitnot_gc:
+        {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
+            if (!a) return;
+            direct_asm_store(&ai->operand[1],
+                LLVMBuildNot(direct_bld, a, "asm"));
+        }
+        return;
+    case copy_gc:
+        {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
+            if (!a) return;
+            direct_asm_store(&ai->operand[1], a);
+        }
+        return;
+    case copys_gc:
+    case copyb_gc:
+        /* Sub-word copies read and write their operands at narrow
+           widths; the word-based operand model would misread them. */
+        llvm_direct_reject("byte/short copy opcode");
+        return;
+    case sexs_gc:
+    case sexb_gc:
+        {   LLVMTypeRef small = (ai->internal_number == sexs_gc)
+                ? LLVMInt16TypeInContext(llctx)
+                : LLVMInt8TypeInContext(llctx);
+            LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
+            if (!a) return;
+            a = LLVMBuildTrunc(direct_bld, a, small, "asm");
+            a = LLVMBuildSExt(direct_bld, a, i32t, "asm");
+            direct_asm_store(&ai->operand[1], a);
+        }
+        return;
+
+    case jump_gc:
+        {   LLVMBasicBlockRef target;
+            if (!direct_symstack_empty()) return;
+            target = direct_label_block((int)ai->operand[0].value);
+            if (!target) return;
+            LLVMBuildBr(direct_bld, target);
+        }
+        return;
+    case jz_gc:   direct_asm_condbranch(ai, LLVMIntEQ,  TRUE);  return;
+    case jnz_gc:  direct_asm_condbranch(ai, LLVMIntNE,  TRUE);  return;
+    case jeq_gc:  direct_asm_condbranch(ai, LLVMIntEQ,  FALSE); return;
+    case jne_gc:  direct_asm_condbranch(ai, LLVMIntNE,  FALSE); return;
+    case jlt_gc:  direct_asm_condbranch(ai, LLVMIntSLT, FALSE); return;
+    case jle_gc:  direct_asm_condbranch(ai, LLVMIntSLE, FALSE); return;
+    case jgt_gc:  direct_asm_condbranch(ai, LLVMIntSGT, FALSE); return;
+    case jge_gc:  direct_asm_condbranch(ai, LLVMIntSGE, FALSE); return;
+    case jltu_gc: direct_asm_condbranch(ai, LLVMIntULT, FALSE); return;
+    case jleu_gc: direct_asm_condbranch(ai, LLVMIntULE, FALSE); return;
+    case jgtu_gc: direct_asm_condbranch(ai, LLVMIntUGT, FALSE); return;
+    case jgeu_gc: direct_asm_condbranch(ai, LLVMIntUGE, FALSE); return;
+
+    case return_gc:
+        {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
+            if (!a) return;
+            /* Anything on the VM stack dies with the call frame. */
+            direct_symstack_depth = 0;
+            LLVMBuildRet(direct_bld, a);
+        }
+        return;
+
+    case call_gc:
+    case glk_gc:
+    case tailcall_gc:
+        {   /* (addr, count[, store]): count operands are popped from
+               the stack at runtime; peel them off the symbolic stack
+               and pass them explicitly. */
+            LLVMValueRef extra[DIRECT_SYMSTACK_MAX];
+            const assembly_operand *cntop = &ai->operand[1];
+            int32 cnt;
+            int i;
+            if (!direct_asm_constant(cntop, &cnt)) {
+                llvm_direct_reject("call with non-constant argument count");
+                return;
+            }
+            if (cnt < 0 || cnt > direct_symstack_depth) {
+                llvm_direct_reject("call consumes more than the symbolic stack");
+                return;
+            }
+            /* Runtime pop order: the first argument was pushed last. */
+            for (i = 0; i < cnt; i++)
+                extra[i] = direct_sympop();
+            direct_asm_opaque(ai, flags, extra, cnt);
+        }
+        return;
+
+    case stkcount_gc:
+    case stkpeek_gc:
+    case stkswap_gc:
+    case stkroll_gc:
+    case stkcopy_gc:
+        llvm_direct_reject("explicit stack-manipulation opcode");
+        return;
+
+    case catch_gc:
+    case throw_gc:
+        llvm_direct_reject("catch/throw");
+        return;
+
+    default:
+        if (flags & OPFLAG_BRANCH) {
+            llvm_direct_reject("unhandled inline branch opcode");
+            return;
+        }
+        direct_asm_opaque(ai, flags, NULL, 0);
+        return;
+    }
+}
+
+/* Statement-level control flow (conditions, switch selectors) must not
+   straddle pending symbolic stack values; see the empty-stack rule. */
+extern void llvm_direct_note_control_flow(void)
+{
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
+        return;
+    (void)direct_symstack_empty();
+}
+
+/* Inline assembly macros: @pull and @push move values between the
+   symbolic stack and an operand; @dload/@dstore expand to word pairs. */
+extern void llvm_direct_glulx_macro(const assembly_instruction *ai,
+    int macro_code)
+{
+    if (!direct_can_emit()) return;
+    switch (macro_code) {
+    case pull_gm:
+        {   LLVMValueRef v = direct_sympop();
+            if (v) direct_asm_store(&ai->operand[0], v);
+        }
+        return;
+    case push_gm:
+        {   LLVMValueRef v = direct_asm_operand(&ai->operand[0]);
+            if (v) direct_sympush(v);
+        }
+        return;
+    case dload_gm:
+    case dstore_gm:
+        {   LLVMValueRef addr = direct_asm_operand(&ai->operand[0]);
+            LLVMValueRef args[3];
+            int is_load = (macro_code == dload_gm);
+            if (!addr) return;
+            if (is_load) {
+                args[0] = addr;
+                args[1] = LLVMConstInt(i32t, 1, FALSE);
+                direct_asm_store(&ai->operand[1],
+                    direct_opaque_call_ex("i6.aload", args, 2, FALSE));
+                args[1] = LLVMConstInt(i32t, 0, FALSE);
+                direct_asm_store(&ai->operand[2],
+                    direct_opaque_call_ex("i6.aload", args, 2, FALSE));
+            }
+            else {
+                LLVMValueRef hi = direct_asm_operand(&ai->operand[1]);
+                LLVMValueRef lo = direct_asm_operand(&ai->operand[2]);
+                if (!hi || !lo) return;
+                args[0] = addr;
+                args[1] = LLVMConstInt(i32t, 0, FALSE);
+                args[2] = hi;
+                (void)direct_opaque_call_ex("i6.astore", args, 3, TRUE);
+                args[1] = LLVMConstInt(i32t, 1, FALSE);
+                args[2] = lo;
+                (void)direct_opaque_call_ex("i6.astore", args, 3, TRUE);
+            }
+        }
+        return;
+    default:
+        llvm_direct_reject("unsupported assembly macro");
+        return;
+    }
 }
 
 /* $LLVM=3: dump the routine's IR, tagged with the pipeline phase. */
