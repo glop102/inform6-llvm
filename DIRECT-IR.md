@@ -39,7 +39,7 @@ The project is successful when:
 
 - [x] Phase 0: pin upstream Inform and move classic Glulx comparisons to it.
 - [x] Phase 1: establish direct routine lifecycle and lower trivial functions.
-- [ ] Phase 2: generate straight-line expressions directly.
+- [x] Phase 2: generate straight-line expressions directly.
 - [ ] Phase 3: generate structured control flow directly.
 - [ ] Phase 4: add calls, memory operations, VM effects, and inline assembly.
 - [ ] Phase 5: make direct IR the default Glulx path.
@@ -334,9 +334,9 @@ Test shapes:
 - Assignment expressions and chained assignments.
 - Pre/post increment and decrement.
 - Comparison returns.
-- Conditional values with ordinary and constant arms.
+- Comparison values nested in arithmetic and assignments.
 - Expressions used only for side effects.
-- Faulting division and shift boundaries.
+- Faulting division and signed-overflow boundaries.
 
 Exit gate:
 
@@ -364,6 +364,7 @@ Test shapes:
 - Early returns and shared return blocks.
 - Switches with shared targets and default fallthrough.
 - Conditional edges requiring lowerer phi-copy stubs.
+- Conditional values with ordinary and constant arms.
 
 Exit gate:
 
@@ -416,6 +417,8 @@ Exit gate:
   direct coverage and exact known incompatibilities.
 - Stack order, custom opcodes, faults, and non-returning operations have focused
   tests.
+- Inline shift counts at zero, 31, 32, negative, and variable boundaries have
+  focused tests.
 - Computed code addresses follow the documented unsupported policy, and the
   compiler warning and compliance failure set remain guarded.
 - Debug-file output, traced routines, and Infix have explicit direct or classic

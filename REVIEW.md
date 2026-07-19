@@ -177,8 +177,9 @@ addressed the most serious harness gaps:
   per-routine static, and dynamic instruction ceilings. It also compares
   classic and LLVM behavior for an unused faulting read.
 - `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
-- `tests/directIrTest.nix` requires constant return, parameter return, local
-  assignment, and source-label branch routines to lower from direct IR. It
+- `tests/directIrTest.nix` requires constant, parameter, local, global,
+  arithmetic, bitwise, assignment, symbolic-value, and source-label branch
+  routines to lower from direct IR. It
   compares behavior with upstream, checks exact direct/fallback diagnostics,
   and verifies byte-identical shadow replay after forced builder and lowering
   failures.
@@ -202,10 +203,25 @@ addressed the most serious harness gaps:
   Z-machine corpus or interpreter-level compliance suite.
 
 Direct IR remains an explicit migration mode at `$LLVM=4`; the production
-default continues to use the lifter. Phase 1 direct generation accepts only
-marker-free scalar returns, simple local assignments, and unconditional source
-branches. All other source forms reject the direct attempt and replay shadow
-assembly. Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
+default continues to use the lifter. Phase 2 directly generates all
+straight-line source arithmetic, bitwise and signed comparison operators,
+comparison-to-word conversion, comma sequencing, local/global pre/post updates,
+symbolic constants, and value-producing assignments. Ordinary operands retain
+Inform's right-to-left evaluation order; comma remains left-to-right.
+Variadic comparison lists preserve Inform's less obvious rule: positive
+predicates (`==`, `<`, `>`) combine with OR, while negated predicates (`~=`,
+`<=`, `>=`) combine with AND.
+
+Division and remainder use the lifter's safety policy: a visibly safe constant
+divisor uses native LLVM signed arithmetic, while zero, minus one, and variable
+divisors remain opaque Glulx operations. When source runtime checks are enabled,
+a potentially zero divisor first branches through the `RT__Err` veneer and
+substitutes one exactly as classic generation does. This keeps division by zero
+and `INT_MIN / -1` out of LLVM undefined behavior. Inform has no source shift or
+cast operator; comparison `i1` to word conversion is the relevant Phase 2
+conversion, while Glulx shifts enter through Phase 4 inline assembly.
+
+Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,
 lifted, and fallback totals. Debug-file generation now uses allocated Unix
 `realpath` output so long source paths do not trigger fortified-libc buffer
@@ -336,16 +352,16 @@ broad transcript coverage.
 ### Signed Division Can Expand Into Unsigned Emulation
 
 Safe constant signed division is lifted directly at
-`src/llvm_codegen.c:579-593`. InstCombine can prove that a dividend is
+`src/llvm_codegen.c:601-615`. InstCombine can prove that a dividend is
 nonnegative and rewrite `sdiv` as `udiv`. Glulx has a native signed division
 instruction but no native unsigned division instruction.
 
 The resulting `udiv` is expanded into shifts, signed division, multiplication,
 subtraction, comparison, and correction at `src/llvm_lower.c:2783-2837`.
 Patterns such as `(x & $7fffffff) / 3` can therefore replace one native
-division dispatch with approximately seven dispatches. This needs a focused
-regression fixture and either prevention of the canonicalization or a
-cost-aware recovery of signed division when nonnegativity is known.
+division dispatch with several dispatches. `Direct_NonnegativeDivide` now
+guards this shape with a nine-instruction static ceiling; prevention of the
+canonicalization or cost-aware recovery of signed division remains desirable.
 
 ### LICM Can Add Work to Zero-Trip or Conditional Paths
 

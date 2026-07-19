@@ -1,4 +1,5 @@
-Constant Story "Direct IR Phase 1";
+Constant Story "Direct IR Migration";
+Global Direct_Global = 5;
 
 [ Direct_Constant;
     return 7;
@@ -24,6 +25,133 @@ Constant Story "Direct IR Phase 1";
     return x;
 ];
 
+[ Direct_Arithmetic x y;
+    return (x + y * 3) - 2;
+];
+
+[ Direct_Bitwise x;
+    return ~(x & $ff) | 1;
+];
+
+[ Direct_GlobalRead x;
+    return Direct_Global + x;
+];
+
+[ Direct_GlobalWrite x;
+    Direct_Global = x + 1;
+    return Direct_Global;
+];
+
+[ Direct_Chain x y;
+    x = y = 7;
+    return x + y;
+];
+
+[ Direct_AssignmentValue x;
+    return (x = x * 2);
+];
+
+[ Direct_Symbol;
+    return Direct_Constant;
+];
+
+[ Direct_Divide x;
+    return x / 2;
+];
+
+[ Direct_Remainder x;
+    return x % -3;
+];
+
+[ Direct_NonnegativeDivide x;
+    return (x & $7fffffff) / 3;
+];
+
+[ Direct_Divisor x y;
+    return x / y;
+];
+
+[ Direct_Modulus x y;
+    return x % y;
+];
+
+[ Direct_Compare x y;
+    return (x == y) + 2 * (x ~= y) + 4 * (x >= y)
+        + 8 * (x > y) + 16 * (x <= y) + 32 * (x < y);
+];
+
+[ Direct_CompareAssignment x y;
+    x = (y < 0);
+    return x;
+];
+
+[ Direct_CompareOr x;
+    return x == 1 or 2 or 3;
+];
+
+[ Direct_CompareOrOrder x y;
+    y = ((x = 1) == (x = 2) or (x = 3));
+    return y * 10 + x;
+];
+
+[ Direct_CompareOrPredicates x;
+    return (x ~= 1 or 2 or 3)
+        + 2 * (x < 1 or 2 or 3)
+        + 4 * (x <= 1 or 2 or 3)
+        + 8 * (x > 1 or 2 or 3)
+        + 16 * (x >= 1 or 2 or 3);
+];
+
+[ Direct_Logical x y;
+    return x && y;
+];
+
+[ Direct_PreInc x;
+    x = 5;
+    return ++x;
+];
+
+[ Direct_PostInc x y;
+    x = 5;
+    y = x++;
+    return y * 10 + x;
+];
+
+[ Direct_PreDec x;
+    x = 5;
+    return --x;
+];
+
+[ Direct_PostDec x y;
+    x = 5;
+    y = x--;
+    return y * 10 + x;
+];
+
+[ Direct_GlobalInc y;
+    Direct_Global = 5;
+    y = Direct_Global++;
+    return y * 10 + Direct_Global;
+];
+
+[ Direct_EvalOrder x y;
+    x = 0;
+    y = (x = 2) + (x = 3);
+    return y * 10 + x;
+];
+
+[ Direct_Comma x y;
+    x = 0;
+    y = ((x = 1), (x = x + 1), x);
+    return y * 10 + x;
+];
+
+[ Direct_Wrap x;
+    x = $7fffffff;
+    x++;
+    return x;
+];
+
 [ Main win dummy;
     @setiosys 2 0;
     @copy 0 sp;
@@ -39,5 +167,31 @@ Constant Story "Direct IR Phase 1";
           Direct_Parameter(9), " ",
           Direct_Assignment(3), " ",
           Direct_Branch(13), " ",
-          Direct_Inline(2), "^done.^";
+          Direct_Inline(2), " ",
+          Direct_Arithmetic(4, 5), " ",
+          Direct_Bitwise($1234), " ",
+          Direct_GlobalRead(4), " ",
+          Direct_GlobalWrite(10), " ",
+          Direct_Chain(1, 2), " ",
+          Direct_AssignmentValue(6), " ",
+          Direct_Divide(18), " ",
+          Direct_Remainder(-17), " ",
+          Direct_NonnegativeDivide(-17), " ",
+          Direct_Divisor(18, 3), " ",
+          Direct_Divisor(18, 0), " ",
+          Direct_Modulus(17, 0), " ",
+          Direct_Compare(-1, 0), " ",
+          Direct_CompareAssignment(0, -1), " ",
+          Direct_CompareOr(3), " ",
+          Direct_CompareOrOrder(), " ",
+          Direct_CompareOrPredicates(2), " ",
+          Direct_Logical(1, 2), " ",
+          Direct_PreInc(), " ",
+          Direct_PostInc(), " ",
+          Direct_PreDec(), " ",
+          Direct_PostDec(), " ",
+          Direct_GlobalInc(), " ",
+          Direct_EvalOrder(), " ",
+          Direct_Comma(), " ",
+          Direct_Wrap(), "^done.^";
 ];

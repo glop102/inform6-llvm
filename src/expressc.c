@@ -3248,8 +3248,6 @@ static void generate_code_from(int n, int void_flag)
 
 static int direct_constant_operand(assembly_operand AO)
 {
-    if (AO.marker != 0)
-        return FALSE;
     return AO.type == ZEROCONSTANT_OT || AO.type == BYTECONSTANT_OT
         || AO.type == HALFCONSTANT_OT || AO.type == CONSTANT_OT;
 }
@@ -3260,50 +3258,193 @@ static int direct_local_operand(assembly_operand AO)
         && AO.value <= no_locals;
 }
 
-extern void llvm_direct_return_expression(assembly_operand AO)
+static llvm_direct_value direct_operand_value(assembly_operand AO)
 {
     if (direct_constant_operand(AO))
-        llvm_direct_return_constant(AO.value);
-    else if (direct_local_operand(AO))
-        llvm_direct_return_local(AO.value);
+        return llvm_direct_constant(AO.value, AO.marker, AO.symindex);
+    if (direct_local_operand(AO))
+        return llvm_direct_load_local(AO.value);
+    if (AO.type == GLOBALVAR_OT)
+        return llvm_direct_load_global(AO.value);
+    llvm_direct_reject("unsupported expression operand");
+    return NULL;
+}
+
+static llvm_direct_value direct_store_operand(assembly_operand AO,
+    llvm_direct_value value)
+{
+    if (direct_local_operand(AO))
+        return llvm_direct_store_local_value(AO.value, value);
+    if (AO.type == GLOBALVAR_OT)
+        return llvm_direct_store_global_value(AO.value, value);
+    llvm_direct_reject("unsupported assignment destination");
+    return NULL;
+}
+
+static llvm_direct_value direct_expression_value(int node)
+{
+    int first, second;
+    llvm_direct_value left, right, value;
+
+    if (node < 0) {
+        llvm_direct_reject("invalid expression tree");
+        return NULL;
+    }
+    first = ET[node].down;
+    if (first == -1)
+        return direct_operand_value(ET[node].value);
+
+    if (ET[node].operator_number == SETEQUALS_OP) {
+        second = ET[first].right;
+        if (ET[first].down != -1 || second < 0 || ET[second].right != -1) {
+            llvm_direct_reject("unsupported assignment expression");
+            return NULL;
+        }
+        value = direct_expression_value(second);
+        if (!value) return NULL;
+        return direct_store_operand(ET[first].value, value);
+    }
+
+    second = ET[first].right;
+    switch (ET[node].operator_number) {
+    case COMMA_OP:
+        if (second < 0 || ET[second].right != -1) {
+            llvm_direct_reject("invalid comma expression");
+            return NULL;
+        }
+        (void)direct_expression_value(first);
+        return direct_expression_value(second);
+
+    case UNARY_MINUS_OP:
+    case ARTNOT_OP:
+        if (second != -1) {
+            llvm_direct_reject("invalid unary expression");
+            return NULL;
+        }
+        return llvm_direct_unary(ET[node].operator_number,
+            direct_expression_value(first));
+
+    case INC_OP:
+    case POST_INC_OP:
+    case DEC_OP:
+    case POST_DEC_OP:
+        if (second != -1 || ET[first].down != -1) {
+            llvm_direct_reject("unsupported increment destination");
+            return NULL;
+        }
+        left = direct_operand_value(ET[first].value);
+        right = llvm_direct_constant(1, 0, 0);
+        value = llvm_direct_binary(
+            ET[node].operator_number == INC_OP
+                || ET[node].operator_number == POST_INC_OP
+                ? PLUS_OP : MINUS_OP,
+            left, right);
+        if (!direct_store_operand(ET[first].value, value))
+            return NULL;
+        return ET[node].operator_number == POST_INC_OP
+            || ET[node].operator_number == POST_DEC_OP ? left : value;
+
+    case ZERO_OP:
+    case NONZERO_OP:
+        if (second != -1) {
+            llvm_direct_reject("invalid zero comparison");
+            return NULL;
+        }
+        left = direct_expression_value(first);
+        right = llvm_direct_constant(0, 0, 0);
+        return llvm_direct_compare(ET[node].operator_number == ZERO_OP
+            ? CONDEQUALS_OP : NOTEQUAL_OP, left, right);
+
+    case CONDEQUALS_OP:
+    case NOTEQUAL_OP:
+    case GE_OP:
+    case GREATER_OP:
+    case LE_OP:
+    case LESS_OP:
+        if (second < 0) {
+            llvm_direct_reject("invalid comparison arity");
+            return NULL;
+        }
+        {   int count = 0, child, i;
+            llvm_direct_value *values;
+            for (child = first; child != -1; child = ET[child].right)
+                count++;
+            values = malloc((size_t)count * sizeof(*values));
+            if (!values)
+                fatalerror("Out of memory creating direct comparison");
+            for (i = count - 1; i >= 0; i--) {
+                int position = 0;
+                child = first;
+                while (position++ < i)
+                    child = ET[child].right;
+                values[i] = direct_expression_value(child);
+            }
+            value = llvm_direct_compare(ET[node].operator_number,
+                values[0], values[1]);
+            for (i = 2; i < count; i++) {
+                right = llvm_direct_compare(ET[node].operator_number,
+                    values[0], values[i]);
+                value = llvm_direct_binary(
+                    ET[node].operator_number == NOTEQUAL_OP
+                        || ET[node].operator_number == GE_OP
+                        || ET[node].operator_number == LE_OP
+                        ? ARTAND_OP : ARTOR_OP,
+                    value, right);
+            }
+            free(values);
+            return value;
+        }
+
+    case PLUS_OP:
+    case MINUS_OP:
+    case TIMES_OP:
+    case ARTAND_OP:
+    case ARTOR_OP:
+    case DIVIDE_OP:
+    case REMAINDER_OP:
+        if (second < 0 || ET[second].right != -1) {
+            llvm_direct_reject("invalid binary expression");
+            return NULL;
+        }
+        /* Match classic Glulx expression evaluation order. */
+        right = direct_expression_value(second);
+        left = direct_expression_value(first);
+        if (ET[node].operator_number == DIVIDE_OP
+            || ET[node].operator_number == REMAINDER_OP) {
+            int check_zero = runtime_error_checking_switch && !veneer_mode
+                && !(ET[second].down == -1
+                    && direct_constant_operand(ET[second].value)
+                    && ET[second].value.marker == 0
+                    && ET[second].value.value != 0);
+            return llvm_direct_division(ET[node].operator_number,
+                left, right, check_zero);
+        }
+        return llvm_direct_binary(ET[node].operator_number, left, right);
+
+    default:
+        llvm_direct_reject("unsupported expression operator");
+        return NULL;
+    }
+}
+
+extern void llvm_direct_return_expression(assembly_operand AO)
+{
+    llvm_direct_value value;
+    if (AO.type == EXPRESSION_OT)
+        value = direct_expression_value(AO.value);
     else
-        llvm_direct_reject("unsupported return expression");
+        value = direct_operand_value(AO);
+    if (value)
+        llvm_direct_return_value(value);
 }
 
 extern void llvm_direct_expression_statement(assembly_operand AO)
 {
-    int root, destination, source;
-    assembly_operand dst, src;
-
     if (AO.type != EXPRESSION_OT) {
         llvm_direct_reject("unsupported expression statement");
         return;
     }
-    root = AO.value;
-    destination = ET[root].down;
-    if (ET[root].operator_number != SETEQUALS_OP || ET[root].up != -1
-        || ET[root].right != -1 || destination < 0) {
-        llvm_direct_reject("unsupported expression operator");
-        return;
-    }
-    source = ET[destination].right;
-    if (source < 0 || ET[source].right != -1
-        || ET[destination].down != -1 || ET[source].down != -1) {
-        llvm_direct_reject("unsupported assignment expression");
-        return;
-    }
-    dst = ET[destination].value;
-    src = ET[source].value;
-    if (!direct_local_operand(dst)) {
-        llvm_direct_reject("unsupported assignment destination");
-        return;
-    }
-    if (direct_constant_operand(src))
-        llvm_direct_store_local_constant(dst.value, src.value);
-    else if (direct_local_operand(src))
-        llvm_direct_store_local(dst.value, src.value);
-    else
-        llvm_direct_reject("unsupported assignment source");
+    (void)direct_expression_value(AO.value);
 }
 
 assembly_operand code_generate(assembly_operand AO, int context, int label)

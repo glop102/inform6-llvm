@@ -732,8 +732,13 @@ static void validate(LLVMValueRef in)
     case LLVMSExt:
         {   LLVMValueRef src = LLVMGetOperand(in, 0);
             int sw = int_width(src);
-            if (sw == 1)
-                check_operand(src, "unlowerable extend source");
+            if (sw == 1) {
+                valinfo *si = lookup(src);
+                /* A lone ret(zext icmp) is emitted directly by the return
+                   terminator and needs no readable comparison slot. */
+                if (!(si && si->kind == VK_FUSED))
+                    check_operand(src, "unlowerable extend source");
+            }
             else {
                 /* 8/16-bit: source must be trunc-from-i32 whose input we
                    can read directly. */

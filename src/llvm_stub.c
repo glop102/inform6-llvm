@@ -38,6 +38,32 @@ extern void llvm_direct_routine_abandon(void)
 extern void llvm_direct_reject(const char *reason) { (void)reason; }
 extern void llvm_direct_note_statement(int statement_code)
 { (void)statement_code; }
+extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
+    int32 symindex)
+{ (void)value; (void)marker; (void)symindex; return NULL; }
+extern llvm_direct_value llvm_direct_load_local(int source)
+{ (void)source; return NULL; }
+extern llvm_direct_value llvm_direct_load_global(int source)
+{ (void)source; return NULL; }
+extern llvm_direct_value llvm_direct_unary(int operator_number,
+    llvm_direct_value operand)
+{ (void)operator_number; (void)operand; return NULL; }
+extern llvm_direct_value llvm_direct_binary(int operator_number,
+    llvm_direct_value left, llvm_direct_value right)
+{ (void)operator_number; (void)left; (void)right; return NULL; }
+extern llvm_direct_value llvm_direct_division(int operator_number,
+    llvm_direct_value left, llvm_direct_value right, int check_zero)
+{ (void)operator_number; (void)left; (void)right; (void)check_zero; return NULL; }
+extern llvm_direct_value llvm_direct_compare(int operator_number,
+    llvm_direct_value left, llvm_direct_value right)
+{ (void)operator_number; (void)left; (void)right; return NULL; }
+extern llvm_direct_value llvm_direct_store_local_value(int destination,
+    llvm_direct_value value)
+{ (void)destination; (void)value; return NULL; }
+extern llvm_direct_value llvm_direct_store_global_value(int destination,
+    llvm_direct_value value)
+{ (void)destination; (void)value; return NULL; }
+extern void llvm_direct_return_value(llvm_direct_value value) { (void)value; }
 extern void llvm_direct_store_local_constant(int destination, int32 value)
 { (void)destination; (void)value; }
 extern void llvm_direct_store_local(int destination, int source)

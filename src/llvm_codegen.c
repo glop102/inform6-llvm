@@ -1120,6 +1120,224 @@ static int direct_can_emit(void)
     return TRUE;
 }
 
+static LLVMValueRef direct_global_var(int32 index)
+{
+    char name[32];
+    LLVMValueRef g;
+    sprintf(name, "i6.g%d", (int)index);
+    g = LLVMGetNamedGlobal(direct_mod, name);
+    if (!g)
+        g = LLVMAddGlobal(direct_mod, i32t, name);
+    return g;
+}
+
+extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
+    int32 symindex)
+{
+    LLVMTypeRef params[3], ft;
+    LLVMValueRef f, args[3];
+    int is_new;
+    if (!direct_can_emit()) return NULL;
+    if (!marker)
+        return LLVMConstInt(i32t, (uint32_t)value, FALSE);
+
+    params[0] = i32t; params[1] = i32t; params[2] = i32t;
+    ft = LLVMFunctionType(i32t, params, 3, FALSE);
+    f = LLVMGetNamedFunction(direct_mod, "i6.sym");
+    is_new = (f == NULL);
+    if (!f)
+        f = LLVMAddFunction(direct_mod, "i6.sym", ft);
+    if (is_new)
+        mark_fn_as_constant(f);
+    args[0] = LLVMConstInt(i32t, (unsigned)marker, FALSE);
+    args[1] = LLVMConstInt(i32t, (uint32_t)value, FALSE);
+    args[2] = LLVMConstInt(i32t, (uint32_t)symindex, FALSE);
+    return LLVMBuildCall2(direct_bld, ft, f, args, 3, "sym");
+}
+
+extern llvm_direct_value llvm_direct_load_local(int source)
+{
+    if (!direct_can_emit()) return NULL;
+    if (source < 1 || source > direct_local_count) {
+        llvm_direct_reject("invalid local expression");
+        return NULL;
+    }
+    return LLVMBuildLoad2(direct_bld, i32t, direct_locals[source], "local");
+}
+
+extern llvm_direct_value llvm_direct_load_global(int source)
+{
+    if (!direct_can_emit()) return NULL;
+    if (source < MAX_LOCAL_VARIABLES) {
+        llvm_direct_reject("invalid global expression");
+        return NULL;
+    }
+    return LLVMBuildLoad2(direct_bld, i32t,
+        direct_global_var(source - MAX_LOCAL_VARIABLES), "global");
+}
+
+extern llvm_direct_value llvm_direct_unary(int operator_number,
+    llvm_direct_value operand)
+{
+    if (!direct_can_emit() || !operand) return NULL;
+    switch (operator_number) {
+    case UNARY_MINUS_OP:
+        return LLVMBuildNeg(direct_bld, operand, "neg");
+    case ARTNOT_OP:
+        return LLVMBuildNot(direct_bld, operand, "not");
+    default:
+        llvm_direct_reject("unsupported unary expression operator");
+        return NULL;
+    }
+}
+
+extern llvm_direct_value llvm_direct_binary(int operator_number,
+    llvm_direct_value left, llvm_direct_value right)
+{
+    if (!direct_can_emit() || !left || !right) return NULL;
+    switch (operator_number) {
+    case PLUS_OP:
+        return LLVMBuildAdd(direct_bld, left, right, "add");
+    case MINUS_OP:
+        return LLVMBuildSub(direct_bld, left, right, "sub");
+    case TIMES_OP:
+        return LLVMBuildMul(direct_bld, left, right, "mul");
+    case ARTAND_OP:
+        return LLVMBuildAnd(direct_bld, left, right, "and");
+    case ARTOR_OP:
+        return LLVMBuildOr(direct_bld, left, right, "or");
+    default:
+        llvm_direct_reject("unsupported binary expression operator");
+        return NULL;
+    }
+}
+
+static LLVMValueRef direct_opaque_call(const char *name, LLVMValueRef *args,
+    int count)
+{
+    LLVMTypeRef params[8], ft;
+    LLVMValueRef f;
+    int i, is_new;
+    for (i = 0; i < count; i++)
+        params[i] = i32t;
+    ft = LLVMFunctionType(i32t, params, (unsigned)count, FALSE);
+    f = LLVMGetNamedFunction(direct_mod, name);
+    is_new = (f == NULL);
+    if (!f)
+        f = LLVMAddFunction(direct_mod, name, ft);
+    if (is_new)
+        mark_opaque_fn_attrs(f, name + 3);
+    return LLVMBuildCall2(direct_bld, ft, f, args, (unsigned)count, "opaque");
+}
+
+extern llvm_direct_value llvm_direct_division(int operator_number,
+    llvm_direct_value left, llvm_direct_value right, int check_zero)
+{
+    const char *name = operator_number == DIVIDE_OP ? "i6.div" : "i6.mod";
+    LLVMValueRef args[3], condition, error_fn, divisor = right;
+    if (!direct_can_emit() || !left || !right) return NULL;
+    if (operator_number != DIVIDE_OP && operator_number != REMAINDER_OP) {
+        llvm_direct_reject("invalid division operator");
+        return NULL;
+    }
+    if (check_zero) {
+        assembly_operand error_routine = veneer_routine(RT__Err_VR);
+        LLVMBasicBlockRef error = LLVMAppendBasicBlockInContext(
+            llctx, direct_fn, "divide.zero");
+        LLVMBasicBlockRef valid = LLVMAppendBasicBlockInContext(
+            llctx, direct_fn, "divide.valid");
+        LLVMBasicBlockRef join = LLVMAppendBasicBlockInContext(
+            llctx, direct_fn, "divide.join");
+        LLVMValueRef incoming[2];
+        LLVMBasicBlockRef blocks[2];
+
+        condition = LLVMBuildICmp(direct_bld, LLVMIntEQ, right,
+            LLVMConstInt(i32t, 0, FALSE), "divide.iszero");
+        LLVMBuildCondBr(direct_bld, condition, error, valid);
+
+        LLVMPositionBuilderAtEnd(direct_bld, error);
+        error_fn = llvm_direct_constant(error_routine.value,
+            error_routine.marker, error_routine.symindex);
+        args[0] = error_fn;
+        args[1] = LLVMConstInt(i32t, 1, FALSE);
+        args[2] = LLVMConstInt(i32t, DBYZERO_RTE, FALSE);
+        (void)direct_opaque_call("i6.call.s", args, 3);
+        LLVMBuildBr(direct_bld, join);
+
+        LLVMPositionBuilderAtEnd(direct_bld, valid);
+        LLVMBuildBr(direct_bld, join);
+
+        LLVMPositionBuilderAtEnd(direct_bld, join);
+        divisor = LLVMBuildPhi(direct_bld, i32t, "divide.divisor");
+        incoming[0] = LLVMConstInt(i32t, 1, FALSE);
+        incoming[1] = right;
+        blocks[0] = error;
+        blocks[1] = valid;
+        LLVMAddIncoming(divisor, incoming, blocks, 2);
+    }
+    else if (LLVMIsAConstantInt(right)) {
+        int32 value = (int32)LLVMConstIntGetSExtValue(right);
+        if (value != 0 && value != -1)
+            return LLVMBuildBinOp(direct_bld,
+                operator_number == DIVIDE_OP ? LLVMSDiv : LLVMSRem,
+                left, right, "arithmetic");
+    }
+    args[0] = left; args[1] = divisor;
+    return direct_opaque_call(name, args, 2);
+}
+
+extern llvm_direct_value llvm_direct_compare(int operator_number,
+    llvm_direct_value left, llvm_direct_value right)
+{
+    LLVMIntPredicate predicate;
+    LLVMValueRef condition;
+    if (!direct_can_emit() || !left || !right) return NULL;
+    switch (operator_number) {
+    case CONDEQUALS_OP: predicate = LLVMIntEQ;  break;
+    case NOTEQUAL_OP:   predicate = LLVMIntNE;  break;
+    case GE_OP:         predicate = LLVMIntSGE; break;
+    case GREATER_OP:    predicate = LLVMIntSGT; break;
+    case LE_OP:         predicate = LLVMIntSLE; break;
+    case LESS_OP:       predicate = LLVMIntSLT; break;
+    default:
+        llvm_direct_reject("unsupported comparison operator");
+        return NULL;
+    }
+    condition = LLVMBuildICmp(direct_bld, predicate, left, right, "compare");
+    return LLVMBuildZExt(direct_bld, condition, i32t, "boolean");
+}
+
+extern llvm_direct_value llvm_direct_store_local_value(int destination,
+    llvm_direct_value value)
+{
+    if (!direct_can_emit() || !value) return NULL;
+    if (destination < 1 || destination > direct_local_count) {
+        llvm_direct_reject("invalid local assignment");
+        return NULL;
+    }
+    LLVMBuildStore(direct_bld, value, direct_locals[destination]);
+    return value;
+}
+
+extern llvm_direct_value llvm_direct_store_global_value(int destination,
+    llvm_direct_value value)
+{
+    if (!direct_can_emit() || !value) return NULL;
+    if (destination < MAX_LOCAL_VARIABLES) {
+        llvm_direct_reject("invalid global assignment");
+        return NULL;
+    }
+    LLVMBuildStore(direct_bld, value,
+        direct_global_var(destination - MAX_LOCAL_VARIABLES));
+    return value;
+}
+
+extern void llvm_direct_return_value(llvm_direct_value value)
+{
+    if (!direct_can_emit() || !value) return;
+    LLVMBuildRet(direct_bld, value);
+}
+
 extern void llvm_direct_note_statement(int statement_code)
 {
     if (direct_state != DIRECT_BUILDING)

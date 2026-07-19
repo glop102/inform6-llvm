@@ -2277,6 +2277,25 @@ extern void  llvm_direct_routine_finish(int embedded_flag,
 extern void  llvm_direct_routine_abandon(void);
 extern void  llvm_direct_reject(const char *reason);
 extern void  llvm_direct_note_statement(int statement_code);
+typedef void *llvm_direct_value;
+extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
+                 int32 symindex);
+extern llvm_direct_value llvm_direct_load_local(int source);
+extern llvm_direct_value llvm_direct_load_global(int source);
+extern llvm_direct_value llvm_direct_unary(int operator_number,
+                 llvm_direct_value operand);
+extern llvm_direct_value llvm_direct_binary(int operator_number,
+                 llvm_direct_value left, llvm_direct_value right);
+extern llvm_direct_value llvm_direct_division(int operator_number,
+                 llvm_direct_value left, llvm_direct_value right,
+                 int check_zero);
+extern llvm_direct_value llvm_direct_compare(int operator_number,
+                 llvm_direct_value left, llvm_direct_value right);
+extern llvm_direct_value llvm_direct_store_local_value(int destination,
+                 llvm_direct_value value);
+extern llvm_direct_value llvm_direct_store_global_value(int destination,
+                 llvm_direct_value value);
+extern void  llvm_direct_return_value(llvm_direct_value value);
 extern void  llvm_direct_store_local_constant(int destination, int32 value);
 extern void  llvm_direct_store_local(int destination, int source);
 extern void  llvm_direct_return_constant(int32 value);
