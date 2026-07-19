@@ -113,8 +113,8 @@ writeShellApplication {
     trap 'rm -rf "$work"' EXIT HUP INT TERM
     fail=0
 
-    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|Logical|If|IfElse|ShortCircuit|LogicalBranches|LogicalNegation|While|Do|DoReturn|For|ForInc|Switch|SwitchLoop|NestedSwitch|Infinite|Unreachable|UnreachableLoop|SharedReturn|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 47 ]; then
+    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|Logical|If|IfElse|ShortCircuit|LogicalBranches|LogicalNegation|While|Do|DoReturn|For|ForInc|Switch|SwitchLoop|NestedSwitch|Infinite|Unreachable|UnreachableLoop|SharedReturn|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap|CalleePair|CalleeSum|Note|Call|CallNested|CallOrder|CallWide|CallWideMixed|CallCondition|CallIndirect|CallVoid)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 58 ]; then
         echo "FAIL  direct-ir (supported routines did not all use direct IR)"
         fail=1
     fi
@@ -122,7 +122,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (quiet direct mode emitted per-routine diagnostics)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=47 lifted=0 fallback=12$' \
+    if [ "$(grep -ac '^LLVM: backends direct=58 lifted=0 fallback=13$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (aggregate backend totals are incorrect)"
         fail=1
@@ -170,6 +170,22 @@ writeShellApplication {
     check_routine Direct_UnreachableLoop 1 1
     check_routine Direct_SharedReturn 4 4
     check_routine Direct_GlobalInc 6 2
+    check_routine Direct_CalleePair 3 3
+    check_routine Direct_CalleeSum 9 9
+    check_routine Direct_Note 3 3
+    check_routine Direct_Call 2 2
+    check_routine Direct_CallNested 3 3
+    check_routine Direct_CallOrder 7 7
+    check_routine Direct_CallWide 8 8
+    check_routine Direct_CallWideMixed 7 9
+    check_routine Direct_CallCondition 4 3
+    check_routine Direct_CallIndirect 2 2
+    check_routine Direct_CallVoid 3 3
+    if ! grep -aq $'name=Direct_Random\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=unsupported system function' \
+        ${direct}/compile.log; then
+        echo "FAIL  direct-ir (random() did not fall back with its reason)"
+        fail=1
+    fi
     if ! grep -aq $'name=Main\tbackend=classic-fallback\tstage=direct-build' \
         ${direct}/compile.log; then
         echo "FAIL  direct-ir (unsupported routine did not report fallback)"
@@ -213,7 +229,7 @@ writeShellApplication {
     upstream_count=$COUNTED_RESULT
     run_counted ${direct}/story.ulx "$work/direct.count"
     direct_count=$COUNTED_RESULT
-    if [ "$upstream_count" -ne 620 ] || [ "$direct_count" -gt 581 ]; then
+    if [ "$upstream_count" -ne 756 ] || [ "$direct_count" -gt 718 ]; then
         echo "FAIL  direct-ir (dynamic instruction bound: upstream $upstream_count, direct $direct_count)"
         fail=1
     fi
@@ -308,7 +324,7 @@ writeShellApplication {
         fail=1
     fi
     if [ "$(grep -ac $'backend=classic-fallback\tstage=direct-lower' \
-        ${forcedLowerFallback}/compile.log)" -ne 47 ]; then
+        ${forcedLowerFallback}/compile.log)" -ne 58 ]; then
         echo "FAIL  direct-ir (forced lowering fallback diagnostics are incomplete)"
         fail=1
     fi

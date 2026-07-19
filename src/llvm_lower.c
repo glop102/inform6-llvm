@@ -166,6 +166,34 @@ static int call_writes_no_ram(const char *name)
     return llvm_opcode_no_ram_write(base);
 }
 
+/* TRUE if this instruction is an opaque i6.<opcode>.s call (stack-passed
+   arguments). *n_src_out gets the count of regular source operands;
+   *nargs_out the total argument count. Extras occupy indices
+   [n_src, nargs), listed in runtime pop order (first argument first). */
+static int stack_call_shape(LLVMValueRef in, int *n_src_out, int *nargs_out)
+{
+    const char *name;
+    char base[64];
+    size_t blen;
+    int32 opnum;
+    int flags;
+    if (!LLVMIsACallInst(in)) return FALSE;
+    name = called_fn_name(in);
+    if (!name || !name_has_prefix(name, "i6.")) return FALSE;
+    blen = strlen(name + 3);
+    if (blen <= 2 || blen >= sizeof(base)) return FALSE;
+    strcpy(base, name + 3);
+    if (strcmp(base + blen - 2, ".s") != 0) return FALSE;
+    base[blen - 2] = 0;
+    opnum = glulx_opcode_by_name(base);
+    if (opnum < 0) return FALSE;
+    flags = glulx_opcode_flags(opnum);
+    *n_src_out = glulx_opcode_operand_count(opnum)
+        - ((flags & OPFLAG_STORE) ? 1 : 0);
+    *nargs_out = (int)LLVMGetNumArgOperands(in);
+    return TRUE;
+}
+
 static valinfo *lookup(LLVMValueRef v)
 {
     int i;
@@ -1903,9 +1931,10 @@ static void liveness_pass(void)
 /*   ride the VM value stack: its def stores to "sp" and its use pops it.    */
 /*   A per-block simulation of the pending stack verifies that pushes and    */
 /*   pops pair up in LIFO order; anything that doesn't falls back to a       */
-/*   slot. Nothing else the lowerer emits touches the stack (opaque .s       */
-/*   calls push and pop their own arguments in a balanced way above any      */
-/*   pending values).                                                        */
+/*   slot. Opaque .s calls push and pop their explicit arguments in a        */
+/*   balanced way above any pending values; additionally, pending values     */
+/*   matching a contiguous deepest tail of a .s call's argument push order   */
+/*   stay on the stack and skip their explicit pushes entirely.              */
 /* ------------------------------------------------------------------------- */
 
 /* Defs whose emission is one instruction whose final operand stores the
@@ -1971,12 +2000,27 @@ static int fusion_candidate(valinfo *vi)
     valinfo *ri;
     readset rs;
     int k, in_pops = 0, in_other = 0;
+    int n_src, nargs;
 
     if (!stackable_def(vi)) return FALSE;
     reader = effective_reader(vi->v);
     if (!reader || LLVMIsAPHINode(reader)) return FALSE;
     ri = lookup(reader);
     if (!ri || ri->blk != vi->blk) return FALSE;
+
+    if (stack_call_shape(reader, &n_src, &nargs)) {
+        /* A .s call's stack arguments are genuine pops, but only a
+           contiguous deepest tail of the push order can stay pending;
+           fusion_pass decides that with its stack simulation and
+           unfuses the rest. Regular operands read after the pushes,
+           so feeding one from the stack would pop an argument. */
+        int hits = 0;
+        for (k = 0; k < n_src; k++)
+            if (rep(LLVMGetOperand(reader, k)) == vi->v) return FALSE;
+        for (k = n_src; k < nargs; k++)
+            if (rep(LLVMGetOperand(reader, k)) == vi->v) hits++;
+        return hits == 1;
+    }
 
     emission_readset(reader, &rs);
     for (k = 0; k < rs.n_pops; k++)
@@ -2006,6 +2050,44 @@ static void fusion_pass(void)
             readset rs;
             valinfo *vi;
             int k;
+            int n_src, nargs;
+
+            if (stack_call_shape(in, &n_src, &nargs)) {
+                /* Explicit argument pushes go deepest-first (last argument
+                   first), so pending values matching a contiguous tail of
+                   that push order — the top of the pending stack reading
+                   extras[j], extras[j+1], ... from the top down — are
+                   already in position and their pushes are elided.
+                   Everything else the call reads must leave the stack:
+                   explicit pushes would land on top of it. */
+                int L, t, max_match = nargs - n_src;
+                if (max_match > n_pend) max_match = n_pend;
+                for (L = max_match; L > 0; L--) {
+                    for (t = 0; t < L; t++)
+                        if (pend[n_pend - 1 - t]
+                            != rep(LLVMGetOperand(in, nargs - L + t)))
+                            break;
+                    if (t == L) break;
+                }
+                n_pend -= L;
+                for (k = 0; k < nargs - L; k++) {
+                    LLVMValueRef r = rep(LLVMGetOperand(in, k));
+                    for (j = n_pend - 1; j >= 0; j--) {
+                        if (pend[j] != r) continue;
+                        unfuse(r);
+                        memmove(&pend[j], &pend[j+1],
+                            (n_pend-j-1) * sizeof(pend[0]));
+                        n_pend--;
+                        break;
+                    }
+                }
+                vi = lookup(in);
+                if (vi && n_pend < MAX_PEND && fusion_candidate(vi)) {
+                    vi->kind = VK_STACK;
+                    pend[n_pend++] = in;
+                }
+                continue;
+            }
 
             emission_readset(in, &rs);
             for (k = 0; k < rs.n_pops; k++) {
@@ -3021,11 +3103,18 @@ static void emit_opaque_call(LLVMValueRef in, valinfo *vi, const char *name)
     n_src = opct - ((flags & OPFLAG_STORE) ? 1 : 0);
     nargs = (int)LLVMGetNumArgOperands(in);
 
-    /* Stack args: the lifter popped them in runtime order (arg n_src was
-       the top of the stack), so push them in reverse to rebuild it. */
+    /* Stack args: listed in runtime pop order (arg n_src is the top of
+       the stack), so push them in reverse to rebuild it. Fused (VK_STACK)
+       arguments were pushed by their defs and are already in position. */
     if (has_stack)
-        for (i = nargs - 1; i >= n_src; i--)
-            gen2(copy_gc, resolve(LLVMGetOperand(in, i)), stack_pointer);
+        for (i = nargs - 1; i >= n_src; i--) {
+            LLVMValueRef ext = LLVMGetOperand(in, i);
+            LLVMValueRef r = rep(ext);
+            valinfo *ei = r ? lookup(r) : NULL;
+            if (ei && ei->kind == VK_STACK)
+                continue;
+            gen2(copy_gc, resolve(ext), stack_pointer);
+        }
 
     for (i = 0; i < n_src; i++)
         ops[i] = resolve(LLVMGetOperand(in, i));

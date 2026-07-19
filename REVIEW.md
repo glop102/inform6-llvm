@@ -275,6 +275,44 @@ After the fold, direct mode matches upstream exactly on Life (56,177,197,
 +0.00%) and the lifted production path improved by the predicted 4,104
 instructions to 54,605,529 (-2.80%).
 
+Phase 4 began with source-level function calls. Direct generation emits the
+same opcode selection as classic: `i6.callf` through `i6.callfiii` for zero to
+three arguments, and `i6.call.s` for wider calls, with stack-passed arguments
+carried as explicit `.s` call operands in runtime pop order. Call declarations
+stay unmarked in the effect scheme, so every call is a full optimization
+barrier for globals and RAM. `indirect()` evaluates its first argument as the
+function; `glk()` and `metaclass()` become calls to the `Glk__Wrap` and
+`Metaclass_VR` veneer routines, matching classic. Other system functions
+(`random`, the object-tree family) still reject with an explicit reason; they
+need the Phase 4 memory operations. The parser's `push on stack` wrapper
+around wide-call arguments unwraps to the argument value itself.
+
+Adding calls exposed a latent direct-generation evaluation-order defect:
+classic emits subtree code right to left, but a leaf variable operand is read
+by the consuming instruction itself, after *all* subtree code. The direct
+backend was loading leaf globals at tree-walk time, so `f() + g` read `g`
+before `f` ran while upstream reads it after. Binary operators, variadic
+comparison lists, and call argument lists now defer leaf variable loads until
+after sibling subtree code, restoring classic read timing (the
+`Direct_CallOrder` fixture pins this with a call that mutates the global).
+
+The lowerer's stack fusion now understands `.s` calls: a contiguous deepest
+tail of a call's argument push order that is already sitting on top of the
+pending-stack simulation stays on the VM stack, and those explicit pushes are
+elided. Because direct generation evaluates arguments right to left, a wide
+call whose arguments are all fusable defs (for example five nested calls)
+lowers to classic's exact shape with zero temporaries. This benefits the
+lifted production path identically. Remaining known gap: constants interleaved
+between effectful wide-call arguments cannot ride the stack because classic
+interleaves their pushes between the argument computations while the lowerer
+pushes at the call site; `Direct_CallWideMixed` pins the resulting +2
+instructions as an accepted static ceiling until emission learns interleaved
+pushes.
+
+With calls supported, Life's `DrawCell` joins `Rnd` in direct coverage
+(2 direct, 13 fallback) and direct mode remains dynamically identical to
+upstream (56,177,197, +0.00%).
+
 Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,
 lifted, and fallback totals. Debug-file generation now uses allocated Unix

@@ -1245,7 +1245,7 @@ extern llvm_direct_value llvm_direct_binary(int operator_number,
 static LLVMValueRef direct_opaque_call(const char *name, LLVMValueRef *args,
     int count)
 {
-    LLVMTypeRef params[8], ft;
+    LLVMTypeRef params[16], ft;
     LLVMValueRef f;
     int i, is_new;
     for (i = 0; i < count; i++)
@@ -1335,6 +1335,38 @@ extern llvm_direct_value llvm_direct_compare(int operator_number,
     }
     condition = LLVMBuildICmp(direct_bld, predicate, left, right, "compare");
     return LLVMBuildZExt(direct_bld, condition, i32t, "boolean");
+}
+
+/* A source-level function call. Glulx has dedicated opcodes for zero to
+   three arguments; larger calls pass every argument on the VM stack, which
+   the opaque-call scheme carries as explicit ".s" arguments in runtime pop
+   order (first argument popped first). Calls have unknown effects, so the
+   opaque declaration stays unmarked and acts as a full barrier. */
+extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
+    llvm_direct_value *arguments, int count)
+{
+    static const char *const direct_call_names[4] =
+        { "i6.callf", "i6.callfi", "i6.callfii", "i6.callfiii" };
+    LLVMValueRef args[16];
+    int i;
+    if (!direct_can_emit() || !function) return NULL;
+    if (count < 0 || count > 12) {
+        llvm_direct_reject("unsupported call arity");
+        return NULL;
+    }
+    for (i = 0; i < count; i++)
+        if (!arguments[i]) return NULL;
+    if (count <= 3) {
+        args[0] = function;
+        for (i = 0; i < count; i++)
+            args[1 + i] = arguments[i];
+        return direct_opaque_call(direct_call_names[count], args, count + 1);
+    }
+    args[0] = function;
+    args[1] = LLVMConstInt(i32t, (uint32_t)count, FALSE);
+    for (i = 0; i < count; i++)
+        args[2 + i] = arguments[i];
+    return direct_opaque_call("i6.call.s", args, count + 2);
 }
 
 extern llvm_direct_value llvm_direct_store_local_value(int destination,

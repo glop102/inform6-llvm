@@ -3283,6 +3283,90 @@ static llvm_direct_value direct_store_operand(assembly_operand AO,
 
 static void direct_expression_condition(int node,
     llvm_direct_block true_block, llvm_direct_block false_block);
+static llvm_direct_value direct_expression_value(int node);
+
+/* A function-call node: the first child is the function (or a system
+   function selector), the rest are arguments. Classic Glulx generation
+   evaluates every child right to left, with the function address last;
+   mirror that order so side effects in arguments match upstream. */
+#define DIRECT_CALL_CHILDREN 14
+static llvm_direct_value direct_function_call(int node)
+{
+    int first = ET[node].down;
+    int nodes[DIRECT_CALL_CHILDREN];
+    llvm_direct_value values[DIRECT_CALL_CHILDREN];
+    llvm_direct_value function;
+    int count = 0, i, child, sysfun = -1;
+    int address_index = 0, argument_start = 1;
+    assembly_operand veneer_op;
+
+    if (first == -1) {
+        llvm_direct_reject("invalid call tree");
+        return NULL;
+    }
+    if (ET[first].down == -1 && ET[first].value.type == SYSFUN_OT)
+        sysfun = ET[first].value.value;
+
+    if (sysfun == -1) {
+        nodes[count++] = first;
+    }
+    for (child = ET[first].right; child != -1; child = ET[child].right) {
+        if (count >= DIRECT_CALL_CHILDREN) {
+            llvm_direct_reject("unsupported call arity");
+            return NULL;
+        }
+        nodes[count++] = child;
+    }
+
+    switch (sysfun) {
+    case -1:
+        break;
+    case INDIRECT_SYSF:
+        if (count < 1) {
+            llvm_direct_reject("invalid indirect call");
+            return NULL;
+        }
+        break;
+    case GLK_SYSF:
+        veneer_op = veneer_routine(Glk__Wrap_VR);
+        address_index = -1;
+        argument_start = 0;
+        break;
+    case METACLASS_SYSF:
+        if (count != 1) {
+            llvm_direct_reject("invalid metaclass call");
+            return NULL;
+        }
+        veneer_op = veneer_routine(Metaclass_VR);
+        address_index = -1;
+        argument_start = 0;
+        break;
+    default:
+        llvm_direct_reject("unsupported system function");
+        return NULL;
+    }
+
+    /* Subtree code right to left; leaf variable operands are read by the
+       call (or its argument pushes) after all subtree code, so load them
+       last, in decode order. */
+    for (i = count - 1; i >= 0; i--)
+        if (ET[nodes[i]].down != -1) {
+            values[i] = direct_expression_value(nodes[i]);
+            if (!values[i]) return NULL;
+        }
+    for (i = 0; i < count; i++)
+        if (ET[nodes[i]].down == -1) {
+            values[i] = direct_operand_value(ET[nodes[i]].value);
+            if (!values[i]) return NULL;
+        }
+    if (address_index >= 0)
+        function = values[address_index];
+    else
+        function = llvm_direct_constant(veneer_op.value, veneer_op.marker,
+            veneer_op.symindex);
+    return llvm_direct_call(function, values + argument_start,
+        count - argument_start);
+}
 
 #define DIRECT_SWITCH_DEPTH 32
 static llvm_direct_value direct_switch_values[DIRECT_SWITCH_DEPTH];
@@ -3353,6 +3437,15 @@ static llvm_direct_value direct_expression_value(int node)
         (void)direct_expression_value(first);
         return direct_expression_value(second);
 
+    case PUSH_OP:
+        /* The parser wraps stack-passed call arguments in an explicit
+           push; the value itself is all direct IR needs. */
+        if (second != -1) {
+            llvm_direct_reject("invalid push expression");
+            return NULL;
+        }
+        return direct_expression_value(first);
+
     case UNARY_MINUS_OP:
     case ARTNOT_OP:
         if (second != -1) {
@@ -3403,20 +3496,28 @@ static llvm_direct_value direct_expression_value(int node)
             llvm_direct_reject("invalid comparison arity");
             return NULL;
         }
-        {   int count = 0, child, i;
+        {   int count = 0, child, i, pass;
             llvm_direct_value *values;
             for (child = first; child != -1; child = ET[child].right)
                 count++;
             values = malloc((size_t)count * sizeof(*values));
             if (!values)
                 fatalerror("Out of memory creating direct comparison");
-            for (i = count - 1; i >= 0; i--) {
-                int position = 0;
-                child = first;
-                while (position++ < i)
-                    child = ET[child].right;
-                values[i] = direct_expression_value(child);
-            }
+            /* Subtree code right to left, then leaf variable reads,
+               which classic makes at the comparison instruction. */
+            for (pass = 0; pass < 2; pass++)
+                for (i = pass ? 0 : count - 1;
+                     pass ? i < count : i >= 0;
+                     pass ? i++ : i--) {
+                    int position = 0;
+                    child = first;
+                    while (position++ < i)
+                        child = ET[child].right;
+                    if ((ET[child].down == -1) == pass)
+                        values[i] = pass
+                            ? direct_operand_value(ET[child].value)
+                            : direct_expression_value(child);
+                }
             value = llvm_direct_compare(ET[node].operator_number,
                 values[0], values[1]);
             for (i = 2; i < count; i++) {
@@ -3444,9 +3545,17 @@ static llvm_direct_value direct_expression_value(int node)
             llvm_direct_reject("invalid binary expression");
             return NULL;
         }
-        /* Match classic Glulx expression evaluation order. */
-        right = direct_expression_value(second);
-        left = direct_expression_value(first);
+        /* Match classic Glulx evaluation: subtree code runs right to
+           left, but leaf variable operands are read by the emitted
+           instruction itself, after all subtree code. */
+        right = NULL;
+        left = NULL;
+        if (ET[second].down != -1) right = direct_expression_value(second);
+        if (ET[first].down != -1) left = direct_expression_value(first);
+        if (ET[first].down == -1)
+            left = direct_operand_value(ET[first].value);
+        if (ET[second].down == -1)
+            right = direct_operand_value(ET[second].value);
         if (ET[node].operator_number == DIVIDE_OP
             || ET[node].operator_number == REMAINDER_OP) {
             int check_zero = runtime_error_checking_switch && !veneer_mode
@@ -3458,6 +3567,9 @@ static llvm_direct_value direct_expression_value(int node)
                 left, right, check_zero);
         }
         return llvm_direct_binary(ET[node].operator_number, left, right);
+
+    case FCALL_OP:
+        return direct_function_call(node);
 
     default:
         llvm_direct_reject("unsupported expression operator");

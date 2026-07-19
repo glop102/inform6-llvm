@@ -271,6 +271,64 @@ Global Direct_Global = 5;
     return x;
 ];
 
+[ Direct_CalleePair x y;
+    return x * 10 + y;
+];
+
+[ Direct_CalleeSum a b c d e;
+    return a * 10000 + b * 1000 + c * 100 + d * 10 + e;
+];
+
+[ Direct_Note x;
+    Direct_Global = Direct_Global * 10 + x;
+    return x;
+];
+
+[ Direct_Call x;
+    return Direct_CalleePair(x, 3);
+];
+
+[ Direct_CallNested x;
+    return Direct_CalleePair(Direct_CalleePair(x, 1), 2);
+];
+
+[ Direct_CallOrder;
+    Direct_Global = 0;
+    return Direct_CalleePair(Direct_Note(1), Direct_Note(2)) * 1000
+        + Direct_Global;
+];
+
+[ Direct_CallWide;
+    Direct_Global = 0;
+    return Direct_CalleeSum(Direct_Note(1), Direct_Note(2), Direct_Note(3),
+        Direct_Note(4), Direct_Note(5));
+];
+
+[ Direct_CallWideMixed x;
+    return Direct_CalleeSum(x, 2, Direct_Note(3), 4, Direct_Note(5));
+];
+
+[ Direct_CallCondition x;
+    if (Direct_CalleePair(x, 0)) return 1;
+    return 2;
+];
+
+[ Direct_CallIndirect f x;
+    return indirect(f, x, 7);
+];
+
+[ Direct_CallVoid x;
+    Direct_Global = 3;
+    Direct_CalleePair(x, 1);
+    return Direct_Global;
+];
+
+! Not called at runtime: proves the random() system function still takes
+! the classic fallback with an explicit direct-generation reason.
+[ Direct_Random x;
+    return random(x);
+];
+
 [ Main win dummy;
     @setiosys 2 0;
     @copy 0 sp;
@@ -337,5 +395,15 @@ Global Direct_Global = 5;
           Direct_GlobalInc(), " ",
           Direct_EvalOrder(), " ",
           Direct_Comma(), " ",
-          Direct_Wrap(), "^done.^";
+          Direct_Wrap(), " ",
+          Direct_Call(4), " ",
+          Direct_CallNested(5), " ",
+          Direct_CallOrder(), " ",
+          Direct_CallWide(), " ",
+          Direct_Global, " ",
+          Direct_CallWideMixed(1), " ",
+          Direct_CallCondition(0), " ",
+          Direct_CallCondition(1), " ",
+          Direct_CallIndirect(Direct_CalleePair, 2), " ",
+          Direct_CallVoid(9), "^done.^";
 ];

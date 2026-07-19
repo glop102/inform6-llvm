@@ -2295,6 +2295,8 @@ extern llvm_direct_value llvm_direct_division(int operator_number,
                  int check_zero);
 extern llvm_direct_value llvm_direct_compare(int operator_number,
                  llvm_direct_value left, llvm_direct_value right);
+extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
+                 llvm_direct_value *arguments, int count);
 extern llvm_direct_value llvm_direct_store_local_value(int destination,
                  llvm_direct_value value);
 extern llvm_direct_value llvm_direct_store_global_value(int destination,
