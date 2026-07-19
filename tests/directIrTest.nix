@@ -164,27 +164,27 @@ writeShellApplication {
     check_routine Direct_Divide 2 2
     check_routine Direct_Remainder 2 2
     check_routine Direct_NonnegativeDivide 3 9
-    check_routine Direct_Divisor 7 9
-    check_routine Direct_Modulus 7 9
-    check_routine Direct_Compare 35 30
+    check_routine Direct_Divisor 7 7
+    check_routine Direct_Modulus 7 7
+    check_routine Direct_Compare 35 24
     check_routine Direct_CompareAssignment 6 2
     check_routine Direct_CompareOr 7 3
     check_routine Direct_CompareOrOrder 16 1
-    check_routine Direct_CompareOrPredicates 39 24
-    check_routine Direct_Logical 6 8
+    check_routine Direct_CompareOrPredicates 39 21
+    check_routine Direct_Logical 6 3
     check_routine Direct_If 3 2
     check_routine Direct_IfElse 5 5
     check_routine Direct_ShortCircuit 10 2
     check_routine Direct_LogicalBranches 10 2
     check_routine Direct_LogicalNegation 8 2
-    check_routine Direct_While 9 15
-    check_routine Direct_Do 3 6
+    check_routine Direct_While 9 13
+    check_routine Direct_Do 3 5
     check_routine Direct_DoReturn 1 1
     check_routine Direct_For 7 8
     check_routine Direct_ForInc 8 10
     check_routine Direct_Switch 17 18
     check_routine Direct_SwitchLoop 11 16
-    check_routine Direct_NestedSwitch 7 7
+    check_routine Direct_NestedSwitch 7 4
     check_routine Direct_Infinite 1 1
     check_routine Direct_Unreachable 1 1
     check_routine Direct_UnreachableLoop 1 1
@@ -255,7 +255,7 @@ writeShellApplication {
     upstream_count=$COUNTED_RESULT
     run_counted ${direct}/story.ulx "$work/direct.count"
     direct_count=$COUNTED_RESULT
-    if [ "$upstream_count" -ne 756 ] || [ "$direct_count" -gt 719 ]; then
+    if [ "$upstream_count" -ne 756 ] || [ "$direct_count" -gt 682 ]; then
         echo "FAIL  direct-ir (dynamic instruction bound: upstream $upstream_count, direct $direct_count)"
         fail=1
     fi

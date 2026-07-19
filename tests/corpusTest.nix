@@ -68,6 +68,11 @@ writeShellApplication {
         grep -a '^LLVM: backends' ${cloakDirect}/compile.log || true
         fail=1
     fi
+    if [ "$(grep -ac $'^LLVM-BACKEND\tname=SetTime\tbackend=direct\tstage=lower\tinput=6\temitted=7\treason=-$' \
+        ${cloakDirect}/compile.log)" -ne 1 ]; then
+        echo "FAIL  corpus (cloak select-to-store fold changed)"
+        fail=1
+    fi
     timeout 60 glulxe ${cloakUpstream} < ${./cloak.walk} \
         >"$work/cloak-up.log" 2>&1 || fail=1
     timeout 60 glulxe ${cloakDirect}/story.ulx < ${./cloak.walk} \
@@ -99,10 +104,10 @@ writeShellApplication {
     cloak_up=$COUNTED_RESULT
     run_counted ${cloakDirect}/story.ulx ${./cloak.walk} "$work/cloak-d.count"
     cloak_d=$COUNTED_RESULT
-    # Direct mode still trails upstream on cloak (a pre-existing LLVM-path
-    # regression, measured in REVIEW.md; the lifted path is worse at
-    # 179,729). The ceiling stops further slippage.
-    if [ "$cloak_up" -ne 164995 ] || [ "$cloak_d" -gt 175651 ]; then
+    # Direct mode beats upstream on cloak (Phase 4.1: 162,002 vs 164,995;
+    # the lifted path measures 163,569). The ceiling stops slippage back
+    # toward the old gap.
+    if [ "$cloak_up" -ne 164995 ] || [ "$cloak_d" -gt 162002 ]; then
         echo "FAIL  corpus (cloak dynamic bound: upstream $cloak_up, direct $cloak_d)"
         fail=1
     fi

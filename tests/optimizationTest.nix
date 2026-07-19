@@ -92,7 +92,7 @@ writeShellApplication {
             echo "FAIL  optimization (lowering coverage: $stats_line)"
             fail=1
         fi
-        if [ "$insts_in" -ne 177 ] || [ "$insts_out" -gt 196 ]; then
+        if [ "$insts_in" -ne 177 ] || [ "$insts_out" -gt 184 ]; then
             echo "FAIL  optimization (aggregate instruction bound: $stats_line)"
             fail=1
         fi
@@ -116,15 +116,15 @@ writeShellApplication {
         fi
     }
 
-    check_routine Opt_StoreFusion 7 8
+    check_routine Opt_StoreFusion 7 7
     check_routine Opt_CompareReturn 5 2
     check_routine Opt_SelectReturn 5 4
-    check_routine Opt_BooleanTree 5 10
-    check_routine Opt_LoopPhi 9 11
-    check_routine Opt_InductionSelect 13 19
-    check_routine Opt_BranchLayout 13 17
+    check_routine Opt_BooleanTree 5 6
+    check_routine Opt_LoopPhi 9 10
+    check_routine Opt_InductionSelect 13 17
+    check_routine Opt_BranchLayout 13 16
     check_routine Opt_SwitchOrder 12 14
-    check_routine Opt_SwitchShared 8 11
+    check_routine Opt_SwitchShared 8 9
     check_routine Opt_GlobalCoalesce 5 5
     check_routine Opt_CoalesceClobber 5 5
 
@@ -217,7 +217,7 @@ writeShellApplication {
         fail=1
     fi
     if [ "$fail" -eq 0 ] && \
-       { [ "$classic_count" -ne 422 ] || [ "$llvm_count" -gt 469 ]; }; then
+       { [ "$classic_count" -ne 422 ] || [ "$llvm_count" -gt 444 ]; }; then
         echo "FAIL  optimization (dynamic instruction bound: classic $classic_count, LLVM $llvm_count)"
         fail=1
     fi

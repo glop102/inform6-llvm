@@ -461,9 +461,85 @@ lifted, and fallback totals. Debug-file generation now uses allocated Unix
 `realpath` output so long source paths do not trigger fortified-libc buffer
 checks.
 
-The focused fixture currently requires 12 of 12 captured routines to lower,
-with zero lift or lowering bailouts. It checks exactly 156 aggregate input
-instructions, at most 175 emitted instructions, and exactly 396 classic dynamic
+Phase 4.1 ranked all 277 direct Cloak routines by emitted-minus-input static
+instructions before changing the lowerer. The largest expansions were
+`GetGNAOfObject` (50 -> 132), `LanguageNumber` (114 -> 170), `ListEqual`
+(136 -> 191), and `ObjectIsUntouchable` (162 -> 216). Their post-pass IR had,
+respectively, 19/9/3/20 phis and 15/18/41/44 comparisons; only
+`GetGNAOfObject` had many selects (7). Assembly comparison showed the dominant
+shape was strict library guards becoming SSA condition values and phi edge
+copies, not missing direct coverage. For example, classic
+`GetGNAOfObject` updates its `case` and `gender` locals in place, while the
+optimized SSA form carries their alternatives through select and phi chains.
+
+Three generic lowerer changes survived the required cross-benchmark checks:
+
+- A select whose sole consumer is a global or dereference store now writes
+  each arm directly to that destination. `SetTime` guards the resulting 6 -> 7
+  shape (formerly 6 -> 8).
+- Multi-use comparisons of immutable operands are rematerialized at each
+  branch/select consumer instead of paying a copy/branch/copy boolean
+  materialization. Single-use comparisons also fuse through a no-op `freeze`.
+- When exactly one side of a conditional needs ordinary phi copies, that side
+  is emitted as the inline/goto edge and the copy-free side is the branch
+  target. This removes the forced jump on the copy-free path and is pathwise
+  non-worsening.
+
+General fusion of returned selects with non-immediate arms was tested and
+rejected: although it reduced static instructions, the focused lifted fixture
+regressed from 463 to 474 dynamic dispatches. Keeping the immediate-only rule
+preserves its branch layout.
+
+The static ranking above turned out to be a poor guide to the dynamic gap:
+those changes recovered only 208 of the 10,656 extra dispatches. Phase 4.1
+then re-measured with dynamic attribution — a `VM_PROFILING` glulxe run of
+the cloak walkthrough joined against `$!asm` routine addresses for
+per-routine self-op deltas, plus `--opcode-histogram` diffs. That showed the
+gap concentrated in a handful of hot routines with four generic causes, each
+then fixed in the shared lowerer:
+
+- `Unsigned__Compare` alone was +5,863 (2.9 ops/call upstream vs 6.1):
+  if-conversion turns the branchy veneer comparison into a nest of selects
+  feeding one return, which materialized each select through a slot. Fused
+  return selects now chain: one arm may be another qualifying select (chains
+  only, never both arms — a stack-riding condition operand of a second arm
+  could pop out of LIFO order, while an untaken chain suffix is merely
+  abandoned and discarded by the return). Conditions expand connective
+  trees at the ret, so or-chains stay branch-form (`Opt_SwitchShared`
+  improved 11 -> 9). `Unsigned__Compare` now lowers to three instructions
+  and beats upstream by 140 dispatches on the walk.
+- `RA__Pr`/`RL__Pr` were +3,263/+1,221: classic mutates the `obj`/`id`
+  parameters in place, while the phi carrying their merged values paid two
+  edge copies plus a jump on every call. `phi_param_slot()` now lets a phi
+  adopt a parameter's slot whenever no read of the parameter can execute at
+  or after any edge into the phi's block (a CFG reachability check),
+  instead of demanding the phi be the parameter's only reader. Slot-sharing
+  safety checks learned to see parameter reads, and one adopting phi per
+  parameter slot is enforced.
+- `NextWord`-style parser code was ~+1/call for `copy wn local` where
+  classic reads the global operand directly at each use.
+  `global_operand_pass()` now accepts cross-block uses via a forward
+  "written since the load" dataflow (re-entering the load's block kills the
+  taint), instead of requiring every use in the load's own block.
+- The residual was almost entirely explicit `jump`s (+5,588 on the walk)
+  from keeping LLVM's block order. `straighten_layout()` moves a block that
+  nothing can fall into and that cannot fall out of its position to sit
+  directly after a block that branches to it and currently falls into
+  nothing. Each move enables one fallthrough and can lengthen no path; no
+  branch-frequency guess is involved.
+
+Cloak now measures 164,995 upstream, 162,002 direct (-1.81%), and 163,569
+lifted (-0.86%): both LLVM paths beat classic codegen, and the direct
+ceiling is pinned at 162,002. The focused optimization fixture improved to
+444 dynamic dispatches (classic 422), the direct-IR fixture to 682
+(upstream 756), and Life to 54,590,010 direct — still ahead of 54,605,034
+lifted. Phase 4.1's exit gate is met on its primary arm; no accepted-gap
+rationale is needed. Interference-aware coalescing beyond the parameter
+case remains future work, but nothing measured still hangs on it.
+
+The focused fixture currently requires 15 of 15 captured routines to lower,
+with zero lift or lowering bailouts. It checks exactly 177 aggregate input
+instructions, at most 184 emitted instructions, and exactly 422 classic dynamic
 dispatches with an LLVM ceiling of 444. Its named static checks cover store
 fusion, comparison and select returns, boolean trees, loop phis, recurrence
 folding, four-block layout, switch order, and shared-target switch cases.
@@ -591,7 +667,8 @@ nonnegative and rewrite `sdiv` as `udiv`. Glulx has a native signed division
 instruction but no native unsigned division instruction.
 
 The resulting `udiv` is expanded into shifts, signed division, multiplication,
-subtraction, comparison, and correction at `src/llvm_lower.c:2783-2837`.
+subtraction, comparison, and correction in `emit_udiv_urem()` at
+`src/llvm_lower.c:3066-3121`.
 Patterns such as `(x & $7fffffff) / 3` can therefore replace one native
 division dispatch with several dispatches. `Direct_NonnegativeDivide` now
 guards this shape with a nine-instruction static ceiling; prevention of the
@@ -612,29 +689,32 @@ comment. Tests should cover both profitable and unprofitable loop shapes.
 
 During emission planning, a conditional target requiring a phi-copy stub causes
 `plan_terminator()` to force a jump on the opposite edge at
-`src/llvm_lower.c:3117-3129`. That edge is planned as `EDGE_DIRECT` rather than
-`EDGE_FALLTHROUGH`, and `emit_terminator()` emits its explicit jump before
-flushing the stub at `src/llvm_lower.c:3226-3232`.
+`plan_terminator()` at `src/llvm_lower.c:3364-3466`. That edge is planned as
+`EDGE_DIRECT` rather than `EDGE_FALLTHROUGH`, and `emit_terminator()` emits its
+explicit jump before flushing the stub.
 
-This adds one dispatch whenever the non-stub fallthrough edge is taken. Stub
-placement or a final `jump L; L:` peephole should remove it.
+Conditional planning now avoids this cost when exactly one ordinary edge has
+phi copies: the copy edge becomes the inline/goto side and the copy-free edge
+the direct branch target. Cases where both edges require copies still need
+stubs and remain candidates for interference-aware coalescing.
 
 ### Returned Selects Materialize Ordinary Values
 
-`ret_select_pass()` accepts only selects whose arms are both immediate values
-at `src/llvm_lower.c:1631-1661`. The fused return emitter already resolves
-ordinary operands at `src/llvm_lower.c:3185-3205`.
+`ret_select_pass()` accepts selects whose arms are immediate values or (as a
+chain, one arm per level) further qualifying selects; `emit_ret_select()`
+expands the chain as conditional returns, with connective-tree conditions
+re-expanded at the ret. This restores the branch form of if-converted
+boolean routines such as `Unsigned__Compare`.
 
-For `return condition ? a : b`, the current lowering can materialize the select
-in a slot and then return it. Direct conditional returns avoid one or two
-dispatches per invocation. The immediate-only restriction appears
-unnecessarily conservative for adjacent select/return sequences.
+Fusing arbitrary ordinary arms was tested in Phase 4.1, but it increased the
+focused fixture from 463 to 474 dynamic dispatches despite reducing static
+output, so arms beyond immediates and select chains still materialize.
 
 ### Select Ordering Assumes Immediates Are Rare
 
-`select_swapped()` at `src/llvm_lower.c:965-980` assumes that an immediate true
-arm is a rare sentinel and orders emission to favor the computed false arm.
-The choice affects `src/llvm_lower.c:2769-2779`.
+`select_swapped()` at `src/llvm_lower.c:1050-1055` assumes that an immediate
+true arm is a rare sentinel and orders emission to favor the computed false
+arm. The choice affects `emit_select()` at `src/llvm_lower.c:3004-3059`.
 
 For the common idiom `ok ? 0 : error`, this can add one dispatch to the common
 success path. Operand representation is not branch-frequency evidence. The
@@ -643,15 +723,11 @@ which does not claim one arm is more likely.
 
 ### Select-to-Store Is Not Folded
 
-`store_fold_pass()` at `src/llvm_lower.c:1587-1615` requires
-`stackable_def()`, which explicitly rejects selects at
-`src/llvm_lower.c:1827-1850`. An adjacent sequence such as
-`Glob = condition ? a : b` therefore materializes a local select result and
-then copies it to the destination.
-
-Writing each select arm directly to the final store target would save one
-dispatch on every path. It needs the same source-before-destination and
-clobber checks used by existing store folding.
+`store_fold_pass()` now recognizes a select whose sole effective consumer is a
+global or dereference store and emits each arm directly to that destination.
+It uses the existing empty-window check and branches before either destination
+write, so condition and arm reads cannot observe an early clobber. Cloak's
+`SetTime` statically guards the fold.
 
 ### Fixed Limits Can Hide Coverage Regressions
 
@@ -670,7 +746,8 @@ silently reduce coverage.
 
 Successfully lowered routines replace the captured stream unconditionally
 through `src/llvm_codegen.c:1062-1076`; the lowerer resets and rewrites the
-capture buffer at `src/llvm_lower.c:3444-3488`. The current aggregate statistic
+capture buffer in `llvm_lower_routine()` at `src/llvm_lower.c:3744-3880`. The
+current aggregate statistic
 records static counts but does not influence acceptance.
 
 A blanket rule rejecting output whenever its static count exceeds the classic

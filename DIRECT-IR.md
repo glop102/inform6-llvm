@@ -42,7 +42,7 @@ The project is successful when:
 - [x] Phase 2: generate straight-line expressions directly.
 - [x] Phase 3: generate structured control flow directly.
 - [x] Phase 4: add calls, memory operations, VM effects, and inline assembly.
-- [ ] Phase 4.1: close the library-code dynamic gap against upstream.
+- [x] Phase 4.1: close the library-code dynamic gap against upstream.
 - [ ] Phase 5: make direct IR the default Glulx path.
 - [ ] Phase 6: remove the lifter and shadow assembly emission.
 
@@ -479,6 +479,15 @@ schemes indefinitely is excessive ongoing cost. If the gap resists
 closing after the documented findings are addressed, record the outcome
 and the accepted ceiling in `REVIEW.md` and proceed to Phase 5 rather
 than holding the lifter's removal hostage to parity.
+
+Outcome: met on the primary arm, so the soft fallback was not needed.
+Dynamic per-routine attribution (profiled glulxe joined against `$!asm`
+addresses) replaced the earlier static ranking and located the gap in
+four generic lowering shapes: return select chains, phi-to-parameter
+slot adoption, cross-block direct global reads, and jump-only layout
+straightening. Cloak now runs 162,002 direct and 163,569 lifted against
+164,995 upstream — both LLVM paths beat classic — and every focused
+fixture tightened; details in `REVIEW.md`.
 
 ### Phase 5: Make Direct IR The Default Glulx Path
 
