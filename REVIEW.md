@@ -25,11 +25,12 @@ bookkeeping, work within an opcode handler as separate operations, or native C
 work performed by accelerated routines.
 
 The Life benchmark measurement recorded after recurrence folding and block
-layout was:
+layout was 54,609,633 LLVM instructions (`-2.79%`). The current measurement,
+after the multi-use store fold described under the Phase 2 findings, is:
 
 ```text
 classic: 56,177,197 instructions
-LLVM:    54,609,633 instructions (-2.79%)
+LLVM:    54,605,529 instructions (-2.80%)
 ```
 
 Before the recurrence-folding improvement described below, LLVM executed
@@ -222,11 +223,30 @@ cast operator; comparison `i1` to word conversion is the relevant Phase 2
 conversion, while Glulx shifts enter through Phase 4 inline assembly.
 
 The Phase 2 Life benchmark has low direct coverage: only `Rnd` builds directly,
-while fourteen routines fall back. In the focused run, upstream executes
-56,177,197 instructions and direct mode executes 56,181,301, a 4,104-instruction
-increase. `Rnd` contains signed division by `$10000`; this result reinforces the
-broader native-division canonicalization cost issue. The lifted production path
-remains lower at 54,609,633 instructions in the same benchmark.
+while fourteen routines fall back. An earlier run measured direct mode at
+56,181,301 instructions against upstream's 56,177,197, a 4,104-instruction
+increase. The cause was not division: `Rnd`'s `sdiv` by `$10000` survives
+optimization intact and lowers to one native `div`. The extra dispatch per call
+was a lowerer coalescing gap for a value that is stored to a global and then
+reused: classic writes the `add` result directly into `seed` and has the
+division read the global back, while the lowerer materialized the value in a
+temporary local plus a `copy` to the global. Both backends emitted the
+identical six-instruction routine, so the lifted production path carried the
+same +4,104, masked by its wins elsewhere; the `udiv` canonicalization hazard
+documented below is real but was not implicated.
+
+The lowerer's store fold now has a multi-use variant: a def stored to an i6
+global immediately after it is computed (the single-use fold's emit-nothing
+window) may keep its remaining same-block uses if the global is unclobbered
+from the store to each read; the def then writes the global directly and the
+reads use the GLOBALVAR operand, so the temporary local and the copy
+disappear. Reads that later passes relocate are guarded by the same
+`arm_globals_stable` span check that protects direct global-load operands,
+and the focused fixture pins both the fold (`Opt_GlobalCoalesce`, 5 -> 5)
+and the mandatory decline across a clobbering call (`Opt_CoalesceClobber`).
+After the fold, direct mode matches upstream exactly on Life (56,177,197,
++0.00%) and the lifted production path improved by the predicted 4,104
+instructions to 54,605,529 (-2.80%).
 
 Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,

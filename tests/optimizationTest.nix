@@ -58,17 +58,17 @@ writeShellApplication {
 
     backend_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=lifted\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
     fallback_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=classic-fallback\tstage=limit\tinput=-1\temitted=-1\treason=-$'
-    if [ "$(grep -acE "$backend_re" ${compileLog})" -ne 12 ] || \
+    if [ "$(grep -acE "$backend_re" ${compileLog})" -ne 15 ] || \
        grep -aq $'\tbackend=classic-fallback\t' ${compileLog}; then
         echo "FAIL  optimization (backend-origin records do not cover lifted routines)"
         fail=1
     fi
-    if [ "$(grep -acE "$fallback_re" ${fallbackLog})" -ne 12 ] || \
+    if [ "$(grep -acE "$fallback_re" ${fallbackLog})" -ne 15 ] || \
        grep -aq $'\tbackend=lifted\t' ${fallbackLog}; then
         echo "FAIL  optimization (backend-origin records do not cover forced fallback)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=0 lifted=12 fallback=0$' \
+    if [ "$(grep -ac '^LLVM: backends direct=0 lifted=15 fallback=0$' \
         ${compileLog})" -ne 1 ]; then
         echo "FAIL  optimization (aggregate backend totals are incorrect)"
         fail=1
@@ -87,12 +87,12 @@ writeShellApplication {
         not_lowered=''${BASH_REMATCH[4]}
         insts_in=''${BASH_REMATCH[5]}
         insts_out=''${BASH_REMATCH[6]}
-        if [ "$optimized" -ne 12 ] || [ "$captured" -ne 12 ] || \
+        if [ "$optimized" -ne 15 ] || [ "$captured" -ne 15 ] || \
            [ "$not_lifted" -ne 0 ] || [ "$not_lowered" -ne 0 ]; then
             echo "FAIL  optimization (lowering coverage: $stats_line)"
             fail=1
         fi
-        if [ "$insts_in" -ne 156 ] || [ "$insts_out" -gt 175 ]; then
+        if [ "$insts_in" -ne 177 ] || [ "$insts_out" -gt 196 ]; then
             echo "FAIL  optimization (aggregate instruction bound: $stats_line)"
             fail=1
         fi
@@ -125,6 +125,8 @@ writeShellApplication {
     check_routine Opt_BranchLayout 13 17
     check_routine Opt_SwitchOrder 12 14
     check_routine Opt_SwitchShared 8 11
+    check_routine Opt_GlobalCoalesce 5 5
+    check_routine Opt_CoalesceClobber 5 5
 
     run_story() {
         local story=$1 log=$2 status
@@ -215,7 +217,7 @@ writeShellApplication {
         fail=1
     fi
     if [ "$fail" -eq 0 ] && \
-       { [ "$classic_count" -ne 396 ] || [ "$llvm_count" -gt 444 ]; }; then
+       { [ "$classic_count" -ne 422 ] || [ "$llvm_count" -gt 469 ]; }; then
         echo "FAIL  optimization (dynamic instruction bound: classic $classic_count, LLVM $llvm_count)"
         fail=1
     fi

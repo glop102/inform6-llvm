@@ -344,12 +344,15 @@ Exit gate:
 - Static and dynamic bounds remain within their test-owned ceilings.
 - Invalid or faulting expressions match upstream behavior.
 
-Benchmark note: Phase 2 direct coverage reaches only `Rnd` in Life, whose
-signed division by `$10000` expands into a multi-instruction LLVM form instead
-of remaining one native Glulx division. That routine makes direct mode execute
-4,104 more dynamic instructions than upstream in the current benchmark. This is
-a target-cost shortcoming to address when revisiting direct division; it does
-not change the Phase 2 correctness gate.
+Benchmark note: Phase 2 direct coverage reaches only `Rnd` in Life. An
+earlier run showed direct mode 4,104 dynamic instructions above upstream;
+the cause was not division (the `sdiv` lowers to one native `div`) but a
+lowerer coalescing gap for a value stored to a global and then reused,
+which cost a temporary local plus a `copy` where classic writes the global
+directly and reads it back. The lowerer's multi-use store fold now emits
+classic's shape, direct mode matches upstream exactly on Life, and the
+lifted production path improved by the same 4,104 instructions. The fix and
+its guards are recorded in `REVIEW.md`.
 
 ### Phase 3: Generate Structured Control Flow Directly
 

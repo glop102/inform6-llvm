@@ -75,6 +75,30 @@ Array opt_cells --> 2;
     }
 ];
 
+Global coal_g = 0;
+
+! Multi-use store fold: a value assigned to a global and then reused
+! writes the global directly and reads it back, dropping the temp local
+! and the copy (classic's own shape for "glob = expr; ... glob ...").
+[ Opt_GlobalCoalesce x r;
+    coal_g = x * 3 + 7;
+    r = coal_g / 3;
+    return r + coal_g;
+];
+
+[ Opt_CoalesceBump;
+    coal_g = coal_g + 1;
+];
+
+! The fold must decline when the global can be clobbered between the
+! assignment and the value's reuse; v must keep its own storage here.
+[ Opt_CoalesceClobber x v;
+    v = x + 5;
+    coal_g = v;
+    Opt_CoalesceBump();
+    return coal_g - v;
+];
+
 [ Main win dummy;
     @setiosys 2 0;
     @copy 0 sp;
@@ -107,5 +131,8 @@ Array opt_cells --> 2;
           Opt_SwitchShared(10), " ",
           Opt_SwitchShared(30), " ",
           Opt_SwitchShared(50), " ",
-          Opt_SwitchShared(99), "^done.^";
+          Opt_SwitchShared(99), " ",
+          Opt_GlobalCoalesce(4), " ",
+          Opt_GlobalCoalesce(-13), " ",
+          Opt_CoalesceClobber(10), "^done.^";
 ];

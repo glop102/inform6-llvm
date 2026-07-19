@@ -1339,15 +1339,28 @@ static int memory_clobber_span(int p1, int p2)
     return FALSE;
 }
 
+/* The global a read of this value resolves to, or NULL: VK_GLOBAL loads
+   and defs folded into a global store (their reads use the store's
+   target operand). */
+static LLVMValueRef read_resolves_to_global(valinfo *ui)
+{
+    if (!ui) return NULL;
+    if (ui->kind == VK_GLOBAL) return LLVMGetOperand(ui->v, 0);
+    if (ui->kind == VK_SKIP && ui->fold_store
+        && LLVMGetInstructionOpcode(ui->fold_store) == LLVMStore)
+        return LLVMGetOperand(ui->fold_store, 1);
+    return NULL;
+}
+
 /* Sinking moves the arm's reads from its own position to the select's;
    reads of globals must still see the same values there. */
 static int arm_globals_stable(LLVMValueRef op, int from, int to)
 {
     unsigned i, n = LLVMGetNumOperands(op);
     for (i = 0; i < n; i++) {
-        valinfo *ui = underlying(LLVMGetOperand(op, i));
-        if (ui && ui->kind == VK_GLOBAL
-            && !global_safe_span(LLVMGetOperand(ui->v, 0), from, to))
+        LLVMValueRef g = read_resolves_to_global(
+            underlying(LLVMGetOperand(op, i)));
+        if (g && !global_safe_span(g, from, to))
             return FALSE;
     }
     return TRUE;
@@ -1372,10 +1385,8 @@ static int pure_op_movable(valinfo *vi, int to_pos)
         {   LLVMValueRef src = LLVMGetOperand(op, 0);
             LLVMValueRef wide = (int_width(src) == 1)
                 ? src : LLVMGetOperand(src, 0);
-            valinfo *ui = underlying(wide);
-            if (ui && ui->kind == VK_GLOBAL
-                && !global_safe_span(LLVMGetOperand(ui->v, 0),
-                       vi->pos, to_pos))
+            LLVMValueRef g = read_resolves_to_global(underlying(wide));
+            if (g && !global_safe_span(g, vi->pos, to_pos))
                 return FALSE;
         }
         return TRUE;
@@ -1529,6 +1540,10 @@ static void edge_fold_pass(void)
 /*   target ("add Glob 1 Glob"). Sound only when nothing emitted between     */
 /*   the def and the store could observe the target's early write, so we     */
 /*   require the window between them to emit nothing at all.                 */
+/*                                                                           */
+/*   The multi-use variant folds a def stored to a global and then reused:   */
+/*   the later reads use the GLOBALVAR operand while the global stays        */
+/*   unclobbered, matching classic's "assign to global, read it back".       */
 /* ------------------------------------------------------------------------- */
 
 static int stackable_def(valinfo *vi);
@@ -1567,6 +1582,10 @@ static int emits_nothing(valinfo *vi)
 static int window_safe_for_reads(valinfo *vi)
 {
     if (emits_nothing(vi)) return TRUE;
+    /* A def folded into a store writes a global, not just its slot. The
+       callers all run before store_fold_pass today; this guards against
+       a future reordering. */
+    if (vi->fold_store) return FALSE;
     switch (LLVMGetInstructionOpcode(vi->v)) {
     case LLVMAdd: case LLVMSub: case LLVMMul:
     case LLVMSDiv: case LLVMSRem:
@@ -1589,6 +1608,66 @@ static int window_safe_for_reads(valinfo *vi)
     }
 }
 
+/* Multi-use variant of the store fold: one use is a store to an i6
+   global immediately after the def (nothing emits between, the same
+   early-write rule as the single-use fold), and every other use reads
+   the value later in the block with no intervening write to that
+   global. The def then writes the global directly and the other uses
+   read the GLOBALVAR operand; both the copy and the def's slot
+   disappear. This is the shape classic codegen produces for
+   "glob = expr; ... use glob ..." ("add sp K Glob; div Glob C sp"). */
+static void multi_store_fold(valinfo *vi)
+{
+    LLVMValueRef st = NULL, g;
+    valinfo *si = NULL;
+    LLVMUseRef use;
+    int q;
+
+    /* Candidate: the earliest store of this value to a global. */
+    for (use = LLVMGetFirstUse(vi->v); use; use = LLVMGetNextUse(use)) {
+        LLVMValueRef user = LLVMGetUser(use);
+        valinfo *ui;
+        if (!LLVMIsAInstruction(user)) return;
+        if (LLVMGetInstructionOpcode(user) != LLVMStore) continue;
+        ui = lookup(user);
+        if (!ui) return;
+        if (!si || ui->pos < si->pos) { st = user; si = ui; }
+    }
+    if (!st || si->blk != vi->blk) return;
+    g = LLVMGetOperand(st, 1);
+    if (!LLVMIsAGlobalVariable(g)) return;
+
+    for (q = vi->pos + 1; q < si->pos; q++)
+        if (!emits_nothing(&vals[q])) return;
+
+    /* Every other use must read strictly after the store, in the same
+       block, with the global unclobbered from the store to the read.
+       Reads absorbed elsewhere (aliases, sunk selects, tree nodes) are
+       not worth chasing; fused icmps read at their consumer. */
+    for (use = LLVMGetFirstUse(vi->v); use; use = LLVMGetNextUse(use)) {
+        LLVMValueRef user = LLVMGetUser(use);
+        valinfo *ui;
+        if (user == st) continue;
+        if (!LLVMIsAInstruction(user) || LLVMIsAPHINode(user)) return;
+        ui = lookup(user);
+        if (!ui) return;
+        if (ui->kind == VK_FUSED) {
+            LLVMValueRef c = LLVMGetUser(LLVMGetFirstUse(user));
+            ui = c ? lookup(c) : NULL;
+            if (!ui) return;
+        }
+        else if (ui->kind == VK_ALIAS
+            || (ui->kind == VK_SKIP
+                && LLVMGetInstructionOpcode(user) != LLVMRet))
+            return;
+        if (ui->blk != vi->blk) return;
+        if (ui->pos <= si->pos) return;
+        if (!global_safe_span(g, si->pos, ui->pos)) return;
+    }
+    vi->fold_store = st;
+    vi->kind = VK_SKIP;
+}
+
 static void store_fold_pass(void)
 {
     int p, q;
@@ -1600,7 +1679,7 @@ static void store_fold_pass(void)
 
         if (vi->kind != VK_SLOT || !stackable_def(vi)) continue;
         reader = effective_reader(vi->v);
-        if (!reader) continue;
+        if (!reader) { multi_store_fold(vi); continue; }
         if (LLVMGetInstructionOpcode(reader) == LLVMStore)
             validx = 0;
         else if (LLVMIsACallInst(reader)) {
@@ -2275,6 +2354,8 @@ static assembly_operand global_op(LLVMValueRef ptr)
     return mkop(GLOBALVAR_OT, MAX_LOCAL_VARIABLES + idx);
 }
 
+static assembly_operand store_target_op(LLVMValueRef st);
+
 /* Turn an SSA value into an assembly_operand at a use site. */
 static assembly_operand resolve(LLVMValueRef v)
 {
@@ -2309,6 +2390,12 @@ static assembly_operand resolve(LLVMValueRef v)
     case VK_SLOT:   return slot_op(vi->slot);
     case VK_STACK:  return stack_op();
     case VK_GLOBAL: return global_op(LLVMGetOperand(vi->v, 0));
+    case VK_SKIP:
+        /* A def folded into a global store: reads use the global. */
+        if (vi->fold_store
+            && LLVMGetInstructionOpcode(vi->fold_store) == LLVMStore)
+            return store_target_op(vi->fold_store);
+        /* fall through */
     default:
         compiler_error("llvm_lower: operand with no representation");
         return const_op(0);
