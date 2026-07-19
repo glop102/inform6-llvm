@@ -344,6 +344,13 @@ Exit gate:
 - Static and dynamic bounds remain within their test-owned ceilings.
 - Invalid or faulting expressions match upstream behavior.
 
+Benchmark note: Phase 2 direct coverage reaches only `Rnd` in Life, whose
+signed division by `$10000` expands into a multi-instruction LLVM form instead
+of remaining one native Glulx division. That routine makes direct mode execute
+4,104 more dynamic instructions than upstream in the current benchmark. This is
+a target-cost shortcoming to address when revisiting direct division; it does
+not change the Phase 2 correctness gate.
+
 ### Phase 3: Generate Structured Control Flow Directly
 
 - Translate condition context into LLVM branches rather than materialized

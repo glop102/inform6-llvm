@@ -1,9 +1,15 @@
-{ writeShellApplication, coreutils, diffutils, gawk, gnugrep
-, glulxe, glulxe-counted, compiledStories }:
+{ lib, runCommand, writeShellApplication, coreutils, diffutils, gawk, gnugrep
+, glulxe, glulxe-counted, inform6-llvm, compiledStories }:
 
 let
   classic = compiledStories.classic.life;
   llvm = compiledStories.llvm.life;
+  directBuild = runCommand "life-direct" { } ''
+    mkdir "$out"
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${../stories/life.inf} "$out/story.ulx" >"$out/compile.log" 2>&1
+  '';
+  direct = "${directBuild}/story.ulx";
 in
 writeShellApplication {
   name = "inform6-llvm-benchmark-life";
@@ -17,6 +23,28 @@ writeShellApplication {
 
     work=$(mktemp -d "''${TMPDIR:-/tmp}/inform6-life.XXXXXX")
     trap 'rm -rf "$work"' EXIT HUP INT TERM
+
+    coverage_re='^LLVM: backends direct=([0-9]+) lifted=([0-9]+) fallback=([0-9]+)$'
+    coverage_line=$(grep -aE "$coverage_re" ${directBuild}/compile.log || true)
+    if [ "$(grep -acE "$coverage_re" ${directBuild}/compile.log)" -ne 1 ] || \
+       [[ ! $coverage_line =~ $coverage_re ]]; then
+        echo "FAIL  life (missing direct backend coverage)"
+        exit 1
+    fi
+    direct_routines=''${BASH_REMATCH[1]}
+    lifted_routines=''${BASH_REMATCH[2]}
+    fallback_routines=''${BASH_REMATCH[3]}
+    direct_names=$(awk -F '\t' '
+        $3 == "backend=direct" {
+            sub(/^name=/, "", $2)
+            names = names (names ? "," : "") $2
+        }
+        END { print names }
+    ' ${directBuild}/compile.log)
+    if [ "$lifted_routines" -ne 0 ]; then
+        echo "FAIL  life (direct build unexpectedly used lifted routines)"
+        exit 1
+    fi
 
     run_timed() {
         local kind=$1 story=$2 log=$3 run=$4 status
@@ -51,28 +79,42 @@ writeShellApplication {
 
     run_timed classic ${classic} "$work/life.classic.log" 1 || exit 1
     run_timed llvm ${llvm} "$work/life.llvm.log" 1 || exit 1
+    run_timed direct ${direct} "$work/life.direct.log" 1 || exit 1
     check_output "$work/life.llvm.log"
+    check_output "$work/life.direct.log"
     classic_elapsed=$(elapsed_ms "$work/life.classic.log") || exit 1
     llvm_elapsed=$(elapsed_ms "$work/life.llvm.log") || exit 1
+    direct_elapsed=$(elapsed_ms "$work/life.direct.log") || exit 1
     classic_times=("$classic_elapsed")
     llvm_times=("$llvm_elapsed")
+    direct_times=("$direct_elapsed")
 
     for ((run = 2; run <= BENCH_RUNS; run++)); do
         classic_log="$work/life.classic.$run.log"
         llvm_log="$work/life.llvm.$run.log"
-        if ((run % 2 == 0)); then
+        direct_log="$work/life.direct.$run.log"
+        if ((run % 3 == 0)); then
+            run_timed classic ${classic} "$classic_log" "$run" || exit 1
             run_timed llvm ${llvm} "$llvm_log" "$run" || exit 1
+            run_timed direct ${direct} "$direct_log" "$run" || exit 1
+        elif ((run % 3 == 1)); then
+            run_timed llvm ${llvm} "$llvm_log" "$run" || exit 1
+            run_timed direct ${direct} "$direct_log" "$run" || exit 1
             run_timed classic ${classic} "$classic_log" "$run" || exit 1
         else
+            run_timed direct ${direct} "$direct_log" "$run" || exit 1
             run_timed classic ${classic} "$classic_log" "$run" || exit 1
             run_timed llvm ${llvm} "$llvm_log" "$run" || exit 1
         fi
         check_output "$classic_log"
         check_output "$llvm_log"
+        check_output "$direct_log"
         classic_elapsed=$(elapsed_ms "$classic_log") || exit 1
         llvm_elapsed=$(elapsed_ms "$llvm_log") || exit 1
+        direct_elapsed=$(elapsed_ms "$direct_log") || exit 1
         classic_times+=("$classic_elapsed")
         llvm_times+=("$llvm_elapsed")
+        direct_times+=("$direct_elapsed")
     done
 
     timing_summary() {
@@ -89,6 +131,9 @@ writeShellApplication {
     echo "ok    life"
     echo "      classic: $(timing_summary classic_times)"
     echo "      llvm:    $(timing_summary llvm_times)"
+    echo "      direct:  $(timing_summary direct_times)"
+    echo "      coverage: direct $direct_routines, fallback $fallback_routines"
+    echo "      direct routines: ''${direct_names:--}"
 
     histogram=0
     counted_help=$(glulxe-counted -help 2>&1 || true)
@@ -130,15 +175,15 @@ writeShellApplication {
     }
 
     write_opcode_comparison() {
-        local classic_log=$1 llvm_log=$2 output=$3
+        local classic_log=$1 candidate_log=$2 candidate_name=$3 output=$4
         {
-            printf 'opcode\tclassic\tllvm\tdelta\n'
+            printf 'opcode\tclassic\t%s\tdelta\n' "$candidate_name"
             awk -F= '
                 /^GLULXE_OPCODE_COUNT_0x[0-9A-F]+=[0-9]+$/ {
                     opcode = $1
                     sub(/^GLULXE_OPCODE_COUNT_/, "", opcode)
                     if (FNR == NR) classic[opcode] = $2
-                    else llvm[opcode] = $2
+                    else compared[opcode] = $2
                     seen[opcode] = 1
                 }
                 END {
@@ -146,10 +191,11 @@ writeShellApplication {
                         opcode = sprintf("0x%03X", number)
                         if (opcode in seen)
                             print opcode "\t" classic[opcode] + 0 "\t" \
-                                llvm[opcode] + 0 "\t" llvm[opcode] - classic[opcode]
+                                compared[opcode] + 0 "\t" \
+                                compared[opcode] - classic[opcode]
                     }
                 }
-            ' "$classic_log" "$llvm_log"
+            ' "$classic_log" "$candidate_log"
         } >"$output"
     }
 
@@ -158,13 +204,20 @@ writeShellApplication {
     classic_count=$COUNTED_RESULT
     count_story ${llvm} "$work/life.llvm.count.log" || exit 1
     llvm_count=$COUNTED_RESULT
-    delta=$((llvm_count - classic_count))
-    percent=$(awk -v delta="$delta" -v base="$classic_count" \
+    count_story ${direct} "$work/life.direct.count.log" || exit 1
+    direct_count=$COUNTED_RESULT
+    llvm_delta=$((llvm_count - classic_count))
+    direct_delta=$((direct_count - classic_count))
+    llvm_percent=$(awk -v delta="$llvm_delta" -v base="$classic_count" \
         'BEGIN { printf "%+.2f%%", 100 * delta / base }')
-    echo "      dynamic: classic $classic_count, llvm $llvm_count ($percent)"
+    direct_percent=$(awk -v delta="$direct_delta" -v base="$classic_count" \
+        'BEGIN { printf "%+.2f%%", 100 * delta / base }')
+    echo "      dynamic: classic $classic_count, llvm $llvm_count ($llvm_percent), direct $direct_count ($direct_percent)"
     if [ "$histogram" -eq 1 ]; then
         write_opcode_comparison "$work/life.classic.count.log" \
-            "$work/life.llvm.count.log" "$work/life.opcodes.tsv"
+            "$work/life.llvm.count.log" llvm "$work/life.llvm-opcodes.tsv"
+        write_opcode_comparison "$work/life.classic.count.log" \
+            "$work/life.direct.count.log" direct "$work/life.direct-opcodes.tsv"
         echo "      opcodes: collected"
     else
         echo "      opcodes: skipped (glulxe-counted lacks --opcode-histogram)"

@@ -221,6 +221,13 @@ and `INT_MIN / -1` out of LLVM undefined behavior. Inform has no source shift or
 cast operator; comparison `i1` to word conversion is the relevant Phase 2
 conversion, while Glulx shifts enter through Phase 4 inline assembly.
 
+The Phase 2 Life benchmark has low direct coverage: only `Rnd` builds directly,
+while fourteen routines fall back. In the focused run, upstream executes
+56,177,197 instructions and direct mode executes 56,181,301, a 4,104-instruction
+increase. `Rnd` contains signed division by `$10000`; this result reinforces the
+broader native-division canonicalization cost issue. The lifted production path
+remains lower at 54,609,633 instructions in the same benchmark.
+
 Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,
 lifted, and fallback totals. Debug-file generation now uses allocated Unix
