@@ -746,8 +746,10 @@ static void lift_instruction(const assembly_instruction *ai)
             return;
         }
         lift_opaque(ai, flags, NULL, 0);
-        /* Opcodes that never return (quit, restart, tailcall...) end the
-           basic block. */
+        /* Opcodes that never return (quit, restart, jumpabs...) end the
+           basic block. Glulx permits @jumpabs to any absolute code address,
+           including another function, but Inform does not guarantee the
+           generated layout used to derive such an address. See REVIEW.md. */
         if (!lift_failed && (flags & OPFLAG_RETURNS))
             LLVMBuildUnreachable(bld);
         return;

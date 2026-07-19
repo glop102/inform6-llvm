@@ -60,8 +60,10 @@ writeShellApplication {
       "check ${story.name} ${story.classic} ${story.llvm} ${story.input}") stories}
 
     # Glulxercise is self-checking. Its layout-dependent addresses legitimately
-    # differ after optimization, so accept only the documented jumpabs and
-    # catch-token failures rather than comparing transcripts.
+    # differ after optimization: computed code addresses are documented as
+    # unsupported under optimization (see REVIEW.md), so accept only the
+    # documented jumpabs and catch-token failures rather than comparing
+    # transcripts. These counts pin the out-of-contract set exactly.
     classic_log="$work/glulxercise.classic.log"
     llvm_log="$work/glulxercise.llvm.log"
     if ! run_story 60 ${glulxercise.classic} ${glulxercise.input} "$classic_log"; then

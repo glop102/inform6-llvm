@@ -1667,6 +1667,9 @@ extern void assembleg_instruction(const assembly_instruction *AI)
     }
 
     if (llvm_capturing && !llvm_replaying) {
+        if (LLVM_CODEGEN >= 2 && AI->internal_number == jumpabs_gc)
+            warning("LLVM optimization does not preserve generated code "
+                "addresses used by @jumpabs");
         llvm_capture_instruction(AI);
         return;
     }

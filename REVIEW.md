@@ -246,19 +246,34 @@ reports rather than gates its dynamic count.
 
 ## Correctness Findings
 
-### `jumpabs` Is Unsafe Under Per-Routine Optimization
+### `jumpabs` And Computed Code Addresses: Documented Policy
 
 `jumpabs` is classified as non-returning at `src/asm.c:802` and is lifted as an
-opaque call followed by `unreachable` at `src/llvm_codegen.c:743-753`. Glulx
+opaque call followed by `unreachable` at `src/llvm_codegen.c:743-755`. Glulx
 allows it to jump into the interior of a routine, but LLVM may remove or
 reorder that routine's instructions and change its local-frame layout.
 
-The compliance suite already observes this mismatch and suppresses it at
-`tests/complianceTest.nix`. Programs using `jumpabs`
-can therefore silently change behavior under the default LLVM level. A routine
-containing `jumpabs` should not be optimized. Because one routine can jump into
-another, a conservative implementation may need to disable routine rewriting
-for the entire story when `jumpabs` is present.
+DM4 §41 says that Inform branch labels are routine-local, but this restriction
+does not define `jumpabs`: its operand is an ordinary computed value rather
+than an Inform branch-label operand. The Glulx specification (§2.2 "Branches")
+explicitly permits branching into another function and notes that a function
+has no well-defined end. It defines `jumpabs` as an unconditional branch to an
+absolute address.
+
+What Inform does not guarantee is the generated instruction layout needed to
+derive an interior address from a routine symbol. Glulxercise relies on that
+layout with `pos = test_jumpabs_2+5`; optimization and compiler-version changes
+may both invalidate the offset.
+
+Policy: programs that compute code addresses are unsupported under LLVM
+optimization, in the same way they are unsupported across upstream compiler
+versions. Handling `jumpabs` routine-locally as an opaque non-returning
+operation is sufficient; no story-wide preflight, whole-story buffering, or
+layout-preserving mode is planned. `tests/complianceTest.nix` pins the known
+out-of-contract glulxercise failures (one `jumpabs` check, ten catch-token
+checks) exactly, so any change in the accepted failure set is still detected.
+The compiler warns whenever LLVM optimization encounters `jumpabs`, because it
+cannot prove whether the address depends on generated layout.
 
 ### Poison, Undef, and Freeze Semantics Need Proof
 
@@ -372,7 +387,7 @@ silently reduce coverage.
 ## Profitability Model
 
 Successfully lowered routines replace the captured stream unconditionally
-through `src/llvm_codegen.c:1060-1074`; the lowerer resets and rewrites the
+through `src/llvm_codegen.c:1062-1076`; the lowerer resets and rewrites the
 capture buffer at `src/llvm_lower.c:3444-3488`. The current aggregate statistic
 records static counts but does not influence acceptance.
 
@@ -440,7 +455,8 @@ gains on additional VM dispatches.
 - Tail calls, ordinary calls, and Glk calls with stack arguments.
 - Nested pointer selects around global loads.
 - `jumpabs`, catch tokens, and other layout-sensitive behavior as explicit
-  expected incompatibilities rather than substring-filtered failures.
+  expected incompatibilities rather than substring-filtered failures, per the
+  computed-code-address policy above.
 
 ### Limits and Version Stability
 
@@ -463,8 +479,9 @@ gains on additional VM dispatches.
 
 ## Recommended Order of Work
 
-1. Disable unsafe optimization in the presence of `jumpabs`. A jump can target
-   a different, previously emitted routine, so this needs a story-wide policy.
+1. Resolved as policy: computed code addresses (including cross-routine
+   `jumpabs` targets) are documented as unsupported under optimization; see
+   the correctness finding above. No story-wide mechanism is planned.
 2. Add focused fixtures for phi-stub fallthrough, unsigned-division
    canonicalization, and zero-trip or conditional LICM before changing those
    transformations.

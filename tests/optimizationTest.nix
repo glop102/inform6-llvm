@@ -8,6 +8,18 @@ let
     ${lib.getExe inform6-llvm} -G '$LLVM=3' \
       ${../stories/optimization-regressions.inf} opt.ulx >"$out" 2>&1
   '';
+  jumpabsLlvmLog = runCommand "jumpabs-warning-llvm.compile.log" { } ''
+    work=$(mktemp -d)
+    cd "$work"
+    ${lib.getExe inform6-llvm} -G '$LLVM=2' \
+      ${../stories/jumpabs-warning.inf} jumpabs.ulx >"$out" 2>&1
+  '';
+  jumpabsClassicLog = runCommand "jumpabs-warning-classic.compile.log" { } ''
+    work=$(mktemp -d)
+    cd "$work"
+    ${lib.getExe inform6-llvm} -G '$LLVM=0' \
+      ${../stories/jumpabs-warning.inf} jumpabs.ulx >"$out" 2>&1
+  '';
   classic = compiledStories.classic.optimization-regressions;
   llvm = compiledStories.llvm.optimization-regressions;
   faultClassic = compiledStories.classic.faulting-read;
@@ -20,6 +32,16 @@ writeShellApplication {
     work=$(mktemp -d "''${TMPDIR:-/tmp}/inform6-opt.XXXXXX")
     trap 'rm -rf "$work"' EXIT HUP INT TERM
     fail=0
+
+    jumpabs_warning='LLVM optimization does not preserve generated code addresses used by @jumpabs'
+    if [ "$(grep -acF "$jumpabs_warning" ${jumpabsLlvmLog})" -ne 1 ]; then
+        echo "FAIL  optimization (missing or duplicate jumpabs warning)"
+        fail=1
+    fi
+    if grep -aqF "$jumpabs_warning" ${jumpabsClassicLog}; then
+        echo "FAIL  optimization (jumpabs warning emitted without optimization)"
+        fail=1
+    fi
 
     if grep -aqE '^! LLVM: (bailed on|could not lower) ' ${compileLog}; then
         echo "FAIL  optimization (unexpected LLVM bailout)"

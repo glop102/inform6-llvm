@@ -1,0 +1,6 @@
+Constant Story "LLVM jumpabs warning fixture";
+
+[ Main target;
+    target = Main + 1;
+    @jumpabs target;
+];

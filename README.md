@@ -103,6 +103,13 @@ behavioral, compliance, static instruction, and dynamic instruction-count
 tests. Unsupported instructions, fixed resource limits, debug output, traced
 routines, or unfamiliar post-LLVM shapes can cause per-routine fallback.
 
+Glulx permits `jumpabs` to branch to an arbitrary absolute code address,
+including code in another function. Inform does not guarantee the generated
+instruction layout used by arithmetic on routine addresses, and LLVM
+optimization does not preserve it. The compiler warns when LLVM optimization
+is requested for code using `jumpabs`; programs which depend on generated code
+addresses are unsupported under optimization.
+
 Dynamic dispatch count is the primary performance signal, but it is not a
 complete cost model. Opcode handlers, operand modes, memory behavior, Glk work,
 host branch prediction, and accelerated routines have different costs.
