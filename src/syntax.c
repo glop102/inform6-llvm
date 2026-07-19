@@ -271,6 +271,7 @@ static int switch_sign(void)
 #define MAX_SPEC_STACK (32)
 static assembly_operand spec_stack[MAX_SPEC_STACK];
 static int spec_type[MAX_SPEC_STACK];
+static int direct_switch_spec_reversed;
 
 static void compile_alternatives_z(assembly_operand switch_value, int n,
     int stack_level, int label, int flag)
@@ -381,6 +382,20 @@ static void generate_switch_spec(assembly_operand switch_value, int label, int l
     int max_equality_args = ((!glulx_mode) ? 3 : 1);
 
     sequence_point_follows = FALSE;
+
+    if (glulx_mode) {
+        if (direct_switch_spec_reversed) {
+            assembly_operand values[MAX_SPEC_STACK];
+            int types[MAX_SPEC_STACK], ix;
+            for (ix = 0; ix < speccount; ix++) {
+                values[ix] = spec_stack[speccount - ix - 1];
+                types[ix] = spec_type[speccount - ix - 1];
+            }
+            llvm_direct_switch_case(label, values, types, speccount);
+        }
+        else
+            llvm_direct_switch_case(label, spec_stack, spec_type, speccount);
+    }
 
     if ((speccount > max_equality_args) && (label_after == -1))
         label_after = alloc_label();
@@ -655,6 +670,8 @@ extern void parse_code_block(int break_label, int continue_label,
             }
             if (token_type == SEP_TT && token_value == CLOSE_BRACE_SEP)
             {   if (switch_clause_made && (!default_clause_made))
+                    llvm_direct_bind_label(switch_label);
+                if (switch_clause_made && (!default_clause_made))
                     assemble_label_no(switch_label);
                 break;
             }
@@ -675,8 +692,10 @@ extern void parse_code_block(int break_label, int continue_label,
                     if (switch_clause_made)
                     {   if (!execution_never_reaches_here)
                         {   sequence_point_follows = FALSE;
+                            llvm_direct_jump(break_label);
                             assemble_jump(break_label);
                         }
+                        llvm_direct_bind_label(switch_label);
                         assemble_label_no(switch_label);
                     }
                     switch_clause_made = TRUE;
@@ -741,8 +760,10 @@ extern void parse_code_block(int break_label, int continue_label,
                         if (switch_clause_made)
                         {   if (!execution_never_reaches_here)
                                 {   sequence_point_follows = FALSE;
+                                    llvm_direct_jump(break_label);
                                     assemble_jump(break_label);
                                 }
+                            llvm_direct_bind_label(switch_label);
                             assemble_label_no(switch_label);
                         }
                         
@@ -750,7 +771,9 @@ extern void parse_code_block(int break_label, int continue_label,
                         switch_clause_made = TRUE;
                         
                         AO = temp_var1;
+                        direct_switch_spec_reversed = TRUE;
                         generate_switch_spec(AO, switch_label, -1, constcount);
+                        direct_switch_spec_reversed = FALSE;
                         continue;
                     }
                     
@@ -782,8 +805,10 @@ extern void parse_code_block(int break_label, int continue_label,
                     if (switch_clause_made)
                     {   if (!execution_never_reaches_here)
                         {   sequence_point_follows = FALSE;
+                            llvm_direct_jump(break_label);
                             assemble_jump(break_label);
                         }
+                        llvm_direct_bind_label(switch_label);
                         assemble_label_no(switch_label);
                     }
 

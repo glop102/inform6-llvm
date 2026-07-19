@@ -1784,6 +1784,7 @@ static void parse_statement_g(int break_label, int continue_label)
     debug_location spare_debug_location1, spare_debug_location2;
 
     ASSERT_GLULX();
+    pre_unreach = execution_never_reaches_here;
 
     if ((token_type == SEP_TT) && (token_value == HASH_SEP))
     {   llvm_direct_reject("directive in routine");
@@ -1886,8 +1887,10 @@ static void parse_statement_g(int break_label, int continue_label)
         case BREAK_CODE:
                  if (break_label == -1)
                  error("'break' can only be used in a loop or 'switch' block");
-                 else
+                 else {
+                     llvm_direct_jump(break_label);
                      assembleg_jump(break_label);
+                 }
                  break;
 
     /*  -------------------------------------------------------------------- */
@@ -1897,8 +1900,10 @@ static void parse_statement_g(int break_label, int continue_label)
         case CONTINUE_CODE:
                  if (continue_label == -1)
                  error("'continue' can only be used in a loop block");
-                 else
+                 else {
+                     llvm_direct_jump(continue_label);
                      assembleg_jump(continue_label);
+                 }
                  break;
 
     /*  -------------------------------------------------------------------- */
@@ -1906,14 +1911,18 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case DO_CODE:
-                 assemble_label_no(ln = alloc_label());
+                 if (pre_unreach) llvm_direct_suspend();
+                 ln = alloc_label();
+                 llvm_direct_bind_label(ln);
+                 assemble_label_no(ln);
                  ln2 = alloc_label(); ln3 = alloc_label();
                  parse_code_block(ln3, ln2, 0);
                  statements.enabled = TRUE;
                  get_next_token();
                  if ((token_type == STATEMENT_TT)
                      && (token_value == UNTIL_CODE))
-                 {   assemble_forward_label_no(ln2);
+                 {   labelexists = assemble_forward_label_no(ln2);
+                     llvm_direct_resolve_label(ln2, labelexists);
                      match_open_bracket();
                      AO = parse_expression(CONDITION_CONTEXT);
                      match_close_bracket();
@@ -1921,7 +1930,9 @@ static void parse_statement_g(int break_label, int continue_label)
                  }
                  else error("'do' without matching 'until'");
 
-                 assemble_forward_label_no(ln3);
+                 labelexists = assemble_forward_label_no(ln3);
+                 llvm_direct_resolve_label(ln3, labelexists);
+                 if (pre_unreach) llvm_direct_resume();
                  break;
 
     /*  -------------------------------------------------------------------- */
@@ -1964,6 +1975,7 @@ static void parse_statement_g(int break_label, int continue_label)
             form of a 'for' loop).  It is adequate for now.                  */
 
         case FOR_CODE:
+                 if (pre_unreach) llvm_direct_suspend();
                  match_open_bracket();
                  get_next_token();
 
@@ -1976,22 +1988,29 @@ static void parse_statement_g(int break_label, int continue_label)
                  if (!((token_type==SEP_TT)&&(token_value==COLON_SEP)))
                  {   put_token_back();
                      if (!((token_type==SEP_TT)&&(token_value==SUPERCLASS_SEP)))
-                     {   sequence_point_follows = TRUE;
-                         statement_debug_location = get_token_location();
-                         code_generate(parse_expression(FORINIT_CONTEXT),
-                             VOID_CONTEXT, -1);
+                         {   sequence_point_follows = TRUE;
+                             statement_debug_location = get_token_location();
+                             AO3 = parse_expression(FORINIT_CONTEXT);
+                             llvm_direct_expression_statement(AO3);
+                             code_generate(AO3, VOID_CONTEXT, -1);
                      }
                      get_next_token();
                      if ((token_type==SEP_TT)&&(token_value == SUPERCLASS_SEP))
                      {   get_next_token();
                          if ((token_type==SEP_TT)&&(token_value == CLOSEB_SEP))
-                         {   assemble_label_no(ln = alloc_label());
+                         {   ln = alloc_label();
+                             llvm_direct_bind_label(ln);
+                             assemble_label_no(ln);
                              ln2 = alloc_label();
                              parse_code_block(ln2, ln, 0);
                              sequence_point_follows = FALSE;
-                             if (!execution_never_reaches_here)
+                             if (!execution_never_reaches_here) {
+                                 llvm_direct_jump(ln);
                                  assembleg_jump(ln);
-                             assemble_forward_label_no(ln2);
+                             }
+                             labelexists = assemble_forward_label_no(ln2);
+                             llvm_direct_resolve_label(ln2, labelexists);
+                             if (pre_unreach) llvm_direct_resume();
                              return;
                          }
                          goto ParseUpdate;
@@ -2022,10 +2041,14 @@ static void parse_statement_g(int break_label, int continue_label)
                  ln2 = alloc_label();
                  ln3 = alloc_label();
 
-                 if ((AO2.type == OMITTED_OT) || (flag != 0))
-                 {
-                     assemble_label_no(ln);
-                     if (flag==0) assemble_label_no(ln2);
+                  if ((AO2.type == OMITTED_OT) || (flag != 0))
+                  {
+                      llvm_direct_bind_label(ln);
+                      assemble_label_no(ln);
+                      if (flag==0) {
+                          llvm_direct_bind_label(ln2);
+                          assemble_label_no(ln2);
+                      }
 
                      /*  The "finished yet?" condition  */
 
@@ -2041,17 +2064,21 @@ static void parse_statement_g(int break_label, int continue_label)
                      /*  This is the jump which could be avoided with the aid
                          of long-term expression storage  */
 
-                     sequence_point_follows = FALSE;
-                     assembleg_jump(ln2);
+                      sequence_point_follows = FALSE;
+                      llvm_direct_jump(ln2);
+                      assembleg_jump(ln2);
 
                      /*  The "update" part  */
 
-                     assemble_label_no(ln);
-                     sequence_point_follows = TRUE;
-                     statement_debug_location = spare_debug_location2;
-                     code_generate(AO2, VOID_CONTEXT, -1);
+                      llvm_direct_bind_label(ln);
+                      assemble_label_no(ln);
+                      sequence_point_follows = TRUE;
+                      statement_debug_location = spare_debug_location2;
+                      llvm_direct_expression_statement(AO2);
+                      code_generate(AO2, VOID_CONTEXT, -1);
 
-                     assemble_label_no(ln2);
+                      llvm_direct_bind_label(ln2);
+                      assemble_label_no(ln2);
 
                      /*  The "finished yet?" condition  */
 
@@ -2067,12 +2094,13 @@ static void parse_statement_g(int break_label, int continue_label)
                      /*  In this optimised case, update code is at the end
                          of the loop block, so "continue" goes there  */
 
-                     parse_code_block(ln3, ln2, 0);
-                     assemble_label_no(ln2);
+                      parse_code_block(ln3, ln2, 0);
+                      llvm_direct_bind_label(ln2);
+                      assemble_label_no(ln2);
 
                      sequence_point_follows = TRUE;
                      statement_debug_location = spare_debug_location2;
-                     if (flag > 0)
+                      if (flag > 0)
                      {   INITAO(&AO3);
                          AO3.value = flag;
                          if (AO3.value >= MAX_LOCAL_VARIABLES)
@@ -2089,22 +2117,28 @@ static void parse_statement_g(int break_label, int continue_label)
                          else
                            AO3.type = LOCALVAR_OT;
                          assembleg_3(sub_gc, AO3, one_operand, AO3);
-                     }
-                     assembleg_jump(ln);
+                      }
+                      llvm_direct_adjust_variable(flag > 0 ? flag : -flag,
+                          flag > 0 ? 1 : -1);
+                      llvm_direct_jump(ln);
+                      assembleg_jump(ln);
                  }
                  else
                  {
                      /*  In the unoptimised case, update code is at the
                          start of the loop block, so "continue" goes there  */
 
-                     parse_code_block(ln3, ln, 0);
-                     if (!execution_never_reaches_here)
-                     {   sequence_point_follows = FALSE;
-                         assembleg_jump(ln);
-                     }
-                 }
+                      parse_code_block(ln3, ln, 0);
+                      if (!execution_never_reaches_here)
+                      {   sequence_point_follows = FALSE;
+                          llvm_direct_jump(ln);
+                          assembleg_jump(ln);
+                      }
+                  }
 
-                 assemble_forward_label_no(ln3);
+                  labelexists = assemble_forward_label_no(ln3);
+                  llvm_direct_resolve_label(ln3, labelexists);
+                  if (pre_unreach) llvm_direct_resume();
                  return;
 
     /*  -------------------------------------------------------------------- */
@@ -2184,6 +2218,7 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case IF_CODE:
+                 if (pre_unreach) llvm_direct_suspend();
                  flag = FALSE; /* set if there's an "else" */
                  ln2 = 0;
                  pre_unreach = execution_never_reaches_here;
@@ -2237,19 +2272,24 @@ static void parse_statement_g(int break_label, int continue_label)
                  
                  if ((token_type == STATEMENT_TT) && (token_value == ELSE_CODE))
                  {   flag = TRUE;
-                     if (ln >= 0)
-                     {   ln2 = alloc_label();
-                         if (!execution_never_reaches_here)
-                         {   sequence_point_follows = FALSE;
-                             assembleg_jump(ln2);
-                         }
+                      if (ln >= 0)
+                      {   ln2 = alloc_label();
+                          if (!execution_never_reaches_here)
+                          {   sequence_point_follows = FALSE;
+                              llvm_direct_jump(ln2);
+                              assembleg_jump(ln2);
+                          }
                      }
                  }
                  else put_token_back();
 
                  /* The "else" label (or end of statement, if there is no "else") */
-                 labelexists = FALSE;
-                 if (ln >= 0) labelexists = assemble_forward_label_no(ln);
+                   labelexists = FALSE;
+                   if (ln >= 0) {
+                       if (!pre_unreach)
+                           llvm_direct_bind_label(ln);
+                       labelexists = assemble_forward_label_no(ln);
+                  }
 
                  if (flag)
                  {
@@ -2275,7 +2315,11 @@ static void parse_statement_g(int break_label, int continue_label)
                      }
 
                      /* The post-"else" label */
-                     if (ln >= 0) assemble_forward_label_no(ln2);
+                       if (ln >= 0) {
+                           if (!pre_unreach)
+                               llvm_direct_bind_label(ln2);
+                           assemble_forward_label_no(ln2);
+                      }
                  }
                  else
                  {
@@ -2287,6 +2331,7 @@ static void parse_statement_g(int break_label, int continue_label)
                      }
                  }
 
+                 if (pre_unreach) llvm_direct_resume();
                  return;
 
     /*  -------------------------------------------------------------------- */
@@ -2711,15 +2756,20 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case SWITCH_CODE:
+                 if (pre_unreach) llvm_direct_suspend();
                  match_open_bracket();
-                 AO = code_generate(parse_expression(QUANTITY_CONTEXT),
-                     QUANTITY_CONTEXT, -1);
+                 AO = parse_expression(QUANTITY_CONTEXT);
+                 llvm_direct_switch_begin(AO);
+                 AO = code_generate(AO, QUANTITY_CONTEXT, -1);
                  match_close_bracket();
 
                  assembleg_store(temp_var1, AO); 
 
                  parse_code_block(ln = alloc_label(), continue_label, 1);
-                 assemble_forward_label_no(ln);
+                 llvm_direct_switch_end();
+                 labelexists = assemble_forward_label_no(ln);
+                 llvm_direct_resolve_label(ln, labelexists);
+                 if (pre_unreach) llvm_direct_resume();
                  return;
 
     /*  -------------------------------------------------------------------- */
@@ -2727,7 +2777,10 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case WHILE_CODE:
-                 assemble_label_no(ln = alloc_label());
+                 if (pre_unreach) llvm_direct_suspend();
+                 ln = alloc_label();
+                 llvm_direct_bind_label(ln);
+                 assemble_label_no(ln);
                  match_open_bracket();
 
                  code_generate(parse_expression(CONDITION_CONTEXT),
@@ -2736,9 +2789,13 @@ static void parse_statement_g(int break_label, int continue_label)
 
                  parse_code_block(ln2, ln, 0);
                  sequence_point_follows = FALSE;
-                 if (!execution_never_reaches_here)
+                 if (!execution_never_reaches_here) {
+                     llvm_direct_jump(ln);
                      assembleg_jump(ln);
-                 assemble_forward_label_no(ln2);
+                 }
+                 labelexists = assemble_forward_label_no(ln2);
+                 llvm_direct_resolve_label(ln2, labelexists);
+                 if (pre_unreach) llvm_direct_resume();
                  return;
 
     /*  -------------------------------------------------------------------- */

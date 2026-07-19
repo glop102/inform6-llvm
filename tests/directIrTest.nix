@@ -113,8 +113,8 @@ writeShellApplication {
     trap 'rm -rf "$work"' EXIT HUP INT TERM
     fail=0
 
-    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 29 ]; then
+    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|Logical|If|IfElse|ShortCircuit|LogicalBranches|LogicalNegation|While|Do|DoReturn|For|ForInc|Switch|SwitchLoop|NestedSwitch|Infinite|Unreachable|UnreachableLoop|SharedReturn|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 47 ]; then
         echo "FAIL  direct-ir (supported routines did not all use direct IR)"
         fail=1
     fi
@@ -122,7 +122,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (quiet direct mode emitted per-routine diagnostics)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=29 lifted=0 fallback=13$' \
+    if [ "$(grep -ac '^LLVM: backends direct=47 lifted=0 fallback=12$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (aggregate backend totals are incorrect)"
         fail=1
@@ -151,6 +151,24 @@ writeShellApplication {
     check_routine Direct_CompareOr 7 3
     check_routine Direct_CompareOrOrder 16 1
     check_routine Direct_CompareOrPredicates 39 24
+    check_routine Direct_Logical 6 8
+    check_routine Direct_If 3 2
+    check_routine Direct_IfElse 5 5
+    check_routine Direct_ShortCircuit 10 2
+    check_routine Direct_LogicalBranches 10 2
+    check_routine Direct_LogicalNegation 8 2
+    check_routine Direct_While 9 15
+    check_routine Direct_Do 3 6
+    check_routine Direct_DoReturn 1 1
+    check_routine Direct_For 7 8
+    check_routine Direct_ForInc 8 10
+    check_routine Direct_Switch 17 18
+    check_routine Direct_SwitchLoop 11 16
+    check_routine Direct_NestedSwitch 7 7
+    check_routine Direct_Infinite 1 1
+    check_routine Direct_Unreachable 1 1
+    check_routine Direct_UnreachableLoop 1 1
+    check_routine Direct_SharedReturn 4 4
     check_routine Direct_GlobalInc 6 2
     if ! grep -aq $'name=Main\tbackend=classic-fallback\tstage=direct-build' \
         ${direct}/compile.log; then
@@ -165,11 +183,6 @@ writeShellApplication {
     if ! grep -aq $'name=Direct_Inline\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=inline assembly' \
         ${direct}/compile.log; then
         echo "FAIL  direct-ir (inline assembly fallback reason is missing)"
-        fail=1
-    fi
-    if ! grep -aq $'name=Direct_Logical\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=unsupported expression operator' \
-        ${direct}/compile.log; then
-        echo "FAIL  direct-ir (unsupported expression diagnostic is missing)"
         fail=1
     fi
     timeout 30 glulxe ${upstream} </dev/null >"$work/upstream.log" 2>&1 || fail=1
@@ -200,7 +213,7 @@ writeShellApplication {
     upstream_count=$COUNTED_RESULT
     run_counted ${direct}/story.ulx "$work/direct.count"
     direct_count=$COUNTED_RESULT
-    if [ "$upstream_count" -ne 327 ] || [ "$direct_count" -gt 271 ]; then
+    if [ "$upstream_count" -ne 620 ] || [ "$direct_count" -gt 581 ]; then
         echo "FAIL  direct-ir (dynamic instruction bound: upstream $upstream_count, direct $direct_count)"
         fail=1
     fi
@@ -295,7 +308,7 @@ writeShellApplication {
         fail=1
     fi
     if [ "$(grep -ac $'backend=classic-fallback\tstage=direct-lower' \
-        ${forcedLowerFallback}/compile.log)" -ne 29 ]; then
+        ${forcedLowerFallback}/compile.log)" -ne 47 ]; then
         echo "FAIL  direct-ir (forced lowering fallback diagnostics are incomplete)"
         fail=1
     fi

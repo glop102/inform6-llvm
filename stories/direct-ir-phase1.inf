@@ -106,6 +106,125 @@ Global Direct_Global = 5;
     return x && y;
 ];
 
+[ Direct_If x;
+    if (x < 0) return 1;
+    return 2;
+];
+
+[ Direct_IfElse x;
+    if (x == 0) x = 7;
+    else x = x + 2;
+    return x;
+];
+
+[ Direct_ShortCircuit x y;
+    x = 0;
+    if ((x = 1) && y && (x = 3)) x = x + 4;
+    return x;
+];
+
+[ Direct_LogicalBranches x y;
+    y = 0;
+    if ((x && (y = 1)) || (y = 2)) return y;
+    return 9;
+];
+
+[ Direct_LogicalNegation x y;
+    y = 0;
+    if (~~(x || (y = 3))) return y + 10;
+    return y;
+];
+
+[ Direct_While n total;
+    while (n > 0) {
+        n--;
+        if (n == 2) continue;
+        total = total + n;
+        if (total > 20) break;
+    }
+    return total;
+];
+
+[ Direct_Do n;
+    do {
+        n++;
+    } until (n >= 3);
+    return n;
+];
+
+[ Direct_DoReturn;
+    do return 5; until (1);
+];
+
+[ Direct_For i total;
+    for (i = 0 : i < 4 : i = i + 1)
+        total = total + i;
+    return total;
+];
+
+[ Direct_ForInc i total;
+    for (i = 0 : i < 4 : i++) {
+        if (i == 1) continue;
+        total = total + i;
+    }
+    return total;
+];
+
+[ Direct_Switch x;
+    switch (x) {
+        0: return 10;
+        1, 2: x = x + 20;
+        3 to 5: x = x + 30;
+        (6, 7): x = x + 40;
+        default: x = 40;
+    }
+    return x;
+];
+
+[ Direct_SwitchLoop i total;
+    while (i < 4) {
+        i++;
+        switch (i) {
+            2: continue;
+            3: break;
+            default: total = total + i;
+        }
+        total = total + 10;
+    }
+    return total;
+];
+
+[ Direct_NestedSwitch x y;
+    switch (x) {
+        1: switch (y) {
+            2: return 12;
+            default: return 10;
+        }
+        default: return 0;
+    }
+];
+
+[ Direct_Infinite;
+    while (1) continue;
+];
+
+[ Direct_Unreachable x;
+    return 1;
+    if (x && (x = 3)) x = 4;
+];
+
+[ Direct_UnreachableLoop x;
+    return 1;
+    while (x) x--;
+];
+
+[ Direct_SharedReturn x y;
+    if (x) jump Done;
+    y = 3;
+    .Done;
+    return y;
+];
+
 [ Direct_PreInc x;
     x = 5;
     return ++x;
@@ -186,6 +305,31 @@ Global Direct_Global = 5;
           Direct_CompareOrOrder(), " ",
           Direct_CompareOrPredicates(2), " ",
           Direct_Logical(1, 2), " ",
+          Direct_If(-1), " ",
+          Direct_IfElse(0), " ",
+          Direct_IfElse(3), " ",
+          Direct_ShortCircuit(0, 0), " ",
+          Direct_ShortCircuit(0, 1), " ",
+          Direct_LogicalBranches(0), " ",
+          Direct_LogicalBranches(1), " ",
+          Direct_LogicalNegation(0), " ",
+          Direct_LogicalNegation(1), " ",
+          Direct_While(5), " ",
+          Direct_While(0), " ",
+          Direct_Do(0), " ",
+          Direct_For(), " ",
+          Direct_ForInc(), " ",
+          Direct_Switch(0), " ",
+          Direct_Switch(2), " ",
+          Direct_Switch(4), " ",
+          Direct_Switch(6), " ",
+          Direct_Switch(9), " ",
+          Direct_SwitchLoop(), " ",
+          Direct_NestedSwitch(1, 2), " ",
+          Direct_NestedSwitch(1, 3), " ",
+          Direct_NestedSwitch(0, 2), " ",
+          Direct_SharedReturn(0, 8), " ",
+          Direct_SharedReturn(1, 8), " ",
           Direct_PreInc(), " ",
           Direct_PostInc(), " ",
           Direct_PreDec(), " ",

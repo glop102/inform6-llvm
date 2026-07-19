@@ -178,9 +178,10 @@ addressed the most serious harness gaps:
   per-routine static, and dynamic instruction ceilings. It also compares
   classic and LLVM behavior for an unused faulting read.
 - `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
-- `tests/directIrTest.nix` requires constant, parameter, local, global,
-  arithmetic, bitwise, assignment, symbolic-value, and source-label branch
-  routines to lower from direct IR. It
+- `tests/directIrTest.nix` requires straight-line expressions, structural
+  conditions, short-circuit values, branches, loops, nested switches,
+  break/continue edges, terminal loops, and unreachable source to lower from
+  direct IR. It
   compares behavior with upstream, checks exact direct/fallback diagnostics,
   and verifies byte-identical shadow replay after forced builder and lowering
   failures.
@@ -212,6 +213,32 @@ Inform's right-to-left evaluation order; comma remains left-to-right.
 Variadic comparison lists preserve Inform's less obvious rule: positive
 predicates (`==`, `<`, `>`) combine with OR, while negated predicates (`~=`,
 `<=`, `>=`) combine with AND.
+
+Phase 3 directly represents condition context as LLVM branches. Logical `&&`,
+`||`, and parser-normalized negation retain short-circuit structure; logical
+expressions used as words join explicit zero and one arms with a phi. `if` and
+`else`, `while`, `do`/`until`, all ordinary `for` layouts, `break`, `continue`,
+source labels, and returns share the same opaque block API. Locals remain
+allocas before optimization, so LLVM promotion forms loop-carried phis rather
+than requiring the streaming parser to construct SSA.
+
+Switch selectors are evaluated once. Cases, alternatives, and ranges become an
+ordered comparison chain rather than an LLVM switch whose cases could be
+reordered, preserving source comparison order without guessing branch
+frequency from operand shape. Nested switches keep a selector stack, and a
+switch inside a loop preserves the enclosing continue target. Parser-elided
+forward exits are terminated as dead LLVM blocks without changing the current
+insertion point; this lets terminal loops and all-return switches verify while
+shadow assembly remains the sole writer of parser reachability and label-use
+state.
+
+The Phase 3 focused fixture matches pinned upstream behavior and guards direct
+coverage, static instruction ceilings, dynamic dispatches, and forced
+fallback. A separate manual clean build verifies the no-LLVM stub configuration.
+Direct output uses fewer dynamic dispatches than upstream for that fixture.
+Life coverage is unchanged because its remaining fallbacks require the calls,
+memory, VM effects, and inline assembly assigned to Phase 4; direct mode
+therefore remains instruction-identical to upstream on Life.
 
 Division and remainder use the lifter's safety policy: a visibly safe constant
 divisor uses native LLVM signed arithmetic, while zero, minus one, and variable

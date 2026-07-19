@@ -130,6 +130,7 @@ static LLVMValueRef *direct_locals;
 static int direct_local_count;
 static LLVMBasicBlockRef *direct_labels;
 static int direct_label_count;
+static int direct_suspended;
 static const char *direct_reason;
 
 static void bail(const char *why)
@@ -1007,7 +1008,7 @@ static void direct_dispose_ir(void)
 
 extern void llvm_direct_reject(const char *reason)
 {
-    if (direct_state != DIRECT_BUILDING)
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
         return;
     direct_reason = reason;
     direct_dispose_ir();
@@ -1020,6 +1021,8 @@ extern void llvm_direct_routine_begin(const char *name, int local_count,
     (void)embedded_flag;
     direct_state = DIRECT_INACTIVE;
     direct_reason = NULL;
+    direct_suspended = 0;
+    llvm_direct_expression_reset();
     if (LLVM_CODEGEN != 4)
         return;
     if (stack_arguments) {
@@ -1110,14 +1113,41 @@ extern void llvm_direct_routine_abandon(void)
 static int direct_can_emit(void)
 {
     LLVMBasicBlockRef bb;
-    if (direct_state != DIRECT_BUILDING)
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
         return FALSE;
     bb = LLVMGetInsertBlock(direct_bld);
     if (!bb || LLVMGetBasicBlockTerminator(bb)) {
+        if (bb && execution_never_reaches_here)
+            return FALSE;
         llvm_direct_reject("operation after terminator");
         return FALSE;
     }
     return TRUE;
+}
+
+extern int llvm_direct_can_generate(void)
+{
+    LLVMBasicBlockRef bb;
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
+        return FALSE;
+    bb = LLVMGetInsertBlock(direct_bld);
+    if (!bb)
+        return FALSE;
+    if (!LLVMGetBasicBlockTerminator(bb))
+        return TRUE;
+    return !execution_never_reaches_here;
+}
+
+extern void llvm_direct_suspend(void)
+{
+    if (direct_state == DIRECT_BUILDING)
+        direct_suspended++;
+}
+
+extern void llvm_direct_resume(void)
+{
+    if (direct_state == DIRECT_BUILDING && direct_suspended > 0)
+        direct_suspended--;
 }
 
 static LLVMValueRef direct_global_var(int32 index)
@@ -1332,6 +1362,24 @@ extern llvm_direct_value llvm_direct_store_global_value(int destination,
     return value;
 }
 
+extern void llvm_direct_adjust_variable(int variable, int amount)
+{
+    LLVMValueRef pointer, value;
+    if (!direct_can_emit()) return;
+    if (variable >= 1 && variable <= direct_local_count)
+        pointer = direct_locals[variable];
+    else if (variable >= MAX_LOCAL_VARIABLES)
+        pointer = direct_global_var(variable - MAX_LOCAL_VARIABLES);
+    else {
+        llvm_direct_reject("invalid adjusted variable");
+        return;
+    }
+    value = LLVMBuildLoad2(direct_bld, i32t, pointer, "adjust.value");
+    value = LLVMBuildAdd(direct_bld, value,
+        LLVMConstInt(i32t, (uint32_t)amount, FALSE), "adjust");
+    LLVMBuildStore(direct_bld, value, pointer);
+}
+
 extern void llvm_direct_return_value(llvm_direct_value value)
 {
     if (!direct_can_emit() || !value) return;
@@ -1340,10 +1388,14 @@ extern void llvm_direct_return_value(llvm_direct_value value)
 
 extern void llvm_direct_note_statement(int statement_code)
 {
-    if (direct_state != DIRECT_BUILDING)
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
         return;
     if (statement_code != RETURN_CODE && statement_code != RTRUE_CODE
-        && statement_code != RFALSE_CODE && statement_code != JUMP_CODE)
+        && statement_code != RFALSE_CODE && statement_code != JUMP_CODE
+        && statement_code != IF_CODE && statement_code != BREAK_CODE
+        && statement_code != CONTINUE_CODE && statement_code != DO_CODE
+        && statement_code != FOR_CODE && statement_code != WHILE_CODE
+        && statement_code != SWITCH_CODE)
         llvm_direct_reject("unsupported statement");
 }
 
@@ -1413,6 +1465,72 @@ static LLVMBasicBlockRef direct_label_block(int label)
     return direct_labels[label];
 }
 
+extern llvm_direct_block llvm_direct_new_block(void)
+{
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
+        return NULL;
+    return LLVMAppendBasicBlockInContext(llctx, direct_fn, "control");
+}
+
+extern llvm_direct_block llvm_direct_source_block(int label)
+{
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
+        return NULL;
+    return direct_label_block(label);
+}
+
+extern void llvm_direct_bind_block(llvm_direct_block block)
+{
+    LLVMBasicBlockRef current;
+    if (direct_state != DIRECT_BUILDING || direct_suspended || !block)
+        return;
+    current = LLVMGetInsertBlock(direct_bld);
+    if (current && !LLVMGetBasicBlockTerminator(current))
+        LLVMBuildBr(direct_bld, block);
+    LLVMPositionBuilderAtEnd(direct_bld, block);
+}
+
+extern void llvm_direct_jump_block(llvm_direct_block block)
+{
+    if (!direct_can_emit() || !block)
+        return;
+    LLVMBuildBr(direct_bld, block);
+}
+
+extern void llvm_direct_branch(llvm_direct_value condition,
+    llvm_direct_block true_block, llvm_direct_block false_block)
+{
+    LLVMValueRef test;
+    if (!direct_can_emit() || !condition || !true_block || !false_block)
+        return;
+    test = LLVMBuildICmp(direct_bld, LLVMIntNE, condition,
+        LLVMConstInt(i32t, 0, FALSE), "condition");
+    LLVMBuildCondBr(direct_bld, test, true_block, false_block);
+}
+
+extern llvm_direct_block llvm_direct_current_block(void)
+{
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
+        return NULL;
+    return LLVMGetInsertBlock(direct_bld);
+}
+
+extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
+    llvm_direct_block first_block, llvm_direct_value second,
+    llvm_direct_block second_block)
+{
+    LLVMValueRef phi, values[2];
+    LLVMBasicBlockRef blocks[2];
+    if (!direct_can_emit() || !first || !first_block || !second
+        || !second_block)
+        return NULL;
+    phi = LLVMBuildPhi(direct_bld, i32t, "condition.value");
+    values[0] = first; values[1] = second;
+    blocks[0] = first_block; blocks[1] = second_block;
+    LLVMAddIncoming(phi, values, blocks, 2);
+    return phi;
+}
+
 extern void llvm_direct_jump(int label)
 {
     LLVMBasicBlockRef target;
@@ -1425,7 +1543,7 @@ extern void llvm_direct_jump(int label)
 extern void llvm_direct_bind_label(int label)
 {
     LLVMBasicBlockRef current, target;
-    if (direct_state != DIRECT_BUILDING)
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
         return;
     target = direct_label_block(label);
     if (!target) return;
@@ -1433,6 +1551,25 @@ extern void llvm_direct_bind_label(int label)
     if (current && !LLVMGetBasicBlockTerminator(current))
         LLVMBuildBr(direct_bld, target);
     LLVMPositionBuilderAtEnd(direct_bld, target);
+}
+
+extern void llvm_direct_resolve_label(int label, int used)
+{
+    LLVMBasicBlockRef target;
+    LLVMBuilderRef builder;
+    if (direct_state != DIRECT_BUILDING || direct_suspended)
+        return;
+    if (used) {
+        llvm_direct_bind_label(label);
+        return;
+    }
+    target = direct_label_block(label);
+    if (!target || LLVMGetBasicBlockTerminator(target))
+        return;
+    builder = LLVMCreateBuilderInContext(llctx);
+    LLVMPositionBuilderAtEnd(builder, target);
+    LLVMBuildUnreachable(builder);
+    LLVMDisposeBuilder(builder);
 }
 
 /* $LLVM=3: dump the routine's IR, tagged with the pipeline phase. */

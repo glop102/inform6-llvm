@@ -36,6 +36,9 @@ extern void llvm_direct_routine_abandon(void)
 }
 
 extern void llvm_direct_reject(const char *reason) { (void)reason; }
+extern int llvm_direct_can_generate(void) { return FALSE; }
+extern void llvm_direct_suspend(void) { }
+extern void llvm_direct_resume(void) { }
 extern void llvm_direct_note_statement(int statement_code)
 { (void)statement_code; }
 extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
@@ -63,6 +66,8 @@ extern llvm_direct_value llvm_direct_store_local_value(int destination,
 extern llvm_direct_value llvm_direct_store_global_value(int destination,
     llvm_direct_value value)
 { (void)destination; (void)value; return NULL; }
+extern void llvm_direct_adjust_variable(int variable, int amount)
+{ (void)variable; (void)amount; }
 extern void llvm_direct_return_value(llvm_direct_value value) { (void)value; }
 extern void llvm_direct_store_local_constant(int destination, int32 value)
 { (void)destination; (void)value; }
@@ -72,7 +77,24 @@ extern void llvm_direct_return_constant(int32 value) { (void)value; }
 extern void llvm_direct_return_local(int source) { (void)source; }
 extern void llvm_direct_jump(int label) { (void)label; }
 extern void llvm_direct_bind_label(int label) { (void)label; }
-
+extern void llvm_direct_resolve_label(int label, int used)
+{ (void)label; (void)used; }
+extern llvm_direct_block llvm_direct_new_block(void) { return NULL; }
+extern llvm_direct_block llvm_direct_source_block(int label)
+{ (void)label; return NULL; }
+extern void llvm_direct_bind_block(llvm_direct_block block) { (void)block; }
+extern void llvm_direct_jump_block(llvm_direct_block block) { (void)block; }
+extern void llvm_direct_branch(llvm_direct_value condition,
+    llvm_direct_block true_block, llvm_direct_block false_block)
+{ (void)condition; (void)true_block; (void)false_block; }
+extern llvm_direct_block llvm_direct_current_block(void) { return NULL; }
+extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
+    llvm_direct_block first_block, llvm_direct_value second,
+    llvm_direct_block second_block)
+{
+    (void)first; (void)first_block; (void)second; (void)second_block;
+    return NULL;
+}
 extern int llvm_pipeline_routine(void)
 {
     any_routine_captured = TRUE;

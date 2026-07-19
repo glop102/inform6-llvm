@@ -2276,8 +2276,12 @@ extern void  llvm_direct_routine_finish(int embedded_flag,
                  int fallthrough_reachable);
 extern void  llvm_direct_routine_abandon(void);
 extern void  llvm_direct_reject(const char *reason);
+extern int   llvm_direct_can_generate(void);
+extern void  llvm_direct_suspend(void);
+extern void  llvm_direct_resume(void);
 extern void  llvm_direct_note_statement(int statement_code);
 typedef void *llvm_direct_value;
+typedef void *llvm_direct_block;
 extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
                  int32 symindex);
 extern llvm_direct_value llvm_direct_load_local(int source);
@@ -2295,6 +2299,7 @@ extern llvm_direct_value llvm_direct_store_local_value(int destination,
                  llvm_direct_value value);
 extern llvm_direct_value llvm_direct_store_global_value(int destination,
                  llvm_direct_value value);
+extern void  llvm_direct_adjust_variable(int variable, int amount);
 extern void  llvm_direct_return_value(llvm_direct_value value);
 extern void  llvm_direct_store_local_constant(int destination, int32 value);
 extern void  llvm_direct_store_local(int destination, int source);
@@ -2302,8 +2307,26 @@ extern void  llvm_direct_return_constant(int32 value);
 extern void  llvm_direct_return_local(int source);
 extern void  llvm_direct_jump(int label);
 extern void  llvm_direct_bind_label(int label);
+extern void  llvm_direct_resolve_label(int label, int used);
+extern llvm_direct_block llvm_direct_new_block(void);
+extern llvm_direct_block llvm_direct_source_block(int label);
+extern void  llvm_direct_bind_block(llvm_direct_block block);
+extern void  llvm_direct_jump_block(llvm_direct_block block);
+extern void  llvm_direct_branch(llvm_direct_value condition,
+                 llvm_direct_block true_block,
+                 llvm_direct_block false_block);
+extern llvm_direct_block llvm_direct_current_block(void);
+extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
+                 llvm_direct_block first_block, llvm_direct_value second,
+                 llvm_direct_block second_block);
 extern void  llvm_direct_expression_statement(assembly_operand AO);
 extern void  llvm_direct_return_expression(assembly_operand AO);
+extern void  llvm_direct_condition_expression(assembly_operand AO, int label);
+extern void  llvm_direct_switch_begin(assembly_operand AO);
+extern void  llvm_direct_switch_case(int label,
+                 const assembly_operand *values, const int *types, int count);
+extern void  llvm_direct_switch_end(void);
+extern void  llvm_direct_expression_reset(void);
 extern void  llvm_codegen_free(void);
 extern void  llvm_buffer_reset(void);
 extern void  llvm_buffer_append_instruction(const assembly_instruction *a);

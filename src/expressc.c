@@ -3281,6 +3281,18 @@ static llvm_direct_value direct_store_operand(assembly_operand AO,
     return NULL;
 }
 
+static void direct_expression_condition(int node,
+    llvm_direct_block true_block, llvm_direct_block false_block);
+
+#define DIRECT_SWITCH_DEPTH 32
+static llvm_direct_value direct_switch_values[DIRECT_SWITCH_DEPTH];
+static int direct_switch_depth;
+
+extern void llvm_direct_expression_reset(void)
+{
+    direct_switch_depth = 0;
+}
+
 static llvm_direct_value direct_expression_value(int node)
 {
     int first, second;
@@ -3307,6 +3319,32 @@ static llvm_direct_value direct_expression_value(int node)
 
     second = ET[first].right;
     switch (ET[node].operator_number) {
+    case LOGAND_OP:
+    case LOGOR_OP:
+        if (second < 0 || ET[second].right != -1) {
+            llvm_direct_reject("invalid logical expression");
+            return NULL;
+        }
+        {   llvm_direct_block true_block = llvm_direct_new_block();
+            llvm_direct_block false_block = llvm_direct_new_block();
+            llvm_direct_block join_block = llvm_direct_new_block();
+            llvm_direct_block true_from, false_from;
+            llvm_direct_value true_value, false_value;
+
+            direct_expression_condition(node, true_block, false_block);
+            llvm_direct_bind_block(true_block);
+            true_value = llvm_direct_constant(1, 0, 0);
+            true_from = llvm_direct_current_block();
+            llvm_direct_jump_block(join_block);
+            llvm_direct_bind_block(false_block);
+            false_value = llvm_direct_constant(0, 0, 0);
+            false_from = llvm_direct_current_block();
+            llvm_direct_jump_block(join_block);
+            llvm_direct_bind_block(join_block);
+            return llvm_direct_phi(true_value, true_from,
+                false_value, false_from);
+        }
+
     case COMMA_OP:
         if (second < 0 || ET[second].right != -1) {
             llvm_direct_reject("invalid comma expression");
@@ -3427,9 +3465,43 @@ static llvm_direct_value direct_expression_value(int node)
     }
 }
 
+static void direct_expression_condition(int node, llvm_direct_block true_block,
+    llvm_direct_block false_block)
+{
+    int first, second;
+    llvm_direct_block next;
+    llvm_direct_value value;
+
+    if (node < 0) {
+        llvm_direct_reject("invalid condition tree");
+        return;
+    }
+    first = ET[node].down;
+    if (first != -1 && (ET[node].operator_number == LOGAND_OP
+        || ET[node].operator_number == LOGOR_OP)) {
+        second = ET[first].right;
+        if (second < 0 || ET[second].right != -1) {
+            llvm_direct_reject("invalid logical condition");
+            return;
+        }
+        next = llvm_direct_new_block();
+        if (ET[node].operator_number == LOGAND_OP)
+            direct_expression_condition(first, next, false_block);
+        else
+            direct_expression_condition(first, true_block, next);
+        llvm_direct_bind_block(next);
+        direct_expression_condition(second, true_block, false_block);
+        return;
+    }
+    value = direct_expression_value(node);
+    if (value)
+        llvm_direct_branch(value, true_block, false_block);
+}
+
 extern void llvm_direct_return_expression(assembly_operand AO)
 {
     llvm_direct_value value;
+    if (!llvm_direct_can_generate()) return;
     if (AO.type == EXPRESSION_OT)
         value = direct_expression_value(AO.value);
     else
@@ -3440,11 +3512,103 @@ extern void llvm_direct_return_expression(assembly_operand AO)
 
 extern void llvm_direct_expression_statement(assembly_operand AO)
 {
+    if (!llvm_direct_can_generate()) return;
     if (AO.type != EXPRESSION_OT) {
         llvm_direct_reject("unsupported expression statement");
         return;
     }
     (void)direct_expression_value(AO.value);
+}
+
+extern void llvm_direct_condition_expression(assembly_operand AO, int label)
+{
+    llvm_direct_block branch_block, fallthrough_block;
+    llvm_direct_block true_block, false_block;
+
+    if (!llvm_direct_can_generate()) return;
+    fallthrough_block = llvm_direct_new_block();
+    if (label == -3 || label == -4) {
+        branch_block = llvm_direct_new_block();
+        true_block = branch_block;
+        false_block = fallthrough_block;
+    }
+    else {
+        branch_block = llvm_direct_source_block(label);
+        true_block = fallthrough_block;
+        false_block = branch_block;
+    }
+    if (AO.type == EXPRESSION_OT)
+        direct_expression_condition(AO.value, true_block, false_block);
+    else {
+        llvm_direct_value value = direct_operand_value(AO);
+        if (value)
+            llvm_direct_branch(value, true_block, false_block);
+    }
+    if (label == -3 || label == -4) {
+        llvm_direct_bind_block(branch_block);
+        llvm_direct_return_constant(label == -4 ? 1 : 0);
+    }
+    llvm_direct_bind_block(fallthrough_block);
+}
+
+extern void llvm_direct_switch_begin(assembly_operand AO)
+{
+    llvm_direct_value value;
+    if (direct_switch_depth >= DIRECT_SWITCH_DEPTH) {
+        llvm_direct_reject("direct switch nesting too deep");
+        return;
+    }
+    value = NULL;
+    if (llvm_direct_can_generate())
+        value = AO.type == EXPRESSION_OT
+            ? direct_expression_value(AO.value) : direct_operand_value(AO);
+    direct_switch_values[direct_switch_depth++] = value;
+}
+
+extern void llvm_direct_switch_case(int label,
+    const assembly_operand *values, const int *types, int count)
+{
+    llvm_direct_value selector;
+    llvm_direct_block match, mismatch, next, low_match;
+    int i;
+
+    if (direct_switch_depth <= 0) {
+        return;
+    }
+    selector = direct_switch_values[direct_switch_depth - 1];
+    if (!selector) return;
+    match = llvm_direct_new_block();
+    mismatch = llvm_direct_source_block(label);
+    for (i = 0; i < count; i++) {
+        llvm_direct_value constant, comparison;
+        int is_range = types[i] == 3 && i + 1 < count;
+        next = (i + (is_range ? 2 : 1) == count)
+            ? mismatch : llvm_direct_new_block();
+        constant = direct_operand_value(values[i]);
+        if (is_range) {
+            comparison = llvm_direct_compare(GE_OP, selector, constant);
+            low_match = llvm_direct_new_block();
+            llvm_direct_branch(comparison, low_match, next);
+            llvm_direct_bind_block(low_match);
+            constant = direct_operand_value(values[++i]);
+            comparison = llvm_direct_compare(LE_OP, selector, constant);
+            llvm_direct_branch(comparison, match, next);
+        }
+        else {
+            comparison = llvm_direct_compare(CONDEQUALS_OP,
+                selector, constant);
+            llvm_direct_branch(comparison, match, next);
+        }
+        if (next != mismatch)
+            llvm_direct_bind_block(next);
+    }
+    llvm_direct_bind_block(match);
+}
+
+extern void llvm_direct_switch_end(void)
+{
+    if (direct_switch_depth > 0)
+        direct_switch_values[--direct_switch_depth] = NULL;
 }
 
 assembly_operand code_generate(assembly_operand AO, int context, int label)
@@ -3473,6 +3637,8 @@ assembly_operand code_generate(assembly_operand AO, int context, int label)
                 AO.value = 0;
                 break;
             case CONDITION_CONTEXT:
+                if (glulx_mode)
+                    llvm_direct_condition_expression(AO, label);
                 if (!glulx_mode) {
                   if (label < -2) assemblez_1_branch(jz_zc, AO, label, FALSE);
                   else assemblez_1_branch(jz_zc, AO, label, TRUE);
@@ -3495,7 +3661,9 @@ assembly_operand code_generate(assembly_operand AO, int context, int label)
     }
 
     if (context == CONDITION_CONTEXT)
-    {   if (label < -2) annotate_for_conditions(AO.value, label, -1);
+    {   if (glulx_mode)
+            llvm_direct_condition_expression(AO, label);
+        if (label < -2) annotate_for_conditions(AO.value, label, -1);
         else annotate_for_conditions(AO.value, -1, label);
     }
     else annotate_for_conditions(AO.value, -1, -1);

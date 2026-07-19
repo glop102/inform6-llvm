@@ -40,7 +40,7 @@ The project is successful when:
 - [x] Phase 0: pin upstream Inform and move classic Glulx comparisons to it.
 - [x] Phase 1: establish direct routine lifecycle and lower trivial functions.
 - [x] Phase 2: generate straight-line expressions directly.
-- [ ] Phase 3: generate structured control flow directly.
+- [x] Phase 3: generate structured control flow directly.
 - [ ] Phase 4: add calls, memory operations, VM effects, and inline assembly.
 - [ ] Phase 5: make direct IR the default Glulx path.
 - [ ] Phase 6: remove the lifter and shadow assembly emission.
