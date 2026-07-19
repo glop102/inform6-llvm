@@ -131,12 +131,20 @@ routine counts, static instructions, opcode histogram, weighted cost, dynamic
 total, story size, and timing samples. This will make comparisons across
 commits and LLVM upgrades reproducible.
 
-### Pinned Interpreter Sources
+### Pinned Baseline Sources
 
-`flake.lock` pins the interpreter sources used by this work:
+`flake.lock` pins the compiler and interpreter sources used by this work:
 
+- Inform 6 `d1066bc214a45ee0f600d2ae7f94ad0210606317`
 - Glulxe `56ab8743bab565de307bd892c555d8d8897ed517`
 - CheapGlk `14d8aaf6e4150669762bd4646a5368e75c1eeee6`
+
+The Inform revision is the parent of this fork's initial source-layout commit;
+the moved C sources are unchanged at that boundary. Nix packages it as
+`inform6-upstream`. Behavioral, compliance, optimization, and benchmark
+classic stories use that package. The temporary capture/replay test instead
+compares the fork's `$LLVM=0` and `$LLVM=1` modes byte-for-byte so it continues
+to isolate capture behavior.
 
 The Glulxe dispatch loop is in `exec.c`; process setup, normal exit, and fatal
 exit handling are in `main.c`; shared declarations are in `glulxe.h`. The
@@ -150,6 +158,7 @@ store manually:
 nix eval --raw .#glulxe.src
 nix eval --raw .#cheapglk.src
 nix eval --raw .#glulxe-counted.src
+nix eval --raw .#inform6-upstream.src
 ```
 
 Built package paths should not be recorded here because they vary by system and

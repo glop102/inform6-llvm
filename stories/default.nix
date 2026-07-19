@@ -1,7 +1,6 @@
-{ lib, runCommand, inform6-llvm, inform6lib }:
+{ lib, runCommand, inform6-llvm, inform6-upstream, inform6lib }:
 
 let
-  compilerExe = lib.getExe inform6-llvm;
   storyNames = [
     "cloak"
     "computation-roundtrip"
@@ -12,19 +11,33 @@ let
     "optimization-regressions"
     "veneer-compliance"
   ];
-  modeValues = {
-    classic = 0;
-    capture = 1;
-    llvm = 2;
+  modes = {
+    classic = {
+      compiler = inform6-upstream;
+      llvmMode = null;
+    };
+    forkClassic = {
+      compiler = inform6-llvm;
+      llvmMode = 0;
+    };
+    capture = {
+      compiler = inform6-llvm;
+      llvmMode = 1;
+    };
+    llvm = {
+      compiler = inform6-llvm;
+      llvmMode = 2;
+    };
   };
   mkStory = mode: name:
-    runCommand "${name}-${mode}.ulx" { } ''
-      ${compilerExe} -G \
+    let config = modes.${mode};
+    in runCommand "${name}-${mode}.ulx" { } ''
+      ${lib.getExe config.compiler} -G \
         ${lib.optionalString (name == "cloak") "+include_path=${inform6lib} +language_name=english"} \
-        '$LLVM=${toString modeValues.${mode}}' \
+        ${lib.optionalString (config.llvmMode != null) "'$LLVM=${toString config.llvmMode}'"} \
         ${./.}/${name}.inf "$out"
     '';
 in
 lib.mapAttrs
   (mode: _: lib.genAttrs storyNames (mkStory mode))
-  modeValues
+  modes

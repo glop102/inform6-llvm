@@ -50,6 +50,23 @@
         "type": "github"
       }
     },
+    "inform6-upstream": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777261693,
+        "narHash": "sha256-/gG8emzagB/1IGKM3U2FhJyJZoG5FPqPGM/xzXTSYRY=",
+        "owner": "DavidKinder",
+        "repo": "Inform6",
+        "rev": "d1066bc214a45ee0f600d2ae7f94ad0210606317",
+        "type": "github"
+      },
+      "original": {
+        "owner": "DavidKinder",
+        "repo": "Inform6",
+        "rev": "d1066bc214a45ee0f600d2ae7f94ad0210606317",
+        "type": "github"
+      }
+    },
     "inform6lib": {
       "flake": false,
       "locked": {
@@ -87,6 +104,7 @@
         "cheapglk": "cheapglk",
         "flake-utils": "flake-utils",
         "glulxe": "glulxe",
+        "inform6-upstream": "inform6-upstream",
         "inform6lib": "inform6lib",
         "nixpkgs": "nixpkgs"
       }

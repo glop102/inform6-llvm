@@ -56,6 +56,19 @@ in {
     '';
   });
 
+  inform6-upstream = final.stdenv.mkDerivation {
+    pname = "inform6-upstream";
+    version = "6.45-${flakeInputs.inform6-upstream.shortRev or "d1066bc"}";
+    src = flakeInputs.inform6-upstream;
+    nativeBuildInputs = [ final.gnumake ];
+    installPhase = ''
+      runHook preInstall
+      install -Dm755 inform6 "$out/bin/inform6"
+      runHook postInstall
+    '';
+    meta.mainProgram = "inform6";
+  };
+
   inform6-llvm = final.stdenv.mkDerivation {
     pname = "inform6-llvm";
     version = "unstable";

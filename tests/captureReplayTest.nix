@@ -4,7 +4,7 @@ let
   names = [ "computation-roundtrip" "veneer-compliance" "glulxercise" "cloak" ];
   stories = map (name: {
     inherit name;
-    classic = compiledStories.classic.${name};
+    classic = compiledStories.forkClassic.${name};
     capture = compiledStories.capture.${name};
   }) names;
 in
