@@ -48,6 +48,7 @@
                 ${pkgs.lib.getExe pkgs.testApps.captureReplay}
                 ${pkgs.lib.getExe pkgs.testApps.optimization}
                 ${pkgs.lib.getExe pkgs.testApps.compliance}
+                ${pkgs.lib.getExe pkgs.testApps.zMachine}
               '';
             });
           };

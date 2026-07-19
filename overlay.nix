@@ -5,6 +5,7 @@ let
     captureReplay = final.callPackage ./tests/captureReplayTest.nix { };
     compliance = final.callPackage ./tests/complianceTest.nix { };
     optimization = final.callPackage ./tests/optimizationTest.nix { };
+    zMachine = final.callPackage ./tests/zMachineTest.nix { };
   };
   benchmarkApps = {
     life = final.callPackage ./tests/lifeBenchmark.nix { };

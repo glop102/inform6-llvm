@@ -177,6 +177,8 @@ addressed the most serious harness gaps:
   per-routine static, and dynamic instruction ceilings. It also compares
   classic and LLVM behavior for an unused faulting read.
 - `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
+- `tests/zMachineTest.nix` requires byte-identical Z5 output from pinned
+  upstream Inform and the fork for a focused shared-assembler fixture.
 - `tests/lifeBenchmark.nix` alternates execution order, reports timing median/min/max,
   and reports deterministic dynamic instruction totals.
 - Interpreter and timeout statuses are checked explicitly.
@@ -185,8 +187,8 @@ addressed the most serious harness gaps:
 - Level 3 compiler output includes per-routine captured/emitted static counts.
 - The real LLVM pipeline is not exercised by CI; the Windows build uses the
   no-LLVM stub.
-- `tests/captureReplayTest.nix` exercises only Glulx; there is no Z-machine baseline for
-  assembler changes shared with the capture seam.
+- The Z-machine baseline is intentionally focused; it does not yet run a broad
+  Z-machine corpus or interpreter-level compliance suite.
 
 The focused fixture currently requires 12 of 12 captured routines to lower,
 with zero lift or lowering bailouts. It checks exactly 156 aggregate input
