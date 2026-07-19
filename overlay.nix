@@ -4,6 +4,9 @@ let
   testApps = {
     captureReplay = final.callPackage ./tests/captureReplayTest.nix { };
     compliance = final.callPackage ./tests/complianceTest.nix { };
+    corpus = final.callPackage ./tests/corpusTest.nix {
+      inform6lib = flakeInputs.inform6lib;
+    };
     directIr = final.callPackage ./tests/directIrTest.nix { };
     optimization = final.callPackage ./tests/optimizationTest.nix { };
     zMachine = final.callPackage ./tests/zMachineTest.nix { };

@@ -107,6 +107,29 @@ Object Room "room" has light;
 ! opaque non-returning operation) should still compile.
 [ Mem_Quit; quit; ];
 
+! Inline shift counts at the Glulx/LLVM boundary: zero, 31, 32, beyond,
+! and negative counts (read as huge unsigned values) all have defined
+! Glulx results that direct generation must fold or preserve.
+[ Mem_Shifts x r total;
+    @shiftl x 0 r;    total = r;
+    @shiftl x 31 r;   total = total + r;
+    @shiftl x 32 r;   total = total + r;
+    @shiftl x 33 r;   total = total + r;
+    @shiftl x $ffffffff r; total = total + r;
+    @sshiftr x 31 r;  total = total + r;
+    @sshiftr x 32 r;  total = total + r;
+    @ushiftr x 31 r;  total = total + r;
+    @ushiftr x 32 r;  total = total + r;
+    return total;
+];
+
+[ Mem_ShiftVar x n a b c;
+    @shiftl x n a;
+    @sshiftr x n b;
+    @ushiftr x n c;
+    return a + b * 10 + c * 100;
+];
+
 [ Mem_RandomVar x; random(0 - x); return random(x - x + 1); ];
 
 [ Main w;
@@ -147,5 +170,12 @@ Object Room "room" has light;
         Mem_PrintRet(), " ",
         Mem_PrintObj(House), " ",
         Mem_Style(), " ",
-        Mem_GiveMove(House, Room), "^done.^";
+        Mem_GiveMove(House, Room), "^";
+    print Mem_Shifts(-5), " ",
+        Mem_Shifts(3), " ",
+        Mem_ShiftVar(-5, 1), " ",
+        Mem_ShiftVar(7, 0), " ",
+        Mem_ShiftVar(7, 31), " ",
+        Mem_ShiftVar(7, 32), " ",
+        Mem_ShiftVar(7, -1), "^done.^";
 ];

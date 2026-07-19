@@ -11,6 +11,7 @@ let
     inherit name;
     classic = compiledStories.classic.${name};
     llvm = compiledStories.llvm.${name};
+    direct = compiledStories.direct.${name};
     input = if name == "cloak" then ./cloak.walk else "/dev/null";
   }) names;
   glulxercise = {
@@ -39,25 +40,32 @@ writeShellApplication {
     }
 
     check() {
-        local name=$1 classic=$2 llvm=$3 input=$4
+        local name=$1 classic=$2 llvm=$3 direct=$4 input=$5
         local classic_log="$work/$name.classic.log"
         local llvm_log="$work/$name.llvm.log"
+        local direct_log="$work/$name.direct.log"
         if ! run_story 30 "$classic" "$input" "$classic_log"; then
             fail=1; return
         fi
         if ! run_story 30 "$llvm" "$input" "$llvm_log"; then
             fail=1; return
         fi
-        if cmp -s "$classic_log" "$llvm_log"; then
-            echo "ok    $name"
-        else
-            echo "FAIL  $name (transcripts differ)"
+        if ! run_story 30 "$direct" "$input" "$direct_log"; then
+            fail=1; return
+        fi
+        if ! cmp -s "$classic_log" "$llvm_log"; then
+            echo "FAIL  $name (lifted transcript differs)"
             fail=1
+        elif ! cmp -s "$classic_log" "$direct_log"; then
+            echo "FAIL  $name (direct transcript differs)"
+            fail=1
+        else
+            echo "ok    $name"
         fi
     }
 
     ${lib.concatMapStringsSep "\n" (story:
-      "check ${story.name} ${story.classic} ${story.llvm} ${story.input}") stories}
+      "check ${story.name} ${story.classic} ${story.llvm} ${story.direct} ${story.input}") stories}
 
     # Glulxercise is self-checking. Its layout-dependent addresses legitimately
     # differ after optimization: computed code addresses are documented as

@@ -328,21 +328,21 @@ writeShellApplication {
     check_unchecked_fault unchecked-remainder \
         ${uncheckedRemainderUpstream} ${uncheckedRemainderDirect}
 
-    mem_re=$'^LLVM-BACKEND\tname=Mem_(Note|WordRead|WordWrite|ByteRW|ArrInc|Order|Computed|Has|Hasnt|In|Notin|Ofclass|Provides|PropRead|PropWrite|PropInc|PropAddr|PropLen|PropCall|Parent|Child|Sibling|Random|RandomVar|Print|PrintChar|PrintOrder|PrintRet|PrintObj|Style|GiveMove|Quit)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    if [ "$(grep -acE "$mem_re" ${memoryStrictDirect}/compile.log)" -ne 32 ]; then
+    mem_re=$'^LLVM-BACKEND\tname=Mem_(Note|WordRead|WordWrite|ByteRW|ArrInc|Order|Computed|Has|Hasnt|In|Notin|Ofclass|Provides|PropRead|PropWrite|PropInc|PropAddr|PropLen|PropCall|Parent|Child|Sibling|Random|RandomVar|Print|PrintChar|PrintOrder|PrintRet|PrintObj|Style|GiveMove|Quit|Shifts|ShiftVar)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    if [ "$(grep -acE "$mem_re" ${memoryStrictDirect}/compile.log)" -ne 34 ]; then
         echo "FAIL  direct-ir (strict memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=60 lifted=0 fallback=8$' \
+    if [ "$(grep -ac '^LLVM: backends direct=62 lifted=0 fallback=8$' \
         ${memoryStrictDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (strict memory backend totals are incorrect)"
         fail=1
     fi
-    if [ "$(grep -acE "$mem_re" ${memoryLooseDirect}/compile.log)" -ne 32 ]; then
+    if [ "$(grep -acE "$mem_re" ${memoryLooseDirect}/compile.log)" -ne 34 ]; then
         echo "FAIL  direct-ir (unchecked memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=52 lifted=0 fallback=6$' \
+    if [ "$(grep -ac '^LLVM: backends direct=54 lifted=0 fallback=6$' \
         ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (unchecked memory backend totals are incorrect)"
         fail=1
@@ -371,7 +371,7 @@ writeShellApplication {
     mem_strict_upstream=$COUNTED_RESULT
     run_counted ${memoryStrictDirect}/story.ulx "$work/mem-strict-direct.count"
     mem_strict_direct=$COUNTED_RESULT
-    if [ "$mem_strict_upstream" -ne 1420 ] || [ "$mem_strict_direct" -gt 1412 ]; then
+    if [ "$mem_strict_upstream" -ne 1519 ] || [ "$mem_strict_direct" -gt 1487 ]; then
         echo "FAIL  direct-ir (strict memory dynamic bound: upstream $mem_strict_upstream, direct $mem_strict_direct)"
         fail=1
     fi
@@ -379,7 +379,7 @@ writeShellApplication {
     mem_loose_upstream=$COUNTED_RESULT
     run_counted ${memoryLooseDirect}/story.ulx "$work/mem-loose-direct.count"
     mem_loose_direct=$COUNTED_RESULT
-    if [ "$mem_loose_upstream" -ne 839 ] || [ "$mem_loose_direct" -gt 811 ]; then
+    if [ "$mem_loose_upstream" -ne 938 ] || [ "$mem_loose_direct" -gt 886 ]; then
         echo "FAIL  direct-ir (unchecked memory dynamic bound: upstream $mem_loose_upstream, direct $mem_loose_direct)"
         fail=1
     fi

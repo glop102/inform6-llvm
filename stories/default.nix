@@ -28,6 +28,10 @@ let
       compiler = inform6-llvm;
       llvmMode = 2;
     };
+    direct = {
+      compiler = inform6-llvm;
+      llvmMode = 4;
+    };
   };
   mkStory = mode: name:
     let config = modes.${mode};

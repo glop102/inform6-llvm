@@ -423,7 +423,37 @@ edge-planning and threading work it stands at 1,412 against upstream's
 1,420, with the unchecked mode at 811 against 839. On Life, direct mode
 covers 12 of 15 routines (adding `Main`) and reaches 54,592,173 dynamic
 dispatches (-2.82%), overtaking the lifted production path's -2.80% for
-the first time.
+the first time. (The memory fixture's totals moved to 1,487 vs 1,519 and
+886 vs 938 after the inline shift-boundary routines were added.)
+
+Phase 4 closed with corpus and compilation-mode gates. `tests/
+corpusTest.nix` compiles Cloak of Darkness with the full library through
+direct IR and pins its coverage exactly (277 direct, 271 fallback; the
+dominant bailout reasons are stack-argument routines, in-routine
+directives, action statements, and top-level switch tables). Measuring the
+corpus exposed a finding the transcript-only cloak test had hidden: on
+cloak the LLVM paths are dynamically *worse* than upstream — lifted
+179,729 and direct 175,651 against upstream's 164,995 (+8.9% and +6.5%).
+Direct improves on the production lifted path but the select/branch
+materialization costs documented under "Instruction-Count Findings"
+dominate library dispatch code. The corpus test holds direct's ceiling;
+closing the gap to upstream is follow-on lowering work, not a Phase 4
+regression (direct is non-worse than the current production path).
+
+Glulxercise under direct IR is pinned at 124 direct / 108 fallback with an
+out-of-contract set of exactly one failure: the documented `jumpabs` case.
+The lifted path's ten catch-token failures disappear because
+`@catch`/`@throw` routines reject to classic generation — rejection is the
+current documented representation for catch tokens and throw edges.
+
+Compilation modes are now product policy with focused tests: debug-file
+builds (`-k`) bypass the LLVM pipeline entirely and are byte-identical to
+classic output (sequence points don't survive reordering); an
+asterisk-traced routine compiles classically while its neighbors stay
+direct and the trace transcript matches upstream; Infix does not exist for
+Glulx (the compiler disables `-X` itself), so no direct-generation policy
+is needed. The compliance suite now runs every behavioral story in
+classic, lifted, and direct modes.
 
 Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,

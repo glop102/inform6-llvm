@@ -50,6 +50,7 @@
                 ${pkgs.lib.getExe pkgs.testApps.compliance}
                 ${pkgs.lib.getExe pkgs.testApps.zMachine}
                 ${pkgs.lib.getExe pkgs.testApps.directIr}
+                ${pkgs.lib.getExe pkgs.testApps.corpus}
               '';
             });
           };
