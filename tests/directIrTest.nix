@@ -40,6 +40,12 @@ let
       ${../stories/direct-ir-phase1.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
+  defaultMode = runCommand "direct-ir-default-mode" { } ''
+    mkdir "$out"
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G \
+      ${../stories/direct-ir-phase1.inf} "$out/story.ulx" \
+      >"$out/compile.log" 2>&1
+  '';
   upstream = runCommand "direct-ir-upstream.ulx" { } ''
     ${lib.getExe inform6-upstream} -G \
       ${../stories/direct-ir-phase1.inf} "$out"
@@ -145,6 +151,23 @@ writeShellApplication {
     if [ "$(grep -ac '^LLVM: backends direct=67 lifted=0 fallback=7$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (aggregate backend totals are incorrect)"
+        fail=1
+    fi
+    if [ "$(grep -ac '^LLVM: direct fallbacks build=7 lower=0$' \
+        ${direct}/compile.log)" -ne 1 ]; then
+        echo "FAIL  direct-ir (direct fallback stage totals are incorrect)"
+        fail=1
+    fi
+
+    # Phase 5: a plain compile (no $LLVM setting) selects the direct
+    # backend and produces the same bytes as an explicit $LLVM=4 compile.
+    if [ "$(grep -ac '^LLVM: backends direct=67 lifted=0 fallback=7$' \
+        ${defaultMode}/compile.log)" -ne 1 ]; then
+        echo "FAIL  direct-ir (default mode did not select the direct backend)"
+        fail=1
+    fi
+    if ! cmp -s ${defaultMode}/story.ulx ${direct}/story.ulx; then
+        echo "FAIL  direct-ir (default mode output differs from explicit direct mode)"
         fail=1
     fi
 
@@ -338,6 +361,11 @@ writeShellApplication {
         echo "FAIL  direct-ir (strict memory backend totals are incorrect)"
         fail=1
     fi
+    if [ "$(grep -ac '^LLVM: direct fallbacks build=8 lower=0$' \
+        ${memoryStrictDirect}/compile.log)" -ne 1 ]; then
+        echo "FAIL  direct-ir (strict memory fallback stage totals are incorrect)"
+        fail=1
+    fi
     if [ "$(grep -acE "$mem_re" ${memoryLooseDirect}/compile.log)" -ne 34 ]; then
         echo "FAIL  direct-ir (unchecked memory routines did not all use direct IR)"
         fail=1
@@ -345,6 +373,11 @@ writeShellApplication {
     if [ "$(grep -ac '^LLVM: backends direct=54 lifted=0 fallback=6$' \
         ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (unchecked memory backend totals are incorrect)"
+        fail=1
+    fi
+    if [ "$(grep -ac '^LLVM: direct fallbacks build=6 lower=0$' \
+        ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
+        echo "FAIL  direct-ir (unchecked memory fallback stage totals are incorrect)"
         fail=1
     fi
     timeout 30 glulxe ${memoryStrictUpstream} </dev/null \
@@ -408,6 +441,11 @@ writeShellApplication {
     if [ "$(grep -ac $'backend=classic-fallback\tstage=direct-lower' \
         ${forcedLowerFallback}/compile.log)" -ne 67 ]; then
         echo "FAIL  direct-ir (forced lowering fallback diagnostics are incomplete)"
+        fail=1
+    fi
+    if [ "$(grep -ac '^LLVM: direct fallbacks build=7 lower=67$' \
+        ${forcedLowerFallback}/compile.log)" -ne 1 ]; then
+        echo "FAIL  direct-ir (lowering failures are not counted separately)"
         fail=1
     fi
     if ! grep -aq 'Error:' ${compileError}; then

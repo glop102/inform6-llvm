@@ -407,18 +407,20 @@ static optiont alloptions[] = {
   optimization passes can be applied before bytecode is emitted (Glulx \n\
   only). Routines which cannot be handled by the LLVM pipeline are \n\
   compiled classically. Ignored when a debug file is being generated. \n\
-  Levels: 0 compiles classically; 1 captures and replays each routine \n\
-  through the classic encoder without optimizing (byte-identical output, \n\
-  for testing the seam); 2 (the default) runs the full pipeline: lift to \n\
-  IR, optimize, and lower back to Glulx bytecode; 3 is level 2 plus a \n\
-  dump of each routine's IR (before and after optimization) to \n\
-  inform6-llvm-dump.ll and reports of routines the pipeline could not \n\
-  handle; 4 enables the experimental direct-IR backend with per-routine \n\
-  classic fallback. Set I6_LLVM_DIAGNOSTICS=1 for IR dumps and per-routine \n\
-  machine-readable backend records.\n",
+  Levels: 0 compiles classically; 4 (the default) generates LLVM IR \n\
+  directly from expression and statement parsing, optimizes it, and \n\
+  lowers it to Glulx bytecode, with per-routine classic fallback. \n\
+  Diagnostic levels retained for comparison during migration: 1 captures \n\
+  and replays each routine through the classic encoder without \n\
+  optimizing (byte-identical output, for testing the seam); 2 runs the \n\
+  old lifter pipeline: capture assembly, lift to IR, optimize, and \n\
+  lower; 3 is level 2 plus a dump of each routine's IR (before and \n\
+  after optimization) to inform6-llvm-dump.ll and reports of routines \n\
+  the pipeline could not handle. Set I6_LLVM_DIAGNOSTICS=1 for IR dumps \n\
+  and per-routine machine-readable backend records.\n",
         OPTUSE_GLULX,
         { OPTLIM_TOMAX, 4 },
-        DEFAULTVALS(0, 2),
+        DEFAULTVALS(0, 4),
     },
 
     /* obsolete options run past OPT_OPTIONS_COUNT */

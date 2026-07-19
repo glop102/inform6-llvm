@@ -49,29 +49,37 @@ Same as upstream Inform 6. The LLVM pipeline is controlled by the `$LLVM`
 option (Glulx only) and is **on by default**:
 
 ```
-./inform6-llvm -G game.inf game.ulx              # LLVM pipeline (default)
+./inform6-llvm -G game.inf game.ulx              # direct-IR pipeline (default)
 ./inform6-llvm -G '$LLVM=0' game.inf game.ulx    # classic upstream codegen
 ./inform6-llvm -G '$LLVM=1' game.inf game.ulx    # capture/replay only (byte-identical)
-./inform6-llvm -G '$LLVM=3' game.inf game.ulx    # + dump IR to inform6-llvm-dump.ll
+./inform6-llvm -G '$LLVM=2' game.inf game.ulx    # old lifter pipeline (diagnostic)
+./inform6-llvm -G '$LLVM=3' game.inf game.ulx    # lifter + dump IR to inform6-llvm-dump.ll
 ```
 
-With `$LLVM=0` eligible code uses the classic path. `$LLVM=1` routes each
-eligible Glulx routine through the capture buffer but replays it without
-optimizing; debug-file builds, asterisk-traced routines, and Infix builds
-bypass capture. Captured output stays byte-identical to `$LLVM=0`. The default,
-`$LLVM=2`, is the full pipeline; `$LLVM=3` additionally dumps each routine's IR
-before and after optimization and reports routines the pipeline could not
-handle.
+The default, `$LLVM=4`, generates LLVM IR directly from expression and
+statement parsing, optimizes it, and lowers it to Glulx bytecode; routines
+the direct backend cannot represent fall back to classic code generation.
+With `$LLVM=0` eligible code uses the classic path. The remaining levels are
+diagnostic modes retained during the direct-IR migration: `$LLVM=1` routes
+each eligible Glulx routine through the capture buffer but replays it without
+optimizing (byte-identical to `$LLVM=0`); `$LLVM=2` is the old pipeline that
+lifts captured assembly to IR before optimizing; `$LLVM=3` additionally dumps
+each routine's IR before and after optimization and reports routines the
+pipeline could not handle. Debug-file builds, asterisk-traced routines, and
+Infix builds bypass capture and compile classically at every level.
 
 ## Architecture
 
-Inform's front end emits `assembly_instruction` records directly to the
-classic assembler. In Glulx mode this fork intercepts that assembler boundary
-and records each routine as instruction and label events. At routine end:
+In Glulx mode the default path builds LLVM IR directly while expressions and
+statements are parsed, before Glulx instructions are selected. The classic
+assembly stream is still captured in parallel as shadow fallback during the
+migration. At routine end:
 
-1. `src/llvm_codegen.c` lifts the captured stream into one LLVM `i32` function.
+1. `src/llvm_codegen.c` finalizes the directly built LLVM `i32` function (or,
+   under the diagnostic `$LLVM=2` lifter mode, lifts the captured assembly
+   stream into one).
 2. LLVM runs `mem2reg`, `instcombine`, `simplifycfg`, `reassociate`, LICM, GVN,
-   DCE, and a final CFG simplification.
+   jump threading, DCE, and a final CFG simplification.
 3. `src/llvm_lower.c` validates the optimized shape, assigns Glulx
    representations, chooses block layout, and constructs a block/edge emission
    plan before lowering it back into the capture buffer.
@@ -81,12 +89,12 @@ and records each routine as instruction and label events. At routine end:
 Unsupported routines fall back independently to classic code generation. The
 Z-machine target always uses the classic path.
 
-Locals begin as LLVM allocas and are promoted by `mem2reg`; Glulx branches form
-the CFG, VM-stack values crossing joins become phis, globals become external
-`i32` globals, and backpatchable symbols remain opaque `i6.sym` calls. Calls,
-Glk, stream operations, and most memory operations remain opaque where LLVM
-cannot safely model VM effects. Division and shifts are lifted directly only
-when their LLVM semantics match Glulx.
+Locals begin as LLVM allocas and are promoted by `mem2reg`; source control
+flow forms the CFG, globals become external `i32` globals, and backpatchable
+symbols remain opaque `i6.sym` calls. Calls, Glk, stream operations, and most
+memory operations remain opaque where LLVM cannot safely model VM effects.
+Division and shifts are represented natively only when their LLVM semantics
+match Glulx.
 
 The lowerer is designed around interpreter costs rather than native register
 allocation. Values can resolve directly as global operands, ride the VM stack
@@ -98,10 +106,11 @@ excluded because it increased dynamic work in benchmarks.
 
 ## Status
 
-The full lift/optimize/lower pipeline is enabled by default and has focused
-behavioral, compliance, static instruction, and dynamic instruction-count
-tests. Unsupported instructions, fixed resource limits, debug output, traced
-routines, or unfamiliar post-LLVM shapes can cause per-routine fallback.
+The direct generate/optimize/lower pipeline is enabled by default and has
+focused behavioral, compliance, static instruction, and dynamic
+instruction-count tests. Unsupported constructs, fixed resource limits, debug
+output, traced routines, or unfamiliar post-LLVM shapes can cause per-routine
+fallback to classic code generation.
 
 Glulx permits `jumpabs` to branch to an arbitrary absolute code address,
 including code in another function. Inform does not guarantee the generated

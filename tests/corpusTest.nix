@@ -68,6 +68,15 @@ writeShellApplication {
         grep -a '^LLVM: backends' ${cloakDirect}/compile.log || true
         fail=1
     fi
+    # Every cloak fallback is a build-stage rejection: the lowerer handles
+    # all IR the direct builder produces. A nonzero lower count means a
+    # generated shape regressed.
+    if [ "$(grep -ac '^LLVM: direct fallbacks build=271 lower=0$' \
+        ${cloakDirect}/compile.log)" -ne 1 ]; then
+        echo "FAIL  corpus (cloak fallback stage totals changed)"
+        grep -a '^LLVM: direct fallbacks' ${cloakDirect}/compile.log || true
+        fail=1
+    fi
     if [ "$(grep -ac $'^LLVM-BACKEND\tname=SetTime\tbackend=direct\tstage=lower\tinput=6\temitted=7\treason=-$' \
         ${cloakDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  corpus (cloak select-to-store fold changed)"
@@ -104,10 +113,10 @@ writeShellApplication {
     cloak_up=$COUNTED_RESULT
     run_counted ${cloakDirect}/story.ulx ${./cloak.walk} "$work/cloak-d.count"
     cloak_d=$COUNTED_RESULT
-    # Direct mode beats upstream on cloak (Phase 4.1: 162,002 vs 164,995;
+    # Direct mode beats upstream on cloak (Phase 5: 162,001 vs 164,995;
     # the lifted path measures 163,569). The ceiling stops slippage back
     # toward the old gap.
-    if [ "$cloak_up" -ne 164995 ] || [ "$cloak_d" -gt 162002 ]; then
+    if [ "$cloak_up" -ne 164995 ] || [ "$cloak_d" -gt 162001 ]; then
         echo "FAIL  corpus (cloak dynamic bound: upstream $cloak_up, direct $cloak_d)"
         fail=1
     fi
@@ -119,6 +128,12 @@ writeShellApplication {
         ${glulxerciseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  corpus (glulxercise direct coverage changed)"
         grep -a '^LLVM: backends' ${glulxerciseDirect}/compile.log || true
+        fail=1
+    fi
+    if [ "$(grep -ac '^LLVM: direct fallbacks build=108 lower=0$' \
+        ${glulxerciseDirect}/compile.log)" -ne 1 ]; then
+        echo "FAIL  corpus (glulxercise fallback stage totals changed)"
+        grep -a '^LLVM: direct fallbacks' ${glulxerciseDirect}/compile.log || true
         fail=1
     fi
     timeout 60 glulxe ${glulxerciseDirect}/story.ulx < ${./glulxercise.walk} \

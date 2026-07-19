@@ -64,6 +64,8 @@ static int no_routines_lowered;
 static int no_routines_unlowered;
 static int no_routines_direct;
 static int no_routines_direct_fallback;
+static int no_routines_direct_build_failed;  /* rejected before lowering     */
+static int no_routines_direct_lower_failed;  /* built IR the lowerer refused */
 
 static int llvm_diagnostics_enabled(void)
 {
@@ -83,9 +85,19 @@ static int llvm_diagnostics_enabled(void)
    comes back as a phi copy per iteration, and the duplicated guards cost
    static size for nothing (measured: cloak +744 instructions, life bench
    ~40ms slower). Revisit if the lowerer learns interference-based
-   coalescing of the increment with its phi's slot. */
+   coalescing of the increment with its phi's slot.
+
+   Re-tuned on direct-IR shapes for Phase 5. reassociate (inherited from
+   the lifted-shape pipeline) was dropped: it helped nothing and cost
+   cloak +1 / life +494 dynamic instructions. Also measured and rejected:
+   sccp, instsimplify, and adce (no effect anywhere); a second
+   instcombine after gvn (produces shapes the lowerer refuses — cloak
+   coverage 277->274, +594 dynamic); early-cse before instcombine
+   (LLVM's instcombine fixpoint verifier hard-aborts the process on
+   library code); simplifycfg<hoist-common-insts> (cloak +25). Removing
+   jump-threading costs cloak +1048, so it stays. */
 #define LLVM_PASS_PIPELINE \
-    "function(mem2reg,instcombine,simplifycfg,reassociate," \
+    "function(mem2reg,instcombine,simplifycfg," \
     "loop-mssa(licm),gvn,jump-threading,dce,simplifycfg)"
 
 /* Per-routine state. */
@@ -2139,6 +2151,10 @@ static void direct_fallback(const char *stage, const char *detail)
 {
     const char *p = detail ? detail : "unknown";
     no_routines_direct_fallback++;
+    if (strcmp(stage, "direct-lower") == 0)
+        no_routines_direct_lower_failed++;
+    else
+        no_routines_direct_build_failed++;
     if (llvm_diagnostics_enabled()) {
         printf("LLVM-BACKEND\tname=%s\tbackend=classic-fallback\tstage=%s"
                "\tinput=-1\temitted=-1\treason=",
@@ -2361,12 +2377,19 @@ extern void llvm_codegen_free(void)
             no_routines_bailed + no_routines_unlowered
                 + no_routines_direct_fallback);
     }
+    if (no_routines_direct_build_failed || no_routines_direct_lower_failed) {
+        printf("LLVM: direct fallbacks build=%d lower=%d\n",
+            no_routines_direct_build_failed,
+            no_routines_direct_lower_failed);
+    }
     no_routines_lifted = 0;
     no_routines_bailed = 0;
     no_routines_lowered = 0;
     no_routines_unlowered = 0;
     no_routines_direct = 0;
     no_routines_direct_fallback = 0;
+    no_routines_direct_build_failed = 0;
+    no_routines_direct_lower_failed = 0;
     llvm_lower_insts_in = 0;
     llvm_lower_insts_out = 0;
     if (dump_file) {

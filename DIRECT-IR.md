@@ -43,7 +43,7 @@ The project is successful when:
 - [x] Phase 3: generate structured control flow directly.
 - [x] Phase 4: add calls, memory operations, VM effects, and inline assembly.
 - [x] Phase 4.1: close the library-code dynamic gap against upstream.
-- [ ] Phase 5: make direct IR the default Glulx path.
+- [x] Phase 5: make direct IR the default Glulx path.
 - [ ] Phase 6: remove the lifter and shadow assembly emission.
 
 Update this checklist only when the corresponding phase exit gate is satisfied.
@@ -507,6 +507,15 @@ Exit gate:
 - Performance is non-worse on guarded dynamic metrics, or each accepted
   regression has a documented target-cost rationale.
 - Repeated timings remain consistent with dynamic and opcode-mix results.
+
+Outcome: complete. `$LLVM` defaults to 4; levels 1-3 are documented as
+migration-diagnostic modes. `tests/directIrTest.nix` proves a plain compile
+selects the direct backend byte-identically to explicit `$LLVM=4`. Direct
+build failures and lowerer failures are counted separately, with `lower=0`
+pinned for cloak and glulxercise. Pass re-tuning on direct shapes removed
+`reassociate` (cloak 162,001; Life 54,589,516; nothing worse; other
+candidates measured and rejected — details in `REVIEW.md`), and timings
+remain consistent with the dynamic ordering.
 
 ### Phase 6: Remove The Lifter And Shadow Emission
 

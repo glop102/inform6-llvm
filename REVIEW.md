@@ -204,8 +204,9 @@ addressed the most serious harness gaps:
 - The Z-machine baseline is intentionally focused; it does not yet run a broad
   Z-machine corpus or interpreter-level compliance suite.
 
-Direct IR remains an explicit migration mode at `$LLVM=4`; the production
-default continues to use the lifter. Phase 2 directly generates all
+Direct IR (`$LLVM=4`) has been the production default since Phase 5; the
+lifter remains reachable at `$LLVM=2`/`3` as a diagnostic comparison
+until Phase 6 removes it. Phase 2 directly generates all
 straight-line source arithmetic, bitwise and signed comparison operators,
 comparison-to-word conversion, comma sequencing, local/global pre/post updates,
 symbolic constants, and value-producing assignments. Ordinary operands retain
@@ -536,6 +537,31 @@ ceiling is pinned at 162,002. The focused optimization fixture improved to
 lifted. Phase 4.1's exit gate is met on its primary arm; no accepted-gap
 rationale is needed. Interference-aware coalescing beyond the parameter
 case remains future work, but nothing measured still hangs on it.
+
+Phase 5 made direct generation the default Glulx mode: `$LLVM` now
+defaults to 4, and levels 1-3 (capture, lifter, lifter+dump) are retained
+only as explicitly selected diagnostic comparisons until Phase 6 deletes
+them. `tests/directIrTest.nix` proves a plain compile (no `$LLVM`
+setting) selects the direct backend and produces bytes identical to an
+explicit `$LLVM=4` compile. Direct build failures are now counted
+separately from lowerer failures (`LLVM: direct fallbacks build=N
+lower=N`); the corpus tests pin `lower=0` for cloak and glulxercise, so
+a direct-built IR shape the shared lowerer refuses can no longer hide
+inside an unchanged fallback total.
+
+Phase 5 also re-tuned the pass pipeline on direct-IR shapes. The only
+change that measured as an improvement was removing `reassociate`, a
+holdover from lifted-shape tuning: cloak 162,002 -> 162,001, Life
+54,590,010 -> 54,589,516, lifted cloak 163,569 -> 163,559, nothing
+worse anywhere. Measured and rejected: `sccp`, `instsimplify`, and
+`adce` (no effect on any corpus point); a second `instcombine` after
+`gvn` (cloak coverage 277 -> 274 and +594 dynamic — its shapes defeat
+the lowerer); `early-cse` before `instcombine` (LLVM 21's instcombine
+fixpoint verifier hard-aborts the compiler process on library code);
+`simplifycfg<hoist-common-insts>` (cloak +25). Removing `jump-threading`
+costs cloak +1,048, confirming it earns its place. The Life benchmark's
+repeated timings stay consistent with the dynamic ordering (direct
+fastest, then lifted, then classic).
 
 The focused fixture currently requires 15 of 15 captured routines to lower,
 with zero lift or lowering bailouts. It checks exactly 177 aggregate input
