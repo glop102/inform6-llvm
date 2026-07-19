@@ -1,5 +1,5 @@
 { lib, runCommand, writeShellApplication, coreutils, diffutils, gawk, gnugrep
-, glulxe, glulxe-counted, inform6-llvm, compiledStories }:
+, glulxe, glulxe-counted, inform6-llvm, compiledStories, python3 }:
 
 let
   classic = compiledStories.classic.life;
@@ -13,7 +13,7 @@ let
 in
 writeShellApplication {
   name = "inform6-llvm-benchmark-life";
-  runtimeInputs = [ coreutils diffutils gawk gnugrep glulxe glulxe-counted ];
+  runtimeInputs = [ coreutils diffutils gawk gnugrep glulxe glulxe-counted python3 ];
   text = ''
     BENCH_RUNS=''${BENCH_RUNS:-5}
     if [[ ! $BENCH_RUNS =~ ^[1-9][0-9]*$ ]]; then
@@ -174,31 +174,6 @@ writeShellApplication {
         fi
     }
 
-    write_opcode_comparison() {
-        local classic_log=$1 candidate_log=$2 candidate_name=$3 output=$4
-        {
-            printf 'opcode\tclassic\t%s\tdelta\n' "$candidate_name"
-            awk -F= '
-                /^GLULXE_OPCODE_COUNT_0x[0-9A-F]+=[0-9]+$/ {
-                    opcode = $1
-                    sub(/^GLULXE_OPCODE_COUNT_/, "", opcode)
-                    if (FNR == NR) classic[opcode] = $2
-                    else compared[opcode] = $2
-                    seen[opcode] = 1
-                }
-                END {
-                    for (number = 0; number < 576; number++) {
-                        opcode = sprintf("0x%03X", number)
-                        if (opcode in seen)
-                            print opcode "\t" classic[opcode] + 0 "\t" \
-                                compared[opcode] + 0 "\t" \
-                                compared[opcode] - classic[opcode]
-                    }
-                }
-            ' "$classic_log" "$candidate_log"
-        } >"$output"
-    }
-
     COUNTED_RESULT=0
     count_story ${classic} "$work/life.classic.count.log" || exit 1
     classic_count=$COUNTED_RESULT
@@ -214,11 +189,12 @@ writeShellApplication {
         'BEGIN { printf "%+.2f%%", 100 * delta / base }')
     echo "      dynamic: classic $classic_count, llvm $llvm_count ($llvm_percent), direct $direct_count ($direct_percent)"
     if [ "$histogram" -eq 1 ]; then
-        write_opcode_comparison "$work/life.classic.count.log" \
-            "$work/life.llvm.count.log" llvm "$work/life.llvm-opcodes.tsv"
-        write_opcode_comparison "$work/life.classic.count.log" \
-            "$work/life.direct.count.log" direct "$work/life.direct-opcodes.tsv"
-        echo "      opcodes: collected"
+        echo "      opcodes (direct - classic dispatches):"
+        python3 ${./attrib.py} opcodes "$work/life.classic.count.log" \
+            "$work/life.direct.count.log" 8
+        echo "      opcodes (llvm - classic dispatches):"
+        python3 ${./attrib.py} opcodes "$work/life.classic.count.log" \
+            "$work/life.llvm.count.log" 8
     else
         echo "      opcodes: skipped (glulxe-counted lacks --opcode-histogram)"
     fi

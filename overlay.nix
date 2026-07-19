@@ -13,6 +13,9 @@ let
   };
   benchmarkApps = {
     life = final.callPackage ./tests/lifeBenchmark.nix { };
+    cloak = final.callPackage ./tests/cloakBenchmark.nix {
+      inform6lib = flakeInputs.inform6lib;
+    };
   };
 in {
   cheapglk = final.stdenv.mkDerivation {
@@ -58,6 +61,17 @@ in {
     ];
     postInstall = (old.postInstall or "") + ''
       mv "$out/bin/glulxe" "$out/bin/glulxe-counted"
+    '';
+  });
+
+  # Upstream glulxe's own profiler: per-function call and self-op counts
+  # dumped as XML via "--profile <file>". Benchmarks join it against an
+  # inform6 "$!asm" trace for per-routine dynamic attribution.
+  glulxe-profiled = final.glulxe.overrideAttrs (old: {
+    pname = "glulxe-profiled";
+    env = (old.env or { }) // { NIX_CFLAGS_COMPILE = "-DVM_PROFILING=1"; };
+    postInstall = (old.postInstall or "") + ''
+      mv "$out/bin/glulxe" "$out/bin/glulxe-profiled"
     '';
   });
 

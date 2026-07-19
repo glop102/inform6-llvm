@@ -31,7 +31,7 @@
       (pkgs: {
         packages = {
           inherit (pkgs) cheapglk glulxe;
-          inherit (pkgs) glulxe-counted inform6-llvm inform6-upstream;
+          inherit (pkgs) glulxe-counted glulxe-profiled inform6-llvm inform6-upstream;
           default = pkgs.inform6-llvm;
         };
 
@@ -61,6 +61,7 @@
               name = "inform6-llvm-benchmarks";
               text = ''
                 ${pkgs.lib.getExe pkgs.benchmarkApps.life}
+                ${pkgs.lib.getExe pkgs.benchmarkApps.cloak}
               '';
             });
           };
