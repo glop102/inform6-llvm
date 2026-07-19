@@ -12,10 +12,8 @@ perfectly weighted runtime estimate.
 The pipeline already reflects this model in several important places,
 particularly stack fusion, direct global operands, phi coalescing, select-arm
 sinking, connective-tree reconstruction, recurrence folding, block layout, and
-the decision not to run `loop-rotate`. The focused regression gate now protects
-representative forms. The current Life measurement is 56,177,197 classic
-instructions versus 54,609,633 LLVM instructions, a reduction of 1,567,564
-(`-2.79%`).
+the decision not to run `loop-rotate`. The focused regression gate protects
+representative forms.
 
 ## Measured Performance Model
 
@@ -26,7 +24,8 @@ called routines and across VM restarts. It does not count interpreter
 bookkeeping, work within an opcode handler as separate operations, or native C
 work performed by accelerated routines.
 
-The current Life benchmark executes:
+The Life benchmark measurement recorded after recurrence folding and block
+layout was:
 
 ```text
 classic: 56,177,197 instructions
@@ -56,11 +55,11 @@ dispatches and determine how much the opcode mix affected runtime. Total
 dynamic count showed that a regression existed, but not whether LLVM added
 copies, branches, arithmetic, address calculations, or expensive VM operations.
 
-`glulxe-counted` now accepts `--opcode-histogram` and emits the total plus one
-machine-readable count for every executed opcode. `tests/lifeBenchmark.nix` validates
-that the histogram sums to the total and writes the classic/LLVM comparison to
-`tests/life.opcodes.tsv`. Collection remains optional so the simplest
-total-count path stays cheap and stable.
+`glulxe-counted` accepts `--opcode-histogram` and emits the total plus one
+machine-readable count for every executed opcode. `tests/lifeBenchmark.nix`
+validates that the histogram sums to the total and writes a temporary
+classic/LLVM comparison during the benchmark run. Collection remains optional
+so the simplest total-count path stays cheap and stable.
 
 The first Life comparison attributes most of the changed mix to the hot
 `Step` loop:
@@ -134,13 +133,10 @@ commits and LLVM upgrades reproducible.
 
 ### Pinned Interpreter Sources
 
-`flake.lock` pins the interpreter sources used by this work, so their current
-Nix source paths are stable until the inputs are updated:
+`flake.lock` pins the interpreter sources used by this work:
 
-- Glulxe `56ab8743bab565de307bd892c555d8d8897ed517`:
-  `/nix/store/92w52qlngz0llrh5br5r7p55jhvds59y-source`
-- CheapGlk `14d8aaf6e4150669762bd4646a5368e75c1eeee6`:
-  `/nix/store/hv7ys416ficc7v3lm0zibn4mfi0rbdwx-source`
+- Glulxe `56ab8743bab565de307bd892c555d8d8897ed517`
+- CheapGlk `14d8aaf6e4150669762bd4646a5368e75c1eeee6`
 
 The Glulxe dispatch loop is in `exec.c`; process setup, normal exit, and fatal
 exit handling are in `main.c`; shared declarations are in `glulxe.h`. The
@@ -179,9 +175,6 @@ addressed the most serious harness gaps:
 - Level 3 compiler output includes per-routine captured/emitted static counts.
 - The real LLVM pipeline is not exercised by CI; the Windows build uses the
   no-LLVM stub.
-- Missing `glulxe` causes the behavioral and benchmark scripts to exit
-  successfully without testing anything. Missing Inform library files also
-  turn the Cloak checks into successful skips.
 - `tests/captureReplayTest.nix` exercises only Glulx; there is no Z-machine baseline for
   assembler changes shared with the capture seam.
 
@@ -194,21 +187,6 @@ folding, four-block layout, switch order, and shared-target switch cases.
 Broader fixtures still need coverage assertions so corpus routines cannot
 silently stop optimizing.
 
-### Recommended Test Gate
-
-The focused optimization suite now compiles known-liftable routines with LLVM
-diagnostics enabled and checks all of the following:
-
-1. Compilation succeeds with the real LLVM implementation, not
-   `src/llvm_stub.c`.
-2. The expected routines are lifted and lowered rather than silently falling
-   back.
-3. Classic and LLVM outputs have identical behavior.
-4. Interpreter and `timeout` exit statuses are successful.
-5. Each fixture remains below a narrow emitted-instruction ceiling.
-6. Hot-loop fixtures remain below a weighted or measured dynamic instruction
-   ceiling, not merely a whole-routine static count.
-
 The compiler reports aggregate and per-routine input/output counts. A future
 dedicated machine-readable diagnostics mode would be less brittle than parsing
 human-facing level 3 output, especially for corpus-scale result collection.
@@ -219,27 +197,17 @@ output instructions disappear from the total. Aggregate counts can therefore
 appear to improve while optimization coverage regresses. Count assertions must
 always be paired with lifted/lowered coverage assertions.
 
-### Initial Microbenchmark Plan and Current Coverage
+### Open Focused Coverage
 
-The initial review proposed the following fixture areas.
-`stories/optimization-regressions.inf` now
-covers store fusion, comparison and immediate select returns, boolean trees,
-loop phis, recurrence folding and loop-rotation sensitivity, four-block layout,
-and switch ordering. The list retains covered areas to show the intended
-complete matrix; many bullets still require broader positive and negative
-cases:
+`stories/optimization-regressions.inf` already covers store fusion, comparison
+and non-immediate select returns, boolean trees, loop phis, recurrence folding
+and loop-rotation sensitivity, four-block layout, and switch ordering. The most
+useful remaining focused fixtures are:
 
-- Store fusion: `Glob = Glob + 1` and `array-->i = array-->i + 1` should emit
-  directly to their destination.
-- Return fusion: comparison returns, `phi; ret`, and
-  `return condition ? a : b`.
-- Boolean trees: nested `&&`, `||`, and negation should retain short-circuit
-  behavior and avoid materialized booleans.
 - Phi and slot coalescing: loop induction values, phi chains, and parallel-copy
   cycles.
 - VM-stack fusion: LIFO consumption, calls with stack arguments, and cases
   which must deliberately unfuse.
-- Switches: early, middle, late, and default cases with a fallthrough target.
 - Conditional phi edges: ensure a natural fallthrough does not gain an
   unnecessary jump because the opposite edge needs a stub.
 - Division: source patterns which InstCombine converts from `sdiv` to `udiv`.
@@ -264,9 +232,6 @@ cases:
   and successful lowering rather than fallback.
 - Cross-block comparison fusion: record the current excess count and guard a
   future implementation which extends operand liveness across blocks.
-- Loop rotation: `Opt_InductionSelect` retains the Life induction/select shape
-  so `loop-rotate` cannot be reintroduced without satisfying its static and
-  dynamic ceilings.
 
 Static emitted count is useful for focused fixtures and per-change deltas, but
 it is not a sufficient global profitability rule. The lowerer intentionally
@@ -276,8 +241,7 @@ interpreter-level instrumentation is needed to estimate dynamic cost without
 requiring application profiles.
 
 The Life benchmark runs each version multiple times, compares medians, and
-reports rather than gates its dynamic count. The current committed measurement
-is 56,177,197 classic versus 54,609,633 LLVM (`-2.79%`).
+reports rather than gates its dynamic count.
 
 ## Correctness Findings
 
@@ -331,16 +295,6 @@ focused alias, callback, fault, and RNG-order tests rather than relying on
 broad transcript coverage.
 
 ## Instruction-Count Findings
-
-### Switch Fallthrough Preserves Earlier Case Order
-
-`plan_terminator()` at `src/llvm_lower.c:3134-3165` selects the last switch case
-targeting the next block as the fallthrough case; `emit_terminator()` emits it
-last and inverted at `src/llvm_lower.c:3235-3250`. Selecting the last eligible
-case cannot increase the number of comparisons needed by preceding cases when
-branch frequency is unknown. `Opt_SwitchShared` guards this policy dynamically:
-selecting the first shared-target case exceeds the focused fixture's LLVM
-dispatch ceiling by two instructions.
 
 ### Signed Division Can Expand Into Unsigned Emulation
 
@@ -445,20 +399,11 @@ important protection. They make each intended tradeoff explicit and prevent
 LLVM version changes or lowerer refactoring from silently spending IR-level
 gains on additional VM dispatches.
 
-## Detailed Test Matrix
+## Remaining Test Matrix
 
 ### Harness Integrity
 
-- Fail when the compiler is built with `src/llvm_stub.c` instead of the real
-  LLVM pipeline.
-- Fail when a required interpreter is absent in CI; retain optional local
-  skips only behind an explicit environment setting.
-- Check compile, interpreter, and `timeout` exit statuses independently.
-- Require a completion marker as well as transcript equality.
-- Assert exact expected `glulxercise` failures and their count.
-- Capture compiler diagnostics instead of discarding them.
-- Assert expected minimum lifted/lowered routine counts and maximum bailout
-  counts.
+- Run the real LLVM build and strict Nix test suite in Linux CI.
 - Keep one Z-machine baseline test to protect assembler changes shared with
   the Glulx capture seam.
 
@@ -485,7 +430,6 @@ gains on additional VM dispatches.
 - Nested short-circuit `&&`, `||`, and negation, including side effects which
   prove an unused arm is not executed.
 - Branch-tree movement across pure operations and rejection across writes.
-- Switch fallthrough with common cases in early, middle, and late positions.
 - Phi stubs on either branch while the other branch is the physical
   fallthrough.
 - Cross-block single-use comparisons.
@@ -527,42 +471,23 @@ gains on additional VM dispatches.
   affect interpreted instruction count, but should be measured if larger
   corpus testing exposes compiler-time problems.
 
-The main implementation history relevant to regression baselines is:
-
-- `ad7b8555`: initial LLVM capture and lifting pipeline.
-- `e01041b`: full lift/optimize/lower round trip.
-- `3b1e0b8`: veneer and `glulxercise` compliance coverage.
-- `fb817d9`: Game of Life benchmark.
-- `16b0eb1`: M4 lowering quality, stack phis, fusion, and slot reuse.
-- `9227ad1`: post-M4 instruction-count reduction series.
-- `451b585`: focused optimization regression tests.
-- `02b7b2e`: dynamic instruction-count measurement.
-- `be440e2`: opcode histograms and recurrence folding.
-- `1623122`: four-block fallthrough layout.
-- `f2ebb74`: CFG emission planning separated from emission.
-
-The current regression baseline is the focused suite as updated through
-`1623122`, together with the emission-plan implementation in `f2ebb74`. The
-older `16b0eb1` and `9227ad1` commits remain useful historical transformation
-baselines, but no longer describe the complete guarded state.
-
 ## Recommended Order of Work
 
-1. Measure per-opcode and important operand-mode costs, then validate a
+1. Preserve potentially faulting reads. Add a focused invalid-read regression,
+   then remove declaration attributes which let LLVM discard the operation;
+   separately avoid claiming `willreturn` for searches over malformed data.
+2. Disable unsafe optimization in the presence of `jumpabs`. This is broader
+   than the read fix because a jump can target a different, previously emitted
+   routine.
+3. Add focused fixtures for phi-stub fallthrough, unsigned-division
+   canonicalization, and zero-trip or conditional LICM before changing those
+   transformations.
+4. Fix demonstrated instruction-count regressions, beginning with phi-stub
+   fallthrough, and tighten the existing `Opt_SelectReturn` ceiling when
+   ordinary-arm return fusion is implemented.
+5. Put the real LLVM build and strict optimization suite in Linux CI.
+6. Measure per-opcode and important operand-mode costs, then validate a
    weighted model against repeated whole-program timings.
-2. Add routine or PC-range attribution for Life opcode differences and
-   remaining locally excessive dispatches.
-3. Extend focused coverage for non-immediate select returns, and add fixtures
-   for phi-stub fallthrough, division canonicalization, and LICM.
-4. Put the real LLVM build and strict optimization suite in Linux CI.
-5. Disable unsafe optimization in the presence of `jumpabs` and correct the
-   removable-read attributes.
-6. Fix the demonstrated instruction-count regressions, beginning with
-   phi-stub fallthrough.
-7. Develop a generic CFG profitability estimate based on loop structure and
+7. Add routine or PC-range attribution for remaining Life opcode differences.
+8. Develop a generic CFG profitability estimate based on loop structure and
    measured target costs before making routine replacement conditional on cost.
-
-The initial optimization-test and dynamic-count infrastructure described above
-was added after this review. `make test`, the strict count gate, the patched
-interpreter build, and the repeated benchmark all passed at the time of the
-update.
