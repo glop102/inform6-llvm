@@ -322,32 +322,21 @@ writeShellApplication {
     check_unchecked_fault unchecked-remainder \
         ${uncheckedRemainderUpstream} ${uncheckedRemainderDirect}
 
-    mem_strict_re=$'^LLVM-BACKEND\tname=Mem_(Note|WordRead|WordWrite|ByteRW|ArrInc|Order|Computed|Ofclass|Provides|PropRead|PropWrite|PropInc|PropAddr|PropLen|PropCall|Random|RandomVar)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    if [ "$(grep -acE "$mem_strict_re" ${memoryStrictDirect}/compile.log)" -ne 17 ]; then
+    mem_re=$'^LLVM-BACKEND\tname=Mem_(Note|WordRead|WordWrite|ByteRW|ArrInc|Order|Computed|Has|Hasnt|In|Notin|Ofclass|Provides|PropRead|PropWrite|PropInc|PropAddr|PropLen|PropCall|Parent|Child|Sibling|Random|RandomVar|Print|PrintChar|PrintOrder|PrintRet|PrintObj|Style|GiveMove|Quit)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    if [ "$(grep -acE "$mem_re" ${memoryStrictDirect}/compile.log)" -ne 32 ]; then
         echo "FAIL  direct-ir (strict memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=26 lifted=0 fallback=29$' \
+    if [ "$(grep -ac '^LLVM: backends direct=46 lifted=0 fallback=22$' \
         ${memoryStrictDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (strict memory backend totals are incorrect)"
         fail=1
     fi
-    if ! grep -aq $'name=Mem_Has\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=strict attribute check' \
-        ${memoryStrictDirect}/compile.log; then
-        echo "FAIL  direct-ir (strict has-test fallback reason is missing)"
-        fail=1
-    fi
-    if ! grep -aq $'name=Mem_Parent\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=strict object-tree check' \
-        ${memoryStrictDirect}/compile.log; then
-        echo "FAIL  direct-ir (strict parent() fallback reason is missing)"
-        fail=1
-    fi
-    mem_loose_re=$'^LLVM-BACKEND\tname=Mem_(Note|WordRead|WordWrite|ByteRW|ArrInc|Order|Computed|Has|Hasnt|In|Notin|Ofclass|Provides|PropRead|PropWrite|PropInc|PropAddr|PropLen|PropCall|Parent|Child|Sibling|Random|RandomVar)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    if [ "$(grep -acE "$mem_loose_re" ${memoryLooseDirect}/compile.log)" -ne 24 ]; then
+    if [ "$(grep -acE "$mem_re" ${memoryLooseDirect}/compile.log)" -ne 32 ]; then
         echo "FAIL  direct-ir (unchecked memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=33 lifted=0 fallback=16$' \
+    if [ "$(grep -ac '^LLVM: backends direct=43 lifted=0 fallback=15$' \
         ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (unchecked memory backend totals are incorrect)"
         fail=1
@@ -376,7 +365,7 @@ writeShellApplication {
     mem_strict_upstream=$COUNTED_RESULT
     run_counted ${memoryStrictDirect}/story.ulx "$work/mem-strict-direct.count"
     mem_strict_direct=$COUNTED_RESULT
-    if [ "$mem_strict_upstream" -ne 1076 ] || [ "$mem_strict_direct" -gt 1056 ]; then
+    if [ "$mem_strict_upstream" -ne 1420 ] || [ "$mem_strict_direct" -gt 1409 ]; then
         echo "FAIL  direct-ir (strict memory dynamic bound: upstream $mem_strict_upstream, direct $mem_strict_direct)"
         fail=1
     fi
@@ -384,7 +373,7 @@ writeShellApplication {
     mem_loose_upstream=$COUNTED_RESULT
     run_counted ${memoryLooseDirect}/story.ulx "$work/mem-loose-direct.count"
     mem_loose_direct=$COUNTED_RESULT
-    if [ "$mem_loose_upstream" -ne 683 ] || [ "$mem_loose_direct" -gt 648 ]; then
+    if [ "$mem_loose_upstream" -ne 839 ] || [ "$mem_loose_direct" -gt 798 ]; then
         echo "FAIL  direct-ir (unchecked memory dynamic bound: upstream $mem_loose_upstream, direct $mem_loose_direct)"
         fail=1
     fi

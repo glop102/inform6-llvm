@@ -66,6 +66,8 @@ extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
 extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
     llvm_direct_value *arguments, int count)
 { (void)opcode; (void)arguments; (void)count; return NULL; }
+extern llvm_direct_value llvm_direct_quantity(assembly_operand AO)
+{ (void)AO; return NULL; }
 extern llvm_direct_value llvm_direct_store_local_value(int destination,
     llvm_direct_value value)
 { (void)destination; (void)value; return NULL; }

@@ -3284,6 +3284,8 @@ static llvm_direct_value direct_store_operand(assembly_operand AO,
 static void direct_expression_condition(int node,
     llvm_direct_block true_block, llvm_direct_block false_block);
 static llvm_direct_value direct_expression_value(int node);
+static llvm_direct_value direct_checked_object_value(llvm_direct_value obj,
+    const assembly_operand *leaf, int rte_number, int allow_classes);
 
 #define DIRECT_CALL_CHILDREN 14
 
@@ -3452,17 +3454,20 @@ static llvm_direct_value direct_function_call(int node)
             llvm_direct_reject("invalid object-tree call");
             return NULL;
         }
-        if (runtime_error_checking_switch && !veneer_mode) {
-            /* Classic guards the object argument with an inline
-               metaclass check; that CFG is not generated yet. */
-            llvm_direct_reject("strict object-tree check");
-            return NULL;
-        }
         field = (sysfun == PARENT_SYSF) ? GOBJFIELD_PARENT()
             : (sysfun == SIBLING_SYSF || sysfun == YOUNGER_SYSF)
             ? GOBJFIELD_SIBLING() : GOBJFIELD_CHILD();
         {   llvm_direct_value args[2];
             if (!direct_evaluate_children(nodes, values, 1)) return NULL;
+            if (runtime_error_checking_switch && !veneer_mode) {
+                int rte = (sysfun == PARENT_SYSF) ? PARENT_RTE
+                    : (sysfun == CHILD_SYSF) ? CHILD_RTE
+                    : (sysfun == ELDEST_SYSF) ? ELDEST_RTE
+                    : (sysfun == SIBLING_SYSF) ? SIBLING_RTE : YOUNGER_RTE;
+                values[0] = direct_checked_object_value(values[0],
+                    ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL,
+                    rte, FALSE);
+            }
             args[0] = values[0];
             args[1] = llvm_direct_constant(field, 0, 0);
             return llvm_direct_glulx_op("aload", args, 2);
@@ -3630,6 +3635,100 @@ static assembly_operand direct_array_operand(int node)
         return ET[node].value;
     INITAOTV(&AO, ZEROCONSTANT_OT, 0);
     return AO;
+}
+
+/* The class-object constant for a named system object ("Class",
+   "Object"), as classic builds it for substitution and comparison. */
+static llvm_direct_value direct_system_object(char *name)
+{
+    int ln = get_symbol_index(name);
+    if (ln < 0)
+        return llvm_direct_constant(0, 0, 0);
+    return llvm_direct_constant(symbols[ln].value, OBJECT_MV, -1);
+}
+
+/* Does this operand need the strict object guard? Provably valid
+   object constants and veneer mode skip it, as classic does. */
+static int direct_object_check_needed(const assembly_operand *leaf)
+{
+    if (veneer_mode) return FALSE;
+    if (leaf && leaf->marker == OBJECT_MV
+        && leaf->value >= 1 && leaf->value <= no_objects)
+        return FALSE;
+    return TRUE;
+}
+
+/* Strict-mode guard mirroring check_nonzero_at_runtime_g: verify the
+   value is a real object (or, for the allow_classes operations, any
+   object-typed value). On failure the RT__Err veneer is called and
+   control jumps to failure_exit. The builder is left in the passed
+   block and the object value is returned; *failed_out receives the
+   failure block that jumped to failure_exit. Callers must test
+   direct_object_check_needed first. */
+static llvm_direct_value direct_check_object(llvm_direct_value object,
+    int rte_number, int allow_classes,
+    llvm_direct_block failure_exit, llvm_direct_block *failed_out)
+{
+    llvm_direct_block failed, passed, next;
+    llvm_direct_value byte0, comparison, args[2], eargs[2];
+
+    failed = llvm_direct_new_block();
+    passed = llvm_direct_new_block();
+    next = llvm_direct_new_block();
+    llvm_direct_branch(object, next, failed);
+    llvm_direct_bind_block(next);
+    args[0] = object;
+    args[1] = llvm_direct_constant(0, 0, 0);
+    byte0 = llvm_direct_glulx_op("aloadb", args, 2);
+    if (allow_classes) {
+        comparison = llvm_direct_compare(CONDEQUALS_OP, byte0,
+            llvm_direct_constant(0x70, 0, 0));
+        llvm_direct_branch(comparison, passed, failed);
+    }
+    else {
+        llvm_direct_block not_class = llvm_direct_new_block();
+        llvm_direct_value parent;
+        comparison = llvm_direct_compare(NOTEQUAL_OP, byte0,
+            llvm_direct_constant(0x70, 0, 0));
+        llvm_direct_branch(comparison, failed, not_class);
+        llvm_direct_bind_block(not_class);
+        args[0] = object;
+        args[1] = llvm_direct_constant(GOBJFIELD_PARENT(), 0, 0);
+        parent = llvm_direct_glulx_op("aload", args, 2);
+        comparison = llvm_direct_compare(NOTEQUAL_OP, parent,
+            direct_system_object("Class"));
+        llvm_direct_branch(comparison, passed, failed);
+    }
+    llvm_direct_bind_block(failed);
+    eargs[0] = llvm_direct_constant(rte_number, 0, 0);
+    eargs[1] = object;
+    (void)direct_veneer_call(RT__Err_VR, eargs, 2);
+    *failed_out = llvm_direct_current_block();
+    llvm_direct_jump_block(failure_exit);
+    llvm_direct_bind_block(passed);
+    return object;
+}
+
+/* Quantity-context form: a failed check substitutes the "Object"
+   class-object, which has no parent, child or sibling. */
+static llvm_direct_value direct_checked_object_value(llvm_direct_value obj,
+    const assembly_operand *leaf, int rte_number, int allow_classes)
+{
+    llvm_direct_block join, passed_from, failed_from;
+    llvm_direct_value checked, substitute;
+
+    if (!obj) return NULL;
+    if (!direct_object_check_needed(leaf)) return obj;
+    /* Materialize the substitute before the check so it dominates the
+       failure edge (a phi block must start with its phis). */
+    substitute = direct_system_object("Object");
+    join = llvm_direct_new_block();
+    checked = direct_check_object(obj, rte_number, allow_classes,
+        join, &failed_from);
+    passed_from = llvm_direct_current_block();
+    llvm_direct_jump_block(join);
+    llvm_direct_bind_block(join);
+    return llvm_direct_phi(checked, passed_from, substitute, failed_from);
 }
 
 #define DIRECT_SWITCH_DEPTH 32
@@ -3906,19 +4005,54 @@ static llvm_direct_value direct_expression_value(int node)
     case HAS_OP:
     case HASNT_OP:
         {   int nodes[2];
-            llvm_direct_value values[2], attribute, bit, args[2];
-            if (runtime_error_checking_switch && !veneer_mode) {
-                llvm_direct_reject("strict attribute check");
-                return NULL;
-            }
+            llvm_direct_value values[2], attribute, bit, args[2], result;
+            int strict = runtime_error_checking_switch && !veneer_mode;
+            int attr_constant, need_check;
+            llvm_direct_block false_block = NULL, join = NULL, result_from;
+
             if (direct_collect_children(first, nodes, 2) != 2) {
                 llvm_direct_reject("invalid attribute test");
                 return NULL;
             }
             if (!direct_evaluate_children(nodes, values, 2)) return NULL;
-            if (ET[nodes[1]].down == -1
+            attr_constant = ET[nodes[1]].down == -1
                 && direct_constant_operand(ET[nodes[1]].value)
-                && ET[nodes[1]].value.marker == 0)
+                && ET[nodes[1]].value.marker == 0;
+            need_check = strict && direct_object_check_needed(
+                ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL);
+            if (need_check || (strict && !attr_constant)) {
+                false_block = llvm_direct_new_block();
+                join = llvm_direct_new_block();
+            }
+            if (need_check) {
+                llvm_direct_block failed_from;
+                values[0] = direct_check_object(values[0], HAS_RTE,
+                    TRUE, false_block, &failed_from);
+            }
+            if (strict && !attr_constant) {
+                /* A failed attribute range check reports INVALIDATTR
+                   and makes the condition false, exactly as classic's
+                   branch to the post-condition label does. */
+                llvm_direct_block attr_fail = llvm_direct_new_block();
+                llvm_direct_block attr_next = llvm_direct_new_block();
+                llvm_direct_block attr_ok = llvm_direct_new_block();
+                llvm_direct_value eargs[3], comparison;
+                comparison = llvm_direct_compare(LESS_OP, values[1],
+                    llvm_direct_constant(0, 0, 0));
+                llvm_direct_branch(comparison, attr_fail, attr_next);
+                llvm_direct_bind_block(attr_next);
+                comparison = llvm_direct_compare(LESS_OP, values[1],
+                    llvm_direct_constant(NUM_ATTR_BYTES * 8, 0, 0));
+                llvm_direct_branch(comparison, attr_ok, attr_fail);
+                llvm_direct_bind_block(attr_fail);
+                eargs[0] = llvm_direct_constant(19, 0, 0); /* INVALIDATTR */
+                eargs[1] = values[0];
+                eargs[2] = values[1];
+                (void)direct_veneer_call(RT__Err_VR, eargs, 3);
+                llvm_direct_jump_block(false_block);
+                llvm_direct_bind_block(attr_ok);
+            }
+            if (attr_constant)
                 attribute = llvm_direct_constant(
                     ET[nodes[1]].value.value + 8, 0, 0);
             else
@@ -3927,32 +4061,57 @@ static llvm_direct_value direct_expression_value(int node)
             args[0] = values[0];
             args[1] = attribute;
             bit = llvm_direct_glulx_op("aloadbit", args, 2);
-            return llvm_direct_compare(
+            result = llvm_direct_compare(
                 ET[node].operator_number == HAS_OP
                     ? NOTEQUAL_OP : CONDEQUALS_OP,
                 bit, llvm_direct_constant(0, 0, 0));
+            if (!join) return result;
+            result_from = llvm_direct_current_block();
+            llvm_direct_jump_block(join);
+            llvm_direct_bind_block(false_block);
+            llvm_direct_jump_block(join);
+            llvm_direct_bind_block(join);
+            return llvm_direct_phi(result, result_from,
+                llvm_direct_constant(0, 0, 0), false_block);
         }
 
     case IN_OP:
     case NOTIN_OP:
         {   int nodes[2];
-            llvm_direct_value values[2], parent, args[2];
-            if (runtime_error_checking_switch && !veneer_mode) {
-                llvm_direct_reject("strict object-tree check");
-                return NULL;
-            }
+            llvm_direct_value values[2], parent, args[2], result;
+            int strict = runtime_error_checking_switch && !veneer_mode;
+            llvm_direct_block false_block, join, result_from;
+            int need_check;
+
             if (direct_collect_children(first, nodes, 2) != 2) {
                 llvm_direct_reject("invalid containment test");
                 return NULL;
             }
             if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            need_check = strict && direct_object_check_needed(
+                ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL);
+            if (need_check) {
+                llvm_direct_block failed_from;
+                false_block = llvm_direct_new_block();
+                join = llvm_direct_new_block();
+                values[0] = direct_check_object(values[0], IN_RTE,
+                    TRUE, false_block, &failed_from);
+            }
             args[0] = values[0];
             args[1] = llvm_direct_constant(GOBJFIELD_PARENT(), 0, 0);
             parent = llvm_direct_glulx_op("aload", args, 2);
-            return llvm_direct_compare(
+            result = llvm_direct_compare(
                 ET[node].operator_number == IN_OP
                     ? CONDEQUALS_OP : NOTEQUAL_OP,
                 parent, values[1]);
+            if (!need_check) return result;
+            result_from = llvm_direct_current_block();
+            llvm_direct_jump_block(join);
+            llvm_direct_bind_block(false_block);
+            llvm_direct_jump_block(join);
+            llvm_direct_bind_block(join);
+            return llvm_direct_phi(result, result_from,
+                llvm_direct_constant(0, 0, 0), false_block);
         }
 
     case OFCLASS_OP:
@@ -4096,6 +4255,17 @@ extern void llvm_direct_return_expression(assembly_operand AO)
         value = direct_operand_value(AO);
     if (value)
         llvm_direct_return_value(value);
+}
+
+/* A quantity-context expression evaluated for a statement (print items,
+   give/move/remove operands...). Must run before code_generate consumes
+   the tree. NULL when direct generation is inactive or has rejected. */
+extern llvm_direct_value llvm_direct_quantity(assembly_operand AO)
+{
+    if (!llvm_direct_can_generate()) return NULL;
+    if (AO.type == EXPRESSION_OT)
+        return direct_expression_value(AO.value);
+    return direct_operand_value(AO);
 }
 
 extern void llvm_direct_expression_statement(assembly_operand AO)

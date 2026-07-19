@@ -338,12 +338,51 @@ diagnostic), and pins per-mode coverage and dynamic ceilings; direct mode
 beats upstream in both (1,056 vs 1,076 strict; 648 vs 683 unchecked).
 `Meta__class` is the first veneer routine to compile through direct IR.
 
-With memory operations, Life direct coverage reaches 8 of 15 routines
-(`Rnd`, `SeedSoup`, `Stir`, `Step`, `DrawCell`, `DrawFull`, `DrawDiff`,
-`MarkStart`) and direct mode drops below upstream for the first time:
-54,632,155 dynamic dispatches (-2.75%), within 0.05% of the lifted
-production path's 54,605,529 (-2.80%). The remaining fallbacks are print
-statements and inline assembly.
+With memory operations, Life direct coverage reached 8 of 15 routines and
+direct mode dropped below upstream for the first time: 54,632,155 dynamic
+dispatches (-2.75%), within 0.05% of the lifted production path's
+54,605,529 (-2.80%). The remaining fallbacks were print statements and
+inline assembly.
+
+The third Phase 4 slice added statements. Print items mirror classic's
+per-item emissions as they parse: literal strings and `(string)` become
+`streamstr`, `(char)` chooses `streamchar` or `streamunichar` by classic's
+constant test, plain items become `streamnum`, `(object)` reads the
+short-name field, and the article, `(name)`, `(number)`, `(property)`,
+`(address)`, custom-routine, and strict-mode `RT__ChPrint*` forms all
+become calls to the same routines classic calls. Stream operations stay
+unmarked in the effect scheme, so filter I/O callbacks cannot reorder.
+`print_ret` and string statements terminate with a direct `return 1`.
+`new_line`, `give` (both the `astorebit` form and the strict `RT__ChG`
+veneers), `move`, `remove`, `font`, `style`, `string`, and `quit` (an
+opaque non-returning operation) generate directly; `box`, `read`,
+`spaces`, and `objectloop` still reject — `spaces` and `objectloop` need
+loop CFGs the statement layer does not build yet, and `box` shares
+`random(...)`'s classic-side table effect. A new `llvm_direct_quantity`
+hook evaluates statement operand trees before classic generation consumes
+them.
+
+The strict-mode object guard from `check_nonzero_at_runtime_g` is now
+generated directly: zero and non-object values call `RT__Err` and either
+substitute the `Object` class-object (quantity contexts such as
+`parent()`) or force the condition false (`has`, `in`), exactly matching
+classic's error labels; variable attribute numbers additionally range
+check against `NUM_ATTR_BYTES` with the INVALIDATTR report. With that CFG
+in place, `has`/`hasnt`, `in`/`notin`, and the object-tree functions
+compile directly in strict mode too, and the strict memory fixture runs
+all 32 focused routines through direct IR in both modes (1,409 vs
+upstream's 1,420 strict, 798 vs 839 unchecked).
+
+One fixture lesson recorded for later phases: transcripts must not print
+raw object or routine addresses. RAM layout shifts across a 256-byte
+alignment boundary whenever generated code size changes, so address-valued
+results (`parent(o)`, bare `(the) o` without a library) must be compared
+against known objects instead of printed.
+
+After statements, Life direct coverage is 11 of 15 routines (adding
+`PrintGrid`, `PrintElapsed`, `WaitKey`) at 54,616,168 dynamic dispatches
+(-2.78%); the remaining fallbacks are `Main` and the inline-assembly
+routines assigned to the next slice.
 
 Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,

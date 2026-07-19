@@ -2325,6 +2325,7 @@ extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
                  llvm_direct_block second_block);
 extern void  llvm_direct_expression_statement(assembly_operand AO);
 extern void  llvm_direct_return_expression(assembly_operand AO);
+extern llvm_direct_value llvm_direct_quantity(assembly_operand AO);
 extern void  llvm_direct_condition_expression(assembly_operand AO, int label);
 extern void  llvm_direct_switch_begin(assembly_operand AO);
 extern void  llvm_direct_switch_case(int label,

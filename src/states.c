@@ -502,6 +502,32 @@ static void parse_print_z(int finally_return)
     }
 }
 
+/* Direct-IR mirrors of the emissions below; each is a quiet no-op when
+   direct generation is inactive or has rejected the routine. */
+static void direct_stream_char(int32 c)
+{
+    llvm_direct_value v = llvm_direct_constant(c, 0, 0);
+    if (v) (void)llvm_direct_glulx_op("streamchar", &v, 1);
+}
+
+static void direct_stream_op(const char *opcode, llvm_direct_value v)
+{
+    if (v) (void)llvm_direct_glulx_op(opcode, &v, 1);
+}
+
+/* Call a routine named by an operand (a veneer routine or a print
+   routine symbol), discarding the result. */
+static void direct_operand_call(assembly_operand fn,
+    llvm_direct_value *args, int count)
+{
+    llvm_direct_value f;
+    int i;
+    for (i = 0; i < count; i++)
+        if (!args[i]) return;
+    f = llvm_direct_constant(fn.value, fn.marker, fn.symindex);
+    if (f) (void)llvm_direct_call(f, args, count);
+}
+
 static void parse_print_g(int finally_return)
 {   int count = 0; assembly_operand AO, AO2;
 
@@ -535,6 +561,7 @@ static void parse_print_g(int finally_return)
               if (token_text[0] == '^' && token_text[1] == '\0') {
                   /* The string "^" is always a simple newline. */
                   INITAOTV(&AO, BYTECONSTANT_OT, 0x0A);
+                  direct_stream_char(0x0A);
                   assembleg_1(streamchar_gc, AO);
                   break;
               }
@@ -543,15 +570,19 @@ static void parse_print_g(int finally_return)
               {   INITAOT(&AO, CONSTANT_OT);
                   AO.marker = STRING_MV;
                   AO.value  = compile_string(token_text, STRCTX_GAME);
+                  direct_stream_op("streamstr",
+                      llvm_direct_constant(AO.value, AO.marker, AO.symindex));
                   assembleg_1(streamstr_gc, AO);
                   if (finally_return)
                   {   get_next_token();
                       if ((token_type == SEP_TT)
                           && (token_value == SEMICOLON_SEP))
                       {   INITAOTV(&AO, BYTECONSTANT_OT, 0x0A);
-                          assembleg_1(streamchar_gc, AO); 
+                          direct_stream_char(0x0A);
+                          llvm_direct_return_constant(1);
+                          assembleg_1(streamchar_gc, AO);
                           INITAOTV(&AO, BYTECONSTANT_OT, 1);
-                          assembleg_1(return_gc, AO); 
+                          assembleg_1(return_gc, AO);
                           return;
                       }
                       put_token_back();
@@ -590,9 +621,21 @@ static void parse_print_g(int finally_return)
                                       goto PrintByRoutine;
                                   }
                                   get_next_token();
-                                  AO1 = code_generate(
-                                      parse_expression(QUANTITY_CONTEXT),
-                                      QUANTITY_CONTEXT, -1);
+                                  {   assembly_operand tree =
+                                          parse_expression(QUANTITY_CONTEXT);
+                                      llvm_direct_value dv =
+                                          llvm_direct_quantity(tree);
+                                      AO1 = code_generate(tree,
+                                          QUANTITY_CONTEXT, -1);
+                                      if (is_constant_ot(AO1.type)
+                                          && AO1.marker == 0
+                                          && AO1.value >= 0
+                                          && AO1.value < 0x100)
+                                          direct_stream_op("streamchar", dv);
+                                      else
+                                          direct_stream_op("streamunichar",
+                                              dv);
+                                  }
                                   if (is_constant_ot(AO1.type) && AO1.marker == 0) {
                                       if (AO1.value >= 0 && AO1.value < 0x100)
                                           assembleg_1(streamchar_gc, AO1);
@@ -615,9 +658,13 @@ static void parse_print_g(int finally_return)
                                       goto PrintByRoutine;
                                   }
                                   get_next_token();
-                                  AO1 = code_generate(
-                                      parse_expression(QUANTITY_CONTEXT),
-                                      QUANTITY_CONTEXT, -1);
+                                  {   assembly_operand tree =
+                                          parse_expression(QUANTITY_CONTEXT);
+                                      direct_stream_op("streamstr",
+                                          llvm_direct_quantity(tree));
+                                      AO1 = code_generate(tree,
+                                          QUANTITY_CONTEXT, -1);
+                                  }
                                   assembleg_1(streamstr_gc, AO1);
                                   goto PrintTermDone;
                               case OBJECT_MK:
@@ -626,12 +673,22 @@ static void parse_print_g(int finally_return)
                                       goto PrintByRoutine;
                                   }
                                   get_next_token();
-                                  AO1 = code_generate(
-                                      parse_expression(QUANTITY_CONTEXT),
-                                      QUANTITY_CONTEXT, -1);
+                                  {   assembly_operand tree =
+                                          parse_expression(QUANTITY_CONTEXT);
+                                      llvm_direct_value args[2];
+                                      args[0] = llvm_direct_quantity(tree);
+                                      args[1] = llvm_direct_constant(
+                                          GOBJFIELD_NAME(), 0, 0);
+                                      if (args[0] && args[1])
+                                          direct_stream_op("streamstr",
+                                              llvm_direct_glulx_op("aload",
+                                                  args, 2));
+                                      AO1 = code_generate(tree,
+                                          QUANTITY_CONTEXT, -1);
+                                  }
                                   INITAOT(&AO2, BYTECONSTANT_OT);
                                   AO2.value = GOBJFIELD_NAME();
-                                  assembleg_3(aload_gc, AO1, AO2, 
+                                  assembleg_3(aload_gc, AO1, AO2,
                                     stack_pointer);
                                   assembleg_1(streamstr_gc, stack_pointer);
                                   goto PrintTermDone;
@@ -684,34 +741,49 @@ static void parse_print_g(int finally_return)
 
                           get_next_token();
                           INITAOT(&AO2, ZEROCONSTANT_OT);
-                          assembleg_call_1(AO,
-                            code_generate(parse_expression(QUANTITY_CONTEXT),
-                              QUANTITY_CONTEXT, -1),
-                            AO2);
+                          {   assembly_operand tree =
+                                  parse_expression(QUANTITY_CONTEXT);
+                              llvm_direct_value dv =
+                                  llvm_direct_quantity(tree);
+                              direct_operand_call(AO, &dv, 1);
+                              assembleg_call_1(AO,
+                                code_generate(tree, QUANTITY_CONTEXT, -1),
+                                AO2);
+                          }
                           goto PrintTermDone;
 
                         default: ebf_curtoken_error("print specification");
                           get_next_token();
-                          assembleg_1(streamnum_gc,
-                          code_generate(parse_expression(QUANTITY_CONTEXT),
-                                QUANTITY_CONTEXT, -1));
+                          {   assembly_operand tree =
+                                  parse_expression(QUANTITY_CONTEXT);
+                              direct_stream_op("streamnum",
+                                  llvm_direct_quantity(tree));
+                              assembleg_1(streamnum_gc,
+                                  code_generate(tree, QUANTITY_CONTEXT, -1));
+                          }
                           goto PrintTermDone;
                       }
                   }
                   put_token_back(); put_token_back(); put_token_back();
                   misc_keywords.enabled = FALSE;
-                  assembleg_1(streamnum_gc,
-                      code_generate(parse_expression(QUANTITY_CONTEXT),
-                          QUANTITY_CONTEXT, -1));
+                  {   assembly_operand tree =
+                          parse_expression(QUANTITY_CONTEXT);
+                      direct_stream_op("streamnum",
+                          llvm_direct_quantity(tree));
+                      assembleg_1(streamnum_gc,
+                          code_generate(tree, QUANTITY_CONTEXT, -1));
+                  }
                   break;
               }
               /* Fall through */
 
             default:
               put_token_back(); misc_keywords.enabled = FALSE;
-              assembleg_1(streamnum_gc,
-                  code_generate(parse_expression(QUANTITY_CONTEXT),
-                      QUANTITY_CONTEXT, -1));
+              {   assembly_operand tree = parse_expression(QUANTITY_CONTEXT);
+                  direct_stream_op("streamnum", llvm_direct_quantity(tree));
+                  assembleg_1(streamnum_gc,
+                      code_generate(tree, QUANTITY_CONTEXT, -1));
+              }
               break;
         }
 
@@ -730,10 +802,12 @@ static void parse_print_g(int finally_return)
     if (count == 0) ebf_curtoken_error("something to print");
     if (finally_return)
     {
+        direct_stream_char(0x0A);
+        llvm_direct_return_constant(1);
         INITAOTV(&AO, BYTECONSTANT_OT, 0x0A);
-        assembleg_1(streamchar_gc, AO); 
+        assembleg_1(streamchar_gc, AO);
         INITAOTV(&AO, BYTECONSTANT_OT, 1);
-        assembleg_1(return_gc, AO); 
+        assembleg_1(return_gc, AO);
     }
 }
 
@@ -1781,6 +1855,7 @@ static void parse_statement_g(int break_label, int continue_label)
 {   int ln, ln2, ln3, ln4, flag, onstack;
     int pre_unreach, labelexists;
     assembly_operand AO, AO2, AO3, AO4;
+    llvm_direct_value direct_qv1 = NULL, direct_qv2 = NULL;
     debug_location spare_debug_location1, spare_debug_location2;
 
     ASSERT_GLULX();
@@ -1808,8 +1883,7 @@ static void parse_statement_g(int break_label, int continue_label)
     }
 
     if (token_type == DQ_TT)
-    {   llvm_direct_reject("print statement");
-        parse_print_g(TRUE); return;
+    {   parse_print_g(TRUE); return;
     }
 
     if ((token_type == SEP_TT) && (token_value == LESS_SEP))
@@ -1957,9 +2031,15 @@ static void parse_statement_g(int break_label, int continue_label)
                  set_constant_ot(&AO);
                  if (token_value == ON_MK)
                    AO2 = zero_operand;
-                 else 
+                 else
                    AO2 = two_operand;
-                 assembleg_call_2(veneer_routine(Glk__Wrap_VR), 
+                 {   llvm_direct_value fargs[2];
+                     fargs[0] = llvm_direct_constant(AO.value, 0, 0);
+                     fargs[1] = llvm_direct_constant(AO2.value, 0, 0);
+                     direct_operand_call(veneer_routine(Glk__Wrap_VR),
+                         fargs, 2);
+                 }
+                 assembleg_call_2(veneer_routine(Glk__Wrap_VR),
                    AO, AO2, zero_operand);
                  break;
 
@@ -2146,8 +2226,11 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case GIVE_CODE:
-                 AO = code_generate(parse_expression(QUANTITY_CONTEXT),
-                          QUANTITY_CONTEXT, -1);
+                 {   assembly_operand gtree =
+                         parse_expression(QUANTITY_CONTEXT);
+                     direct_qv1 = llvm_direct_quantity(gtree);
+                     AO = code_generate(gtree, QUANTITY_CONTEXT, -1);
+                 }
                  check_warn_symbol_type(&AO, OBJECT_T, 0, "\"give\" statement");
                  if ((AO.type == LOCALVAR_OT) && (AO.value == 0))
                      onstack = TRUE;
@@ -2169,11 +2252,18 @@ static void parse_statement_g(int break_label, int continue_label)
                      {   ln = 1;
                          put_token_back();
                      }
-                     AO2 = code_generate(parse_expression(QUANTITY_CONTEXT),
-                               QUANTITY_CONTEXT, -1);
+                     {   assembly_operand atree =
+                             parse_expression(QUANTITY_CONTEXT);
+                         direct_qv2 = llvm_direct_quantity(atree);
+                         AO2 = code_generate(atree, QUANTITY_CONTEXT, -1);
+                     }
                      check_warn_symbol_type(&AO2, ATTRIBUTE_T, 0, "\"give\" statement");
                      if (runtime_error_checking_switch && (!veneer_mode))
-                     {   ln2 = (ln ? RT__ChG_VR : RT__ChGt_VR);
+                     {   llvm_direct_value gargs[2];
+                         gargs[0] = direct_qv1;
+                         gargs[1] = direct_qv2;
+                         ln2 = (ln ? RT__ChG_VR : RT__ChGt_VR);
+                         direct_operand_call(veneer_routine(ln2), gargs, 2);
                          if ((AO2.type == LOCALVAR_OT) && (AO2.value == 0)) {
                            /* already on stack */
                          }
@@ -2188,6 +2278,20 @@ static void parse_statement_g(int break_label, int continue_label)
                            zero_operand);
                      }
                      else {
+                         {   llvm_direct_value bargs[3];
+                             if (is_constant_ot(AO2.type) && AO2.marker == 0)
+                                 bargs[1] = llvm_direct_constant(
+                                     AO2.value + 8, 0, 0);
+                             else
+                                 bargs[1] = llvm_direct_binary(PLUS_OP,
+                                     direct_qv2,
+                                     llvm_direct_constant(8, 0, 0));
+                             bargs[0] = direct_qv1;
+                             bargs[2] = llvm_direct_constant(ln, 0, 0);
+                             if (bargs[0] && bargs[1] && bargs[2])
+                                 (void)llvm_direct_glulx_op("astorebit",
+                                     bargs, 3);
+                         }
                          if (is_constant_ot(AO2.type) && AO2.marker == 0) {
                            AO2.value += 8;
                            set_constant_ot(&AO2);
@@ -2409,9 +2513,19 @@ static void parse_statement_g(int break_label, int continue_label)
                      return;
                  }
 
-                 AO2 = code_generate(parse_expression(QUANTITY_CONTEXT),
-                     QUANTITY_CONTEXT, -1);
-                 AO = code_generate(AO, QUANTITY_CONTEXT, -1);
+                 {   assembly_operand dtree =
+                         parse_expression(QUANTITY_CONTEXT);
+                     llvm_direct_value margs[2];
+                     direct_qv2 = llvm_direct_quantity(dtree);
+                     AO2 = code_generate(dtree, QUANTITY_CONTEXT, -1);
+                     direct_qv1 = llvm_direct_quantity(AO);
+                     AO = code_generate(AO, QUANTITY_CONTEXT, -1);
+                     margs[0] = direct_qv1;
+                     margs[1] = direct_qv2;
+                     direct_operand_call(veneer_routine(
+                         (runtime_error_checking_switch && !veneer_mode)
+                             ? RT__ChT_VR : OB__Move_VR), margs, 2);
+                 }
                  check_warn_symbol_type(&AO, OBJECT_T, 0, "\"move\" statement");
                  check_warn_symbol_type(&AO2, OBJECT_T, CLASS_T, "\"move\" statement");
                  if ((runtime_error_checking_switch) && (veneer_mode == FALSE))
@@ -2426,9 +2540,10 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  new_line ----------------------------------------------------------- */
     /*  -------------------------------------------------------------------- */
 
-        case NEW_LINE_CODE:  
+        case NEW_LINE_CODE:
               INITAOTV(&AO, BYTECONSTANT_OT, 0x0A);
-              assembleg_1(streamchar_gc, AO); 
+              direct_stream_char(0x0A);
+              assembleg_1(streamchar_gc, AO);
               break;
 
     /*  -------------------------------------------------------------------- */
@@ -2594,6 +2709,7 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case QUIT_CODE:
+                 (void)llvm_direct_glulx_op("quit", NULL, 0);
                  assembleg_0(quit_gc); break;
 
     /*  -------------------------------------------------------------------- */
@@ -2601,8 +2717,13 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case REMOVE_CODE:
-            AO = code_generate(parse_expression(QUANTITY_CONTEXT),
-                QUANTITY_CONTEXT, -1);
+            {   assembly_operand rtree = parse_expression(QUANTITY_CONTEXT);
+                direct_qv1 = llvm_direct_quantity(rtree);
+                AO = code_generate(rtree, QUANTITY_CONTEXT, -1);
+                direct_operand_call(veneer_routine(
+                    (runtime_error_checking_switch && !veneer_mode)
+                        ? RT__ChR_VR : OB__Remove_VR), &direct_qv1, 1);
+            }
             check_warn_symbol_type(&AO, OBJECT_T, 0, "\"remove\" statement");
             if ((runtime_error_checking_switch) && (veneer_mode == FALSE))
                 assembleg_call_1(veneer_routine(RT__ChR_VR), AO,
@@ -2675,8 +2796,11 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case STRING_CODE:
-                 AO2 = code_generate(parse_expression(QUANTITY_CONTEXT),
-                     QUANTITY_CONTEXT, -1);
+                 {   assembly_operand stree =
+                         parse_expression(QUANTITY_CONTEXT);
+                     direct_qv1 = llvm_direct_quantity(stree);
+                     AO2 = code_generate(stree, QUANTITY_CONTEXT, -1);
+                 }
                  if (is_constant_ot(AO2.type) && AO2.marker == 0) {
                      /* Compile-time check */
                      if (AO2.value < 0 || AO2.value >= MAX_DYNAMIC_STRINGS) {
@@ -2695,6 +2819,13 @@ static void parse_statement_g(int break_label, int continue_label)
                  else
                  {   put_token_back();
                      AO4 = parse_expression(CONSTANT_CONTEXT);
+                 }
+                 {   llvm_direct_value dsargs[2];
+                     dsargs[0] = direct_qv1;
+                     dsargs[1] = llvm_direct_constant(AO4.value, AO4.marker,
+                         AO4.symindex);
+                     direct_operand_call(veneer_routine(Dynam__String_VR),
+                         dsargs, 2);
                  }
                  assembleg_call_2(veneer_routine(Dynam__String_VR),
                    AO2, AO4, zero_operand);
@@ -2743,11 +2874,17 @@ static void parse_statement_g(int break_label, int continue_label)
                      case UNDERLINE_MK: 
                          AO2 = one_operand; /* emphasized */
                          break;
-                     case FIXED_MK: 
+                     case FIXED_MK:
                          AO2 = two_operand; /* preformatted */
                          break;
                  }
-                 assembleg_call_2(veneer_routine(Glk__Wrap_VR), 
+                 {   llvm_direct_value sargs[2];
+                     sargs[0] = llvm_direct_constant(AO.value, 0, 0);
+                     sargs[1] = llvm_direct_constant(AO2.value, 0, 0);
+                     direct_operand_call(veneer_routine(Glk__Wrap_VR),
+                         sargs, 2);
+                 }
+                 assembleg_call_2(veneer_routine(Glk__Wrap_VR),
                    AO, AO2, zero_operand);
                  break;
 

@@ -1395,7 +1395,7 @@ extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
         return NULL;
     }
     flags = glulx_opcode_flags(opnum);
-    if ((flags & (OPFLAG_STORE2 | OPFLAG_BRANCH | OPFLAG_RETURNS))) {
+    if ((flags & (OPFLAG_STORE2 | OPFLAG_BRANCH))) {
         llvm_direct_reject("unsupported direct opcode shape");
         return NULL;
     }
@@ -1412,6 +1412,9 @@ extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
     sprintf(name, "i6.%.32s", opcode);
     result = direct_opaque_call_ex(name, args, count,
         !(flags & OPFLAG_STORE));
+    /* Opcodes that never return (quit, restart...) end the block. */
+    if (flags & OPFLAG_RETURNS)
+        LLVMBuildUnreachable(direct_bld);
     return (flags & OPFLAG_STORE) ? result : (llvm_direct_value)direct_fn;
 }
 
@@ -1473,7 +1476,12 @@ extern void llvm_direct_note_statement(int statement_code)
         && statement_code != IF_CODE && statement_code != BREAK_CODE
         && statement_code != CONTINUE_CODE && statement_code != DO_CODE
         && statement_code != FOR_CODE && statement_code != WHILE_CODE
-        && statement_code != SWITCH_CODE)
+        && statement_code != SWITCH_CODE && statement_code != PRINT_CODE
+        && statement_code != PRINT_RET_CODE
+        && statement_code != NEW_LINE_CODE && statement_code != GIVE_CODE
+        && statement_code != MOVE_CODE && statement_code != REMOVE_CODE
+        && statement_code != FONT_CODE && statement_code != STYLE_CODE
+        && statement_code != STRING_CODE && statement_code != QUIT_CODE)
         llvm_direct_reject("unsupported statement");
 }
 

@@ -51,13 +51,61 @@ Object Room "room" has light;
 
 [ Mem_PropCall o v; return o.run(v); ];
 
-[ Mem_Parent o; return parent(o); ];
+! Object addresses depend on story layout, so tree lookups are compared
+! against known objects rather than printed.
+[ Mem_Parent o; return parent(o) == Room; ];
 
-[ Mem_Child o; return child(o); ];
+[ Mem_Child o; return child(o) == House; ];
 
-[ Mem_Sibling o; return sibling(o); ];
+[ Mem_Sibling o; return sibling(o) == 0; ];
 
 [ Mem_Random; random(-7); return random(1); ];
+
+[ Mem_Print x;
+    print "value ", x, " char ", (char) 65, " num ", (number) 3, "^";
+    return 1;
+];
+
+[ Mem_PrintChar c;
+    print (char) c;
+    new_line;
+    return 2;
+];
+
+[ Mem_PrintOrder;
+    Track = 4;
+    print "order ", Mem_Note(2), " ", Track, "^";
+    return 3;
+];
+
+[ Mem_PrintRet;
+    print_ret "print and return";
+];
+
+[ Mem_PrintObj o;
+    print (object) o, " ", (name) o, " ", (string) "lit", "^";
+    return 4;
+];
+
+[ Mem_Style;
+    style bold;
+    style roman;
+    font off;
+    font on;
+    return 5;
+];
+
+[ Mem_GiveMove o p;
+    give o light;
+    move o to p;
+    remove o;
+    give o ~light;
+    return (o has light) * 10 + (parent(o) == 0);
+];
+
+! Not called at runtime: quit ends the story, but its direct shape (an
+! opaque non-returning operation) should still compile.
+[ Mem_Quit; quit; ];
 
 [ Mem_RandomVar x; random(0 - x); return random(x - x + 1); ];
 
@@ -92,5 +140,12 @@ Object Room "room" has light;
         Mem_Child(Room), " ",
         Mem_Sibling(House), " ",
         Mem_Random(), " ",
-        Mem_RandomVar(4), "^done.^";
+        Mem_RandomVar(4), "^";
+    print Mem_Print(7), " ",
+        Mem_PrintChar(66), " ",
+        Mem_PrintOrder(), " ", Track, " ",
+        Mem_PrintRet(), " ",
+        Mem_PrintObj(House), " ",
+        Mem_Style(), " ",
+        Mem_GiveMove(House, Room), "^done.^";
 ];
