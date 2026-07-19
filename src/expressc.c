@@ -3285,20 +3285,116 @@ static void direct_expression_condition(int node,
     llvm_direct_block true_block, llvm_direct_block false_block);
 static llvm_direct_value direct_expression_value(int node);
 
+#define DIRECT_CALL_CHILDREN 14
+
+/* Collect an operator node's children, or -1 if there are too many. */
+static int direct_collect_children(int first, int *nodes, int max)
+{
+    int child, count = 0;
+    for (child = first; child != -1; child = ET[child].right) {
+        if (count >= max) return -1;
+        nodes[count++] = child;
+    }
+    return count;
+}
+
+/* Evaluate an operand list the way classic Glulx generation does:
+   subtree code runs right to left, but leaf variable operands are read
+   by the consuming instruction itself, after all subtree code, so leaf
+   loads come last (in decode order). FALSE on rejection. */
+static int direct_evaluate_children(const int *nodes,
+    llvm_direct_value *values, int count)
+{
+    int i;
+    for (i = count - 1; i >= 0; i--)
+        if (ET[nodes[i]].down != -1) {
+            values[i] = direct_expression_value(nodes[i]);
+            if (!values[i]) return FALSE;
+        }
+    for (i = 0; i < count; i++)
+        if (ET[nodes[i]].down == -1) {
+            values[i] = direct_operand_value(ET[nodes[i]].value);
+            if (!values[i]) return FALSE;
+        }
+    return TRUE;
+}
+
+static llvm_direct_value direct_veneer_value(int vr)
+{
+    assembly_operand op = veneer_routine(vr);
+    return llvm_direct_constant(op.value, op.marker, op.symindex);
+}
+
+static llvm_direct_value direct_veneer_call(int vr,
+    llvm_direct_value *args, int count)
+{
+    llvm_direct_value function = direct_veneer_value(vr);
+    if (!function) return NULL;
+    return llvm_direct_call(function, args, count);
+}
+
+/* random(x) for a single argument: positive ranges become @random plus
+   one; zero or negative arguments seed the generator and yield zero.
+   Classic decides constant arguments at compile time and branches for
+   variables; mirror both shapes. */
+static llvm_direct_value direct_random_call(int argument_node,
+    llvm_direct_value argument)
+{
+    llvm_direct_value one, result, seed;
+    if (ET[argument_node].down == -1
+        && direct_constant_operand(ET[argument_node].value)
+        && ET[argument_node].value.marker == 0) {
+        int32 range = ET[argument_node].value.value;
+        if (range > 0) {
+            result = llvm_direct_glulx_op("random", &argument, 1);
+            one = llvm_direct_constant(1, 0, 0);
+            return llvm_direct_binary(PLUS_OP, result, one);
+        }
+        seed = llvm_direct_constant(-range, 0, 0);
+        if (!llvm_direct_glulx_op("setrandom", &seed, 1)) return NULL;
+        return llvm_direct_constant(0, 0, 0);
+    }
+    {   llvm_direct_block seed_block = llvm_direct_new_block();
+        llvm_direct_block range_block = llvm_direct_new_block();
+        llvm_direct_block join_block = llvm_direct_new_block();
+        llvm_direct_block seed_from, range_from;
+        llvm_direct_value zero, seeded, ranged, comparison;
+
+        zero = llvm_direct_constant(0, 0, 0);
+        comparison = llvm_direct_compare(LE_OP, argument, zero);
+        llvm_direct_branch(comparison, seed_block, range_block);
+
+        llvm_direct_bind_block(range_block);
+        ranged = llvm_direct_glulx_op("random", &argument, 1);
+        one = llvm_direct_constant(1, 0, 0);
+        ranged = llvm_direct_binary(PLUS_OP, ranged, one);
+        range_from = llvm_direct_current_block();
+        llvm_direct_jump_block(join_block);
+
+        llvm_direct_bind_block(seed_block);
+        seed = llvm_direct_unary(UNARY_MINUS_OP, argument);
+        if (!llvm_direct_glulx_op("setrandom", &seed, 1)) return NULL;
+        seeded = llvm_direct_constant(0, 0, 0);
+        seed_from = llvm_direct_current_block();
+        llvm_direct_jump_block(join_block);
+
+        llvm_direct_bind_block(join_block);
+        return llvm_direct_phi(ranged, range_from, seeded, seed_from);
+    }
+}
+
 /* A function-call node: the first child is the function (or a system
    function selector), the rest are arguments. Classic Glulx generation
    evaluates every child right to left, with the function address last;
    mirror that order so side effects in arguments match upstream. */
-#define DIRECT_CALL_CHILDREN 14
 static llvm_direct_value direct_function_call(int node)
 {
     int first = ET[node].down;
     int nodes[DIRECT_CALL_CHILDREN];
     llvm_direct_value values[DIRECT_CALL_CHILDREN];
     llvm_direct_value function;
-    int count = 0, i, child, sysfun = -1;
-    int address_index = 0, argument_start = 1;
-    assembly_operand veneer_op;
+    int count, sysfun = -1, field = -1;
+    int address_index = 0, argument_start = 1, veneer = -1;
 
     if (first == -1) {
         llvm_direct_reject("invalid call tree");
@@ -3307,15 +3403,11 @@ static llvm_direct_value direct_function_call(int node)
     if (ET[first].down == -1 && ET[first].value.type == SYSFUN_OT)
         sysfun = ET[first].value.value;
 
-    if (sysfun == -1) {
-        nodes[count++] = first;
-    }
-    for (child = ET[first].right; child != -1; child = ET[child].right) {
-        if (count >= DIRECT_CALL_CHILDREN) {
-            llvm_direct_reject("unsupported call arity");
-            return NULL;
-        }
-        nodes[count++] = child;
+    count = direct_collect_children(
+        sysfun == -1 ? first : ET[first].right, nodes, DIRECT_CALL_CHILDREN);
+    if (count < 0) {
+        llvm_direct_reject("unsupported call arity");
+        return NULL;
     }
 
     switch (sysfun) {
@@ -3328,7 +3420,7 @@ static llvm_direct_value direct_function_call(int node)
         }
         break;
     case GLK_SYSF:
-        veneer_op = veneer_routine(Glk__Wrap_VR);
+        veneer = Glk__Wrap_VR;
         address_index = -1;
         argument_start = 0;
         break;
@@ -3337,35 +3429,207 @@ static llvm_direct_value direct_function_call(int node)
             llvm_direct_reject("invalid metaclass call");
             return NULL;
         }
-        veneer_op = veneer_routine(Metaclass_VR);
+        veneer = Metaclass_VR;
         address_index = -1;
         argument_start = 0;
         break;
+    case RANDOM_SYSF:
+        if (count != 1) {
+            /* Multi-argument random() builds a word array during classic
+               generation; direct generation must not repeat that table
+               side effect. */
+            llvm_direct_reject("unsupported random arity");
+            return NULL;
+        }
+        if (!direct_evaluate_children(nodes, values, 1)) return NULL;
+        return direct_random_call(nodes[0], values[0]);
+    case PARENT_SYSF:
+    case CHILD_SYSF:
+    case ELDEST_SYSF:
+    case SIBLING_SYSF:
+    case YOUNGER_SYSF:
+        if (count != 1) {
+            llvm_direct_reject("invalid object-tree call");
+            return NULL;
+        }
+        if (runtime_error_checking_switch && !veneer_mode) {
+            /* Classic guards the object argument with an inline
+               metaclass check; that CFG is not generated yet. */
+            llvm_direct_reject("strict object-tree check");
+            return NULL;
+        }
+        field = (sysfun == PARENT_SYSF) ? GOBJFIELD_PARENT()
+            : (sysfun == SIBLING_SYSF || sysfun == YOUNGER_SYSF)
+            ? GOBJFIELD_SIBLING() : GOBJFIELD_CHILD();
+        {   llvm_direct_value args[2];
+            if (!direct_evaluate_children(nodes, values, 1)) return NULL;
+            args[0] = values[0];
+            args[1] = llvm_direct_constant(field, 0, 0);
+            return llvm_direct_glulx_op("aload", args, 2);
+        }
     default:
         llvm_direct_reject("unsupported system function");
         return NULL;
     }
 
-    /* Subtree code right to left; leaf variable operands are read by the
-       call (or its argument pushes) after all subtree code, so load them
-       last, in decode order. */
-    for (i = count - 1; i >= 0; i--)
-        if (ET[nodes[i]].down != -1) {
-            values[i] = direct_expression_value(nodes[i]);
-            if (!values[i]) return NULL;
-        }
-    for (i = 0; i < count; i++)
-        if (ET[nodes[i]].down == -1) {
-            values[i] = direct_operand_value(ET[nodes[i]].value);
-            if (!values[i]) return NULL;
-        }
+    if (!direct_evaluate_children(nodes, values, count)) return NULL;
     if (address_index >= 0)
         function = values[address_index];
     else
-        function = llvm_direct_constant(veneer_op.value, veneer_op.marker,
-            veneer_op.symindex);
+        function = direct_veneer_value(veneer);
     return llvm_direct_call(function, values + argument_start,
         count - argument_start);
+}
+
+/* Mirror of access_memory_g's bounds table for an array recognized from
+   its backpatch marker: the permitted index range, the encoded type and
+   size the error veneer reports, and the array number. Warnings and
+   errors stay with classic generation, which always runs. FALSE if the
+   array cannot be found. */
+static int direct_array_bounds(int oc, assembly_operand AO1, int32 *low_out,
+    int32 *max_out, int32 *type_out, int32 *size_out, int32 *number_out)
+{
+    int x, y = -1, data_len, read_flag;
+    int32 size = -1, type, low = 0, max;
+
+    data_len = (oc == aloadb_gc || oc == astoreb_gc) ? 1 : 4;
+    read_flag = (oc == aloadb_gc || oc == aload_gc);
+    for (x = 0; x < no_arrays; x++) {
+        if (((AO1.marker == ARRAY_MV) == (!arrays[x].loc))
+            && (AO1.value == symbols[arrays[x].symbol].value)) {
+            size = arrays[x].size;
+            y = x;
+        }
+    }
+    if (y < 0) return FALSE;
+
+    type = arrays[y].type;
+    max = size;
+    if (data_len == 1
+        && (arrays[y].type == WORD_ARRAY || arrays[y].type == TABLE_ARRAY)) {
+        max = size * 4 + 3;
+        type += 8;
+    }
+    if (data_len == 4
+        && (arrays[y].type == BYTE_ARRAY || arrays[y].type == STRING_ARRAY
+            || arrays[y].type == BUFFER_ARRAY)) {
+        max = (size - 3) / 4;
+        type += 16;
+    }
+    max++;
+    if ((arrays[y].type == STRING_ARRAY || arrays[y].type == TABLE_ARRAY)
+        && !read_flag)
+        low = (arrays[y].type == TABLE_ARRAY && data_len == 1) ? 4 : 1;
+
+    *low_out = low;
+    *max_out = max;
+    *type_out = type;
+    *size_out = size;
+    *number_out = y;
+    return TRUE;
+}
+
+/* A byte or word array access. AO1 describes the array child when it is
+   a leaf (so declared arrays are recognized by marker); index_op is the
+   index child's operand when that is a leaf. Reads return the loaded
+   value; writes take the value to store and return it. Classic shapes:
+   a plain opcode without checking, a compile-time-checked plain opcode
+   for recognized arrays with constant indices, an inline bounds check
+   branching to the RT__Err veneer for recognized arrays, and an RT__Ch*
+   veneer call for unrecognized addresses. */
+static llvm_direct_value direct_access_memory(int oc, assembly_operand AO1,
+    llvm_direct_value array, llvm_direct_value index,
+    const assembly_operand *index_op, llvm_direct_value value)
+{
+    const char *opname = (oc == aloadb_gc) ? "aloadb"
+        : (oc == aload_gc) ? "aload"
+        : (oc == astoreb_gc) ? "astoreb" : "astore";
+    int read_flag = (oc == aloadb_gc || oc == aload_gc);
+    llvm_direct_value args[3], result;
+    int32 low, max, type, size, number;
+
+    if (!array || !index || (!read_flag && !value)) return NULL;
+    args[0] = array;
+    args[1] = index;
+    args[2] = value;
+
+    if (!runtime_error_checking_switch || veneer_mode) {
+        result = llvm_direct_glulx_op(opname, args, read_flag ? 2 : 3);
+        return read_flag ? result : (result ? value : NULL);
+    }
+
+    if (AO1.marker == ARRAY_MV || AO1.marker == STATIC_ARRAY_MV) {
+        int32 en = (oc == aloadb_gc) ? ABOUNDS_RTE
+            : (oc == aload_gc) ? ABOUNDS_RTE + 1
+            : (oc == astoreb_gc) ? ABOUNDS_RTE + 2 : ABOUNDS_RTE + 3;
+        if (!direct_array_bounds(oc, AO1, &low, &max, &type, &size,
+            &number)) {
+            llvm_direct_reject("unknown checked array");
+            return NULL;
+        }
+        if (index_op && is_constant_ot(index_op->type)
+            && index_op->marker == 0) {
+            /* Out-of-bounds constants are a compile error (classic
+               reports it); the emitted opcode is unchecked. */
+            result = llvm_direct_glulx_op(opname, args, read_flag ? 2 : 3);
+            return read_flag ? result : (result ? value : NULL);
+        }
+        {   llvm_direct_block failed = llvm_direct_new_block();
+            llvm_direct_block second = llvm_direct_new_block();
+            llvm_direct_block passed = llvm_direct_new_block();
+            llvm_direct_block final = llvm_direct_new_block();
+            llvm_direct_block failed_from, passed_from;
+            llvm_direct_value comparison, err_args[5], zero;
+
+            comparison = llvm_direct_compare(LESS_OP, index,
+                llvm_direct_constant(low, 0, 0));
+            llvm_direct_branch(comparison, failed, second);
+            llvm_direct_bind_block(second);
+            comparison = llvm_direct_compare(LESS_OP, index,
+                llvm_direct_constant(max, 0, 0));
+            llvm_direct_branch(comparison, passed, failed);
+
+            llvm_direct_bind_block(failed);
+            err_args[0] = llvm_direct_constant(en, 0, 0);
+            err_args[1] = index;
+            err_args[2] = llvm_direct_constant(size, 0, 0);
+            err_args[3] = llvm_direct_constant(type, 0, 0);
+            err_args[4] = llvm_direct_constant(number, 0, 0);
+            if (!direct_veneer_call(RT__Err_VR, err_args, 5)) return NULL;
+            zero = llvm_direct_constant(0, 0, 0);
+            failed_from = llvm_direct_current_block();
+            llvm_direct_jump_block(final);
+
+            llvm_direct_bind_block(passed);
+            result = llvm_direct_glulx_op(opname, args, read_flag ? 2 : 3);
+            if (!result) return NULL;
+            passed_from = llvm_direct_current_block();
+            llvm_direct_jump_block(final);
+
+            llvm_direct_bind_block(final);
+            if (!read_flag) return value;
+            return llvm_direct_phi(result, passed_from, zero, failed_from);
+        }
+    }
+
+    {   int vr = (oc == aloadb_gc) ? RT__ChLDB_VR
+            : (oc == aload_gc) ? RT__ChLDW_VR
+            : (oc == astoreb_gc) ? RT__ChSTB_VR : RT__ChSTW_VR;
+        result = direct_veneer_call(vr, args, read_flag ? 2 : 3);
+        return read_flag ? result : (result ? value : NULL);
+    }
+}
+
+/* The array child's operand when it is a leaf (recognizable declared
+   arrays carry their backpatch marker there); an unmarked placeholder
+   otherwise. */
+static assembly_operand direct_array_operand(int node)
+{
+    assembly_operand AO;
+    if (ET[node].down == -1)
+        return ET[node].value;
+    INITAOTV(&AO, ZEROCONSTANT_OT, 0);
+    return AO;
 }
 
 #define DIRECT_SWITCH_DEPTH 32
@@ -3567,6 +3831,218 @@ static llvm_direct_value direct_expression_value(int node)
                 left, right, check_zero);
         }
         return llvm_direct_binary(ET[node].operator_number, left, right);
+
+    case ARROW_OP:
+    case DARROW_OP:
+        {   int nodes[2];
+            llvm_direct_value values[2];
+            int oc = (ET[node].operator_number == ARROW_OP)
+                ? aloadb_gc : aload_gc;
+            if (direct_collect_children(first, nodes, 2) != 2) {
+                llvm_direct_reject("invalid array read");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            return direct_access_memory(oc, direct_array_operand(nodes[0]),
+                values[0], values[1],
+                ET[nodes[1]].down == -1 ? &ET[nodes[1]].value : NULL, NULL);
+        }
+
+    case ARROW_SETEQUALS_OP:
+    case DARROW_SETEQUALS_OP:
+        {   int nodes[3];
+            llvm_direct_value values[3];
+            int oc = (ET[node].operator_number == ARROW_SETEQUALS_OP)
+                ? astoreb_gc : astore_gc;
+            if (direct_collect_children(first, nodes, 3) != 3) {
+                llvm_direct_reject("invalid array assignment");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 3)) return NULL;
+            return direct_access_memory(oc, direct_array_operand(nodes[0]),
+                values[0], values[1],
+                ET[nodes[1]].down == -1 ? &ET[nodes[1]].value : NULL,
+                values[2]);
+        }
+
+    case ARROW_INC_OP:
+    case ARROW_DEC_OP:
+    case ARROW_POST_INC_OP:
+    case ARROW_POST_DEC_OP:
+    case DARROW_INC_OP:
+    case DARROW_DEC_OP:
+    case DARROW_POST_INC_OP:
+    case DARROW_POST_DEC_OP:
+        {   int nodes[2];
+            llvm_direct_value values[2], old, adjusted;
+            int opnum = ET[node].operator_number;
+            int is_byte = (opnum == ARROW_INC_OP || opnum == ARROW_DEC_OP
+                || opnum == ARROW_POST_INC_OP || opnum == ARROW_POST_DEC_OP);
+            int is_inc = (opnum == ARROW_INC_OP || opnum == ARROW_POST_INC_OP
+                || opnum == DARROW_INC_OP || opnum == DARROW_POST_INC_OP);
+            int is_post = (opnum == ARROW_POST_INC_OP
+                || opnum == ARROW_POST_DEC_OP || opnum == DARROW_POST_INC_OP
+                || opnum == DARROW_POST_DEC_OP);
+            assembly_operand unmarked;
+            if (direct_collect_children(first, nodes, 2) != 2) {
+                llvm_direct_reject("invalid array update");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            /* Classic funnels these through temporaries, so the array is
+               never recognized and strict mode uses the RT__Ch veneers. */
+            INITAOTV(&unmarked, ZEROCONSTANT_OT, 0);
+            old = direct_access_memory(is_byte ? aloadb_gc : aload_gc,
+                unmarked, values[0], values[1], NULL, NULL);
+            if (!old) return NULL;
+            adjusted = llvm_direct_binary(is_inc ? PLUS_OP : MINUS_OP,
+                old, llvm_direct_constant(1, 0, 0));
+            if (!direct_access_memory(is_byte ? astoreb_gc : astore_gc,
+                unmarked, values[0], values[1], NULL, adjusted))
+                return NULL;
+            return is_post ? old : adjusted;
+        }
+
+    case HAS_OP:
+    case HASNT_OP:
+        {   int nodes[2];
+            llvm_direct_value values[2], attribute, bit, args[2];
+            if (runtime_error_checking_switch && !veneer_mode) {
+                llvm_direct_reject("strict attribute check");
+                return NULL;
+            }
+            if (direct_collect_children(first, nodes, 2) != 2) {
+                llvm_direct_reject("invalid attribute test");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            if (ET[nodes[1]].down == -1
+                && direct_constant_operand(ET[nodes[1]].value)
+                && ET[nodes[1]].value.marker == 0)
+                attribute = llvm_direct_constant(
+                    ET[nodes[1]].value.value + 8, 0, 0);
+            else
+                attribute = llvm_direct_binary(PLUS_OP, values[1],
+                    llvm_direct_constant(8, 0, 0));
+            args[0] = values[0];
+            args[1] = attribute;
+            bit = llvm_direct_glulx_op("aloadbit", args, 2);
+            return llvm_direct_compare(
+                ET[node].operator_number == HAS_OP
+                    ? NOTEQUAL_OP : CONDEQUALS_OP,
+                bit, llvm_direct_constant(0, 0, 0));
+        }
+
+    case IN_OP:
+    case NOTIN_OP:
+        {   int nodes[2];
+            llvm_direct_value values[2], parent, args[2];
+            if (runtime_error_checking_switch && !veneer_mode) {
+                llvm_direct_reject("strict object-tree check");
+                return NULL;
+            }
+            if (direct_collect_children(first, nodes, 2) != 2) {
+                llvm_direct_reject("invalid containment test");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            args[0] = values[0];
+            args[1] = llvm_direct_constant(GOBJFIELD_PARENT(), 0, 0);
+            parent = llvm_direct_glulx_op("aload", args, 2);
+            return llvm_direct_compare(
+                ET[node].operator_number == IN_OP
+                    ? CONDEQUALS_OP : NOTEQUAL_OP,
+                parent, values[1]);
+        }
+
+    case OFCLASS_OP:
+    case NOTOFCLASS_OP:
+    case PROVIDES_OP:
+    case NOTPROVIDES_OP:
+        {   int nodes[2];
+            llvm_direct_value values[2], result;
+            int opnum = ET[node].operator_number;
+            int positive = (opnum == OFCLASS_OP || opnum == PROVIDES_OP);
+            int vr = (opnum == OFCLASS_OP || opnum == NOTOFCLASS_OP)
+                ? OC__Cl_VR : OP__Pr_VR;
+            if (direct_collect_children(first, nodes, 2) != 2) {
+                llvm_direct_reject("invalid class test");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            result = direct_veneer_call(vr, values, 2);
+            return llvm_direct_compare(
+                positive ? NOTEQUAL_OP : CONDEQUALS_OP,
+                result, llvm_direct_constant(0, 0, 0));
+        }
+
+    case PROPERTY_OP:
+    case MESSAGE_OP:
+    case MPROP_ADD_OP:
+    case PROP_ADD_OP:
+    case MPROP_NUM_OP:
+    case PROP_NUM_OP:
+    case SUPERCLASS_OP:
+    case MESSAGE_INC_OP:
+    case PROPERTY_INC_OP:
+    case MESSAGE_DEC_OP:
+    case PROPERTY_DEC_OP:
+    case MESSAGE_POST_INC_OP:
+    case PROPERTY_POST_INC_OP:
+    case MESSAGE_POST_DEC_OP:
+    case PROPERTY_POST_DEC_OP:
+        {   int nodes[2];
+            llvm_direct_value values[2];
+            int vr;
+            switch (ET[node].operator_number) {
+            case PROPERTY_OP: case MESSAGE_OP: vr = RV__Pr_VR; break;
+            case MPROP_ADD_OP: case PROP_ADD_OP: vr = RA__Pr_VR; break;
+            case MPROP_NUM_OP: case PROP_NUM_OP: vr = RL__Pr_VR; break;
+            case SUPERCLASS_OP: vr = RA__Sc_VR; break;
+            case MESSAGE_INC_OP: case PROPERTY_INC_OP:
+                vr = IB__Pr_VR; break;
+            case MESSAGE_DEC_OP: case PROPERTY_DEC_OP:
+                vr = DB__Pr_VR; break;
+            case MESSAGE_POST_INC_OP: case PROPERTY_POST_INC_OP:
+                vr = IA__Pr_VR; break;
+            default:
+                vr = DA__Pr_VR; break;
+            }
+            if (direct_collect_children(first, nodes, 2) != 2) {
+                llvm_direct_reject("invalid property expression");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            return direct_veneer_call(vr, values, 2);
+        }
+
+    case PROPERTY_SETEQUALS_OP:
+    case MESSAGE_SETEQUALS_OP:
+        {   int nodes[3];
+            llvm_direct_value values[3];
+            int vr = (runtime_error_checking_switch && !veneer_mode)
+                ? RT__ChPS_VR : WV__Pr_VR;
+            if (direct_collect_children(first, nodes, 3) != 3) {
+                llvm_direct_reject("invalid property assignment");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, 3)) return NULL;
+            return direct_veneer_call(vr, values, 3);
+        }
+
+    case PROP_CALL_OP:
+    case MESSAGE_CALL_OP:
+        {   int nodes[DIRECT_CALL_CHILDREN];
+            llvm_direct_value values[DIRECT_CALL_CHILDREN];
+            int count = direct_collect_children(first, nodes,
+                DIRECT_CALL_CHILDREN);
+            if (count < 2) {
+                llvm_direct_reject("invalid property call");
+                return NULL;
+            }
+            if (!direct_evaluate_children(nodes, values, count)) return NULL;
+            return direct_veneer_call(CA__Pr_VR, values, count);
+        }
 
     case FCALL_OP:
         return direct_function_call(node);

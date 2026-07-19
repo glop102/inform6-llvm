@@ -323,10 +323,11 @@ Global Direct_Global = 5;
     return Direct_Global;
 ];
 
-! Not called at runtime: proves the random() system function still takes
-! the classic fallback with an explicit direct-generation reason.
-[ Direct_Random x;
-    return random(x);
+! Not called at runtime: proves multi-argument random() still takes the
+! classic fallback with an explicit direct-generation reason (its word
+! array is a classic-generation side effect).
+[ Direct_Random;
+    return random(2, 4, 6);
 ];
 
 [ Main win dummy;

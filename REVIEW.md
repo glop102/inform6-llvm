@@ -309,9 +309,41 @@ pushes at the call site; `Direct_CallWideMixed` pins the resulting +2
 instructions as an accepted static ceiling until emission learns interleaved
 pushes.
 
-With calls supported, Life's `DrawCell` joins `Rnd` in direct coverage
-(2 direct, 13 fallback) and direct mode remains dynamically identical to
-upstream (56,177,197, +0.00%).
+With calls supported, Life's `DrawCell` joined `Rnd` in direct coverage and
+direct mode remained dynamically identical to upstream (56,177,197, +0.00%).
+
+The next Phase 4 slice added memory and object operations. Byte and word
+array reads, writes, and increments become opaque `aloadb`/`aload`/
+`astoreb`/`astore` operations (reads readonly, writes full barriers, so a
+computed store cannot reorder against Inform global accesses that share the
+Glulx memory map). Strict mode mirrors classic's three checked shapes: a
+compile-time-checked plain opcode for recognized arrays with constant
+indices, an inline bounds check branching to `RT__Err` for recognized arrays
+(reads yield zero on the failed arm via a phi), and `RT__ChLDW`-family
+veneer calls for unrecognized addresses; `direct_array_bounds` mirrors the
+classic bounds table without repeating its warnings. Property operators
+(`.`, `.&`, `.#`, `.()`, their write and increment forms, `superclass`,
+`ofclass`, `provides`) become the same veneer calls classic emits, in both
+strict and unchecked modes. `has`/`hasnt` lower to `aloadbit`, `in`/`notin`
+to a parent-field `aload` comparison, and `parent`/`child`/`sibling`/
+`eldest`/`younger` to object-field loads — in unchecked or veneer mode;
+their strict forms need classic's inline metaclass-check CFG and reject
+with explicit `strict attribute check`/`strict object-tree check` reasons
+until that is generated. Single-argument `random()` follows classic's three
+shapes (constant range, constant seed, variable branch); multi-argument
+`random()` rejects because its word array is a classic-generation side
+effect. The `direct-ir-memory` fixture compiles strict and unchecked,
+matches upstream transcripts (including the strict out-of-bounds
+diagnostic), and pins per-mode coverage and dynamic ceilings; direct mode
+beats upstream in both (1,056 vs 1,076 strict; 648 vs 683 unchecked).
+`Meta__class` is the first veneer routine to compile through direct IR.
+
+With memory operations, Life direct coverage reaches 8 of 15 routines
+(`Rnd`, `SeedSoup`, `Stir`, `Step`, `DrawCell`, `DrawFull`, `DrawDiff`,
+`MarkStart`) and direct mode drops below upstream for the first time:
+54,632,155 dynamic dispatches (-2.75%), within 0.05% of the lifted
+production path's 54,605,529 (-2.80%). The remaining fallbacks are print
+statements and inline assembly.
 
 Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
 `I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,

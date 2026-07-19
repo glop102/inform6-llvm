@@ -1242,22 +1242,30 @@ extern llvm_direct_value llvm_direct_binary(int operator_number,
     }
 }
 
-static LLVMValueRef direct_opaque_call(const char *name, LLVMValueRef *args,
-    int count)
+static LLVMValueRef direct_opaque_call_ex(const char *name, LLVMValueRef *args,
+    int count, int void_return)
 {
     LLVMTypeRef params[16], ft;
     LLVMValueRef f;
     int i, is_new;
     for (i = 0; i < count; i++)
         params[i] = i32t;
-    ft = LLVMFunctionType(i32t, params, (unsigned)count, FALSE);
+    ft = LLVMFunctionType(void_return ? LLVMVoidTypeInContext(llctx) : i32t,
+        params, (unsigned)count, FALSE);
     f = LLVMGetNamedFunction(direct_mod, name);
     is_new = (f == NULL);
     if (!f)
         f = LLVMAddFunction(direct_mod, name, ft);
     if (is_new)
         mark_opaque_fn_attrs(f, name + 3);
-    return LLVMBuildCall2(direct_bld, ft, f, args, (unsigned)count, "opaque");
+    return LLVMBuildCall2(direct_bld, ft, f, args, (unsigned)count,
+        void_return ? "" : "opaque");
+}
+
+static LLVMValueRef direct_opaque_call(const char *name, LLVMValueRef *args,
+    int count)
+{
+    return direct_opaque_call_ex(name, args, count, FALSE);
 }
 
 extern llvm_direct_value llvm_direct_division(int operator_number,
@@ -1367,6 +1375,44 @@ extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
     for (i = 0; i < count; i++)
         args[2 + i] = arguments[i];
     return direct_opaque_call("i6.call.s", args, count + 2);
+}
+
+/* A Glulx opcode with no native IR form, emitted as a typed opaque call
+   whose centralized effect grading pins its ordering. Store-form opcodes
+   return the stored value; void opcodes return a non-NULL sentinel so
+   callers can distinguish success from rejection. */
+extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
+    llvm_direct_value *arguments, int count)
+{
+    char name[64];
+    LLVMValueRef args[16], result;
+    int32 opnum;
+    int flags, n_src, i;
+    if (!direct_can_emit()) return NULL;
+    opnum = glulx_opcode_by_name(opcode);
+    if (opnum < 0) {
+        llvm_direct_reject("unknown direct opcode");
+        return NULL;
+    }
+    flags = glulx_opcode_flags(opnum);
+    if ((flags & (OPFLAG_STORE2 | OPFLAG_BRANCH | OPFLAG_RETURNS))) {
+        llvm_direct_reject("unsupported direct opcode shape");
+        return NULL;
+    }
+    n_src = glulx_opcode_operand_count(opnum)
+        - ((flags & OPFLAG_STORE) ? 1 : 0);
+    if (count != n_src || count > 16) {
+        llvm_direct_reject("direct opcode arity mismatch");
+        return NULL;
+    }
+    for (i = 0; i < count; i++) {
+        if (!arguments[i]) return NULL;
+        args[i] = arguments[i];
+    }
+    sprintf(name, "i6.%.32s", opcode);
+    result = direct_opaque_call_ex(name, args, count,
+        !(flags & OPFLAG_STORE));
+    return (flags & OPFLAG_STORE) ? result : (llvm_direct_value)direct_fn;
 }
 
 extern llvm_direct_value llvm_direct_store_local_value(int destination,

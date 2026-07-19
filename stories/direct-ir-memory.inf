@@ -1,0 +1,96 @@
+Constant Story "Direct IR Memory";
+Global Track = 0;
+Attribute light;
+Array Words --> 10;
+Array Bytes -> 12;
+Object House "house"
+  with descr 7,
+       weight 40,
+       run [ x; return x + 60; ];
+Object Room "room" has light;
+
+[ Mem_Note x; Track = Track * 10 + x; return x; ];
+
+[ Mem_WordRead i; return Words-->i; ];
+
+[ Mem_WordWrite i v; Words-->i = v; return Words-->i; ];
+
+[ Mem_ByteRW i v; Bytes->i = v; return Bytes->i + (Bytes->i = 9); ];
+
+[ Mem_ArrInc i;
+    Words-->i = 5;
+    (Words-->i)++;
+    return Words-->i + --(Words-->i);
+];
+
+[ Mem_Order; Track = 3; return (Words-->Mem_Note(1)) + Track; ];
+
+[ Mem_Computed a i; return (a + 4)-->i; ];
+
+[ Mem_Has o; if (o has light) return 1; return 2; ];
+
+[ Mem_Hasnt o; return o hasnt light; ];
+
+[ Mem_In o p; return o in p; ];
+
+[ Mem_Notin o p; return o notin p; ];
+
+[ Mem_Ofclass o; return o ofclass Object; ];
+
+[ Mem_Provides o; return o provides descr; ];
+
+[ Mem_PropRead o; return o.descr; ];
+
+[ Mem_PropWrite o v; o.weight = v; return o.weight; ];
+
+[ Mem_PropInc o; o.weight = 5; return (o.weight++) * 10 + o.weight; ];
+
+[ Mem_PropAddr o; return o.&descr ~= 0; ];
+
+[ Mem_PropLen o; return o.#descr; ];
+
+[ Mem_PropCall o v; return o.run(v); ];
+
+[ Mem_Parent o; return parent(o); ];
+
+[ Mem_Child o; return child(o); ];
+
+[ Mem_Sibling o; return sibling(o); ];
+
+[ Mem_Random; random(-7); return random(1); ];
+
+[ Mem_RandomVar x; random(0 - x); return random(x - x + 1); ];
+
+[ Main w;
+    @setiosys 2 0;
+    @copy 0 sp; @copy 3 sp; @copy 0 sp; @copy 0 sp; @copy 0 sp;
+    @glk $0023 5 w;
+    @copy w sp;
+    @glk $002F 1 sp;
+    move House to Room;
+    print Mem_WordRead(3), " ",
+        Mem_WordWrite(2, 44), " ",
+        Mem_ByteRW(5, 8), " ",
+        Mem_ArrInc(1), " ",
+        Mem_Order(), " ", Track, " ",
+        Mem_WordRead(12), " ",
+        Mem_WordWrite(10, 6), " ",
+        Mem_Computed(Words, 2), " ",
+        Mem_Has(Room), " ", Mem_Has(House), " ",
+        Mem_Hasnt(House), " ",
+        Mem_In(House, Room), " ", Mem_In(Room, House), " ",
+        Mem_Notin(Room, House), " ",
+        Mem_Ofclass(House), " ",
+        Mem_Provides(House), " ",
+        Mem_PropRead(House), " ",
+        Mem_PropWrite(House, 99), " ",
+        Mem_PropInc(House), " ",
+        Mem_PropAddr(House), " ",
+        Mem_PropLen(House), " ",
+        Mem_PropCall(House, 5), " ",
+        Mem_Parent(House), " ",
+        Mem_Child(Room), " ",
+        Mem_Sibling(House), " ",
+        Mem_Random(), " ",
+        Mem_RandomVar(4), "^done.^";
+];
