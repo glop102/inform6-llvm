@@ -42,6 +42,7 @@ The project is successful when:
 - [x] Phase 2: generate straight-line expressions directly.
 - [x] Phase 3: generate structured control flow directly.
 - [x] Phase 4: add calls, memory operations, VM effects, and inline assembly.
+- [ ] Phase 4.1: close the library-code dynamic gap against upstream.
 - [ ] Phase 5: make direct IR the default Glulx path.
 - [ ] Phase 6: remove the lifter and shadow assembly emission.
 
@@ -433,6 +434,51 @@ Exit gate:
   compiler warning and compliance failure set remain guarded.
 - Debug-file output, traced routines, and Infix have explicit direct or classic
   behavior with focused tests.
+
+### Phase 4.1: Close The Library-Code Dynamic Gap
+
+Phase 4's corpus gate measured what the transcript-only cloak test had
+hidden: on a full library game both LLVM paths run more dynamic Glulx
+instructions than upstream (upstream 164,995; direct 175,651, +6.5%;
+lifted 179,729, +8.9%). Fallback routines replay classic code, so the
+gap comes entirely from lowering shapes, not from coverage. The known
+cost items are documented under "Instruction-Count Findings" in
+`REVIEW.md`: materialized comparisons and selects, select-to-store not
+folding, phi edge copies, and related boolean-value shapes that library
+dispatch code hits constantly.
+
+This phase spends bounded effort closing that gap before the lifter is
+removed:
+
+- Collect per-routine static deltas and opcode histograms for cloak's
+  direct routines against classic, and rank the hot shapes.
+- Attack the documented lowering costs generically: fold selects into
+  their stores and returns, emit boolean values through branch forms
+  when the consumer is a store or return, and coalesce phi edge copies,
+  each guarded by focused fixtures.
+- Where a value-form boolean exists only because direct generation joins
+  paths that classic keeps as branches (strict guards, `has`/`in`
+  results), prefer condition-context generation when the consumer
+  branches — only where the transformation is generic and pathwise
+  non-worsening.
+- Re-measure cloak, Life, and the focused optimization fixture after
+  each change; lower the test-owned cloak ceiling as it improves.
+  Improvements land in the shared lowerer, so the lifted path benefits
+  while it still exists.
+
+Exit gate:
+
+- The cloak direct dynamic count is at or below upstream, or the
+  remaining gap is explained by a documented target-cost rationale with
+  its ceiling pinned in the corpus test.
+
+This gate is deliberately softer than the others. Direct generation
+already beats the lifted path on every measured corpus point, so the gap
+is not evidence against the migration, and maintaining two IR generation
+schemes indefinitely is excessive ongoing cost. If the gap resists
+closing after the documented findings are addressed, record the outcome
+and the accepted ceiling in `REVIEW.md` and proceed to Phase 5 rather
+than holding the lifter's removal hostage to parity.
 
 ### Phase 5: Make Direct IR The Default Glulx Path
 
