@@ -1049,6 +1049,9 @@ int llvm_event_count;
 
 int llvm_capturing;         /* capturing the current routine's code          */
 static int llvm_replaying;  /* replaying the buffer through the encoder      */
+static int llvm_direct_started;
+static int llvm_direct_errors;
+static int llvm_direct_compiler_errors;
 
 /* Opcode metadata accessors for the LLVM pipeline. The OPFLAG_* bits in
    header.h are defined to match the St/Br/Rf/St2 flag bits used here. */
@@ -2277,6 +2280,13 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         llvm_capturing = TRUE;
         llvm_event_count = 0;
         llvm_header_ha_end = zcode_ha_size;
+        if (no_errors == 0 && no_compiler_errors == 0) {
+            llvm_direct_routine_begin(current_routine_name.data, no_locals,
+                embedded_flag, stackargs);
+            llvm_direct_started = TRUE;
+            llvm_direct_errors = no_errors;
+            llvm_direct_compiler_errors = no_compiler_errors;
+        }
     }
 
     return rv;
@@ -2284,6 +2294,7 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
 
 void assemble_routine_end(int embedded_flag, debug_locations locations)
 {   int32 i;
+    int fallthrough_reachable = !execution_never_reaches_here;
 
     /* No marker is made in the Z-machine's code area to indicate the        */
     /* end of a routine.  Instead, we simply assemble a return opcode if     */
@@ -2312,6 +2323,15 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
        llvm_pipeline_routine() returns TRUE if it emitted code itself;
        otherwise fall back to replaying the capture buffer verbatim
        through the classic encoder.                                          */
+
+    if (llvm_direct_started) {
+        if (no_errors != llvm_direct_errors
+            || no_compiler_errors != llvm_direct_compiler_errors)
+            llvm_direct_routine_abandon();
+        else
+            llvm_direct_routine_finish(embedded_flag, fallthrough_reachable);
+        llvm_direct_started = FALSE;
+    }
 
     if (llvm_capturing) {
         if (llvm_pipeline_routine()) {

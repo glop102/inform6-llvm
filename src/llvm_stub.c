@@ -15,6 +15,26 @@
 
 static int any_routine_captured;
 
+extern void llvm_direct_routine_begin(const char *name, int local_count,
+    int embedded_flag, int stack_arguments)
+{
+    (void)name;
+    (void)local_count;
+    (void)embedded_flag;
+    (void)stack_arguments;
+}
+
+extern void llvm_direct_routine_finish(int embedded_flag,
+    int fallthrough_reachable)
+{
+    (void)embedded_flag;
+    (void)fallthrough_reachable;
+}
+
+extern void llvm_direct_routine_abandon(void)
+{
+}
+
 extern int llvm_pipeline_routine(void)
 {
     any_routine_captured = TRUE;

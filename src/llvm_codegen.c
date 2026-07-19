@@ -964,6 +964,26 @@ static void unmerge_pointer_selects(LLVMValueRef f)
 /*   Entry points (called from asm.c)                                        */
 /* ------------------------------------------------------------------------- */
 
+extern void llvm_direct_routine_begin(const char *name, int local_count,
+    int embedded_flag, int stack_arguments)
+{
+    (void)name;
+    (void)local_count;
+    (void)embedded_flag;
+    (void)stack_arguments;
+}
+
+extern void llvm_direct_routine_finish(int embedded_flag,
+    int fallthrough_reachable)
+{
+    (void)embedded_flag;
+    (void)fallthrough_reachable;
+}
+
+extern void llvm_direct_routine_abandon(void)
+{
+}
+
 /* $LLVM=3: dump the routine's IR, tagged with the pipeline phase. */
 static void dump_module(LLVMModuleRef m, const char *phase)
 {

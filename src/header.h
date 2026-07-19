@@ -2270,6 +2270,11 @@ extern int   glulx_opcode_flags(int32 internal_number);
 extern int   glulx_opcode_operand_count(int32 internal_number);
 extern char *llvm_current_routine_name(void);
 extern int   llvm_pipeline_routine(void);
+extern void  llvm_direct_routine_begin(const char *name, int local_count,
+                 int embedded_flag, int stack_arguments);
+extern void  llvm_direct_routine_finish(int embedded_flag,
+                 int fallthrough_reachable);
+extern void  llvm_direct_routine_abandon(void);
 extern void  llvm_codegen_free(void);
 extern void  llvm_buffer_reset(void);
 extern void  llvm_buffer_append_instruction(const assembly_instruction *a);
