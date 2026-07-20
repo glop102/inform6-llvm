@@ -539,8 +539,12 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
 
         if ((token_type == SEP_TT)
             && (token_value == CLOSE_SQUARE_SEP))
-        {   if (switch_clause_made && (!default_clause_made))
+        {   if (switch_clause_made && (!default_clause_made)) {
+                llvm_direct_bind_label(switch_label);
                 assemble_label_no(switch_label);
+            }
+            if (switch_clause_made)
+                llvm_direct_switch_end();
             directives.enabled = TRUE;
             sequence_point_follows = TRUE;
             get_next_token();
@@ -552,8 +556,7 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
         }
 
         if ((token_type == STATEMENT_TT) && (token_value == SDEFAULT_CODE))
-        {   llvm_direct_reject("top-level switch default");
-            if (default_clause_made)
+        {   if (default_clause_made)
                 error("Multiple 'default' clauses defined in same 'switch'");
             default_clause_made = TRUE;
 
@@ -562,10 +565,13 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
                 {   sequence_point_follows = FALSE;
                     if (!glulx_mode)
                         assemblez_0((embedded_flag)?rfalse_zc:rtrue_zc);
-                    else
-                        assembleg_1(return_gc, 
+                    else {
+                        llvm_direct_return_constant(embedded_flag ? 0 : 1);
+                        assembleg_1(return_gc,
                             ((embedded_flag)?zero_operand:one_operand));
+                    }
                 }
+                llvm_direct_bind_label(switch_label);
                 assemble_label_no(switch_label);
             }
             switch_clause_made = TRUE;
@@ -589,7 +595,7 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
         {   get_next_token();
             if (switch_sign() > 0)
             {   assembly_operand AO;
-                llvm_direct_reject("top-level switch case");
+                int first_switch_clause = !switch_clause_made;
                 if (default_clause_made)
                     error("'default' must be the last 'switch' case");
 
@@ -598,10 +604,13 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
                     {   sequence_point_follows = FALSE;
                         if (!glulx_mode)
                             assemblez_0((embedded_flag)?rfalse_zc:rtrue_zc);
-                        else
-                            assembleg_1(return_gc, 
+                        else {
+                            llvm_direct_return_constant(embedded_flag ? 0 : 1);
+                            assembleg_1(return_gc,
                                 ((embedded_flag)?zero_operand:one_operand));
+                        }
                     }
+                    llvm_direct_bind_label(switch_label);
                     assemble_label_no(switch_label);
                 }
 
@@ -614,6 +623,8 @@ extern int32 parse_routine(char *source, int embedded_flag, char *name,
                 }
                 else {
                     INITAOTV(&AO, GLOBALVAR_OT, MAX_LOCAL_VARIABLES+6); /* sw__var */
+                    if (first_switch_clause)
+                        llvm_direct_switch_begin(AO);
                 }
                 parse_switch_spec(AO, switch_label, TRUE);
 

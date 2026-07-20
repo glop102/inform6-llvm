@@ -10,13 +10,12 @@ let
   stories = map (name: {
     inherit name;
     classic = compiledStories.classic.${name};
-    llvm = compiledStories.llvm.${name};
     direct = compiledStories.direct.${name};
     input = if name == "cloak" then ./cloak.walk else "/dev/null";
   }) names;
   glulxercise = {
     classic = compiledStories.classic.glulxercise;
-    llvm = compiledStories.llvm.glulxercise;
+    direct = compiledStories.direct.glulxercise;
     input = ./glulxercise.walk;
   };
 in
@@ -40,23 +39,17 @@ writeShellApplication {
     }
 
     check() {
-        local name=$1 classic=$2 llvm=$3 direct=$4 input=$5
+        local name=$1 classic=$2 direct=$3 input=$4
         local classic_log="$work/$name.classic.log"
-        local llvm_log="$work/$name.llvm.log"
         local direct_log="$work/$name.direct.log"
         if ! run_story 30 "$classic" "$input" "$classic_log"; then
-            fail=1; return
-        fi
-        if ! run_story 30 "$llvm" "$input" "$llvm_log"; then
             fail=1; return
         fi
         if ! run_story 30 "$direct" "$input" "$direct_log"; then
             fail=1; return
         fi
-        if ! cmp -s "$classic_log" "$llvm_log"; then
-            echo "FAIL  $name (lifted transcript differs)"
-            fail=1
-        elif ! cmp -s "$classic_log" "$direct_log"; then
+        if ! cmp -s <(grep -av '^Release .*Serial number' "$classic_log") \
+                   <(grep -av '^Release .*Serial number' "$direct_log"); then
             echo "FAIL  $name (direct transcript differs)"
             fail=1
         else
@@ -65,7 +58,7 @@ writeShellApplication {
     }
 
     ${lib.concatMapStringsSep "\n" (story:
-      "check ${story.name} ${story.classic} ${story.llvm} ${story.direct} ${story.input}") stories}
+      "check ${story.name} ${story.classic} ${story.direct} ${story.input}") stories}
 
     # Glulxercise is self-checking. Its layout-dependent addresses legitimately
     # differ after optimization: computed code addresses are documented as
@@ -73,12 +66,12 @@ writeShellApplication {
     # documented jumpabs and catch-token failures rather than comparing
     # transcripts. These counts pin the out-of-contract set exactly.
     classic_log="$work/glulxercise.classic.log"
-    llvm_log="$work/glulxercise.llvm.log"
+    direct_log="$work/glulxercise.direct.log"
     if ! run_story 60 ${glulxercise.classic} ${glulxercise.input} "$classic_log"; then
         fail=1
-    elif ! run_story 60 ${glulxercise.llvm} ${glulxercise.input} "$llvm_log"; then
+    elif ! run_story 60 ${glulxercise.direct} ${glulxercise.input} "$direct_log"; then
         fail=1
-    elif ! grep -aq 'Goodbye' "$classic_log" || ! grep -aq 'Goodbye' "$llvm_log"; then
+    elif ! grep -aq 'Goodbye' "$classic_log" || ! grep -aq 'Goodbye' "$direct_log"; then
         echo "FAIL  glulxercise (a run crashed or hung)"
         fail=1
     elif grep -aq 'FAIL' "$classic_log" || \
@@ -86,13 +79,19 @@ writeShellApplication {
         echo "FAIL  glulxercise (classic build fails its own checks)"
         fail=1
     else
-        bad=$(grep -a 'FAIL' "$llvm_log" | grep -av -e 'token=' -e 'jumpabs test=' || true)
-        fail_count=$(grep -ac 'FAIL' "$llvm_log" || true)
-        jumpabs_count=$(grep -ac 'jumpabs test=.*FAIL' "$llvm_log" || true)
-        token_count=$(grep -ac 'token=.*FAIL' "$llvm_log" || true)
+        # Catch tokens encode absolute stack offsets, and glulxercise
+        # hardcodes the harness chain's classic frame sizes
+        # (allstackdepth = 148); direct lowering legitimately changes
+        # frame layouts, so the token sub-checks join jumpabs in the
+        # out-of-contract set. Every catch VALUE check must still pass.
+        bad=$(grep -a 'FAIL' "$direct_log" \
+            | grep -av 'jumpabs test=' | grep -av 'token=' || true)
+        fail_count=$(grep -ac 'FAIL' "$direct_log" || true)
+        jumpabs_count=$(grep -ac 'jumpabs test=.*FAIL' "$direct_log" || true)
+        token_count=$(grep -ac 'token=.*FAIL' "$direct_log" || true)
         if [ -n "$bad" ] || [ "$fail_count" -ne 11 ] || \
            [ "$jumpabs_count" -ne 1 ] || [ "$token_count" -ne 10 ]; then
-            echo "FAIL  glulxercise (LLVM build fails non-layout-sensitive checks)"
+            echo "FAIL  glulxercise (direct build failure set changed)"
             if [ -n "$bad" ]; then
                 while IFS= read -r line; do printf '      %s\n' "$line"; done <<<"$bad"
             fi

@@ -909,8 +909,10 @@ extern int parse_given_directive(int internal_flag)
 
             if (!glulx_mode)
                 assemblez_0(rfalse_zc);
-            else
+            else {
+                llvm_direct_return_constant(0);
                 assembleg_1(return_gc, zero_operand);
+            }
 
             /*  Inhibit "local variable unused" warnings  */
 

@@ -2269,6 +2269,8 @@ extern const char *glulx_opcode_name(int32 internal_number);
 extern int   glulx_opcode_flags(int32 internal_number);
 extern int   glulx_opcode_operand_count(int32 internal_number);
 extern char *llvm_current_routine_name(void);
+extern int   llvm_codegen_available(void);
+extern void  llvm_note_classic_routine(const char *reason);
 extern int   llvm_pipeline_routine(void);
 extern void  llvm_direct_routine_begin(const char *name, int local_count,
                  int embedded_flag, int stack_arguments);
@@ -2327,6 +2329,15 @@ extern llvm_direct_block llvm_direct_current_block(void);
 extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
                  llvm_direct_block first_block, llvm_direct_value second,
                  llvm_direct_block second_block);
+extern llvm_direct_value llvm_direct_phi_list(llvm_direct_value *values,
+                 llvm_direct_block *blocks, int count);
+extern llvm_direct_value llvm_direct_phi_empty(void);
+extern void  llvm_direct_phi_add(llvm_direct_value phi,
+                 llvm_direct_value value, llvm_direct_block block);
+extern llvm_direct_value llvm_direct_check_object_operand(
+                 llvm_direct_value obj, assembly_operand AO, int rte_number);
+extern void  llvm_direct_check_object_branch(llvm_direct_value obj,
+                 int rte_number, int label);
 extern void  llvm_direct_expression_statement(assembly_operand AO);
 extern void  llvm_direct_return_expression(assembly_operand AO);
 extern llvm_direct_value llvm_direct_quantity(assembly_operand AO);

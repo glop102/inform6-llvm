@@ -63,6 +63,11 @@ extern void compile_initial_routine(void)
 
         sequence_point_follows = FALSE;
 
+        {   llvm_direct_value main_fn =
+                llvm_direct_constant(AO.value, AO.marker, AO.symindex);
+            if (main_fn) (void)llvm_direct_call(main_fn, NULL, 0);
+            llvm_direct_return_constant(0);
+        }
         assembleg_3(call_gc, AO, zero_operand, zero_operand);
         assembleg_1(return_gc, zero_operand);
 
@@ -2375,7 +2380,8 @@ static void compile_symbol_table_routine(void)
     else {
     
         if (define_INFIX_switch == FALSE)
-        {   assembleg_1(return_gc, zero_operand);
+        {   llvm_direct_return_constant(0);
+            assembleg_1(return_gc, zero_operand);
             variables[1].usage = TRUE;
             variables[2].usage = TRUE;
             assemble_routine_end(FALSE, null_debug_locations);

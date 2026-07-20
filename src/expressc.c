@@ -3286,6 +3286,9 @@ static void direct_expression_condition(int node,
 static llvm_direct_value direct_expression_value(int node);
 static llvm_direct_value direct_checked_object_value(llvm_direct_value obj,
     const assembly_operand *leaf, int rte_number, int allow_classes);
+static int direct_attribute_needs_branches(int node);
+static llvm_direct_value direct_attribute_test(int node,
+    llvm_direct_block true_block, llvm_direct_block false_block);
 
 #define DIRECT_CALL_CHILDREN 14
 
@@ -3471,6 +3474,49 @@ static llvm_direct_value direct_function_call(int node)
             args[0] = values[0];
             args[1] = llvm_direct_constant(field, 0, 0);
             return llvm_direct_glulx_op("aload", args, 2);
+        }
+    case CHILDREN_SYSF:
+        if (count != 1) {
+            llvm_direct_reject("invalid object-tree call");
+            return NULL;
+        }
+        /* Count the children by walking the sibling chain, as classic's
+           inline loop does. */
+        {   llvm_direct_value args[2], entry_child, counter, cursor;
+            llvm_direct_value bumped, sibling;
+            llvm_direct_block entry_from, head, body, body_from, done;
+            if (!direct_evaluate_children(nodes, values, 1)) return NULL;
+            if (runtime_error_checking_switch && !veneer_mode)
+                values[0] = direct_checked_object_value(values[0],
+                    ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL,
+                    CHILDREN_RTE, FALSE);
+            args[0] = values[0];
+            args[1] = llvm_direct_constant(GOBJFIELD_CHILD(), 0, 0);
+            entry_child = llvm_direct_glulx_op("aload", args, 2);
+            entry_from = llvm_direct_current_block();
+            head = llvm_direct_new_block();
+            body = llvm_direct_new_block();
+            done = llvm_direct_new_block();
+            llvm_direct_jump_block(head);
+            llvm_direct_bind_block(head);
+            counter = llvm_direct_phi_empty();
+            cursor = llvm_direct_phi_empty();
+            llvm_direct_phi_add(counter, llvm_direct_constant(0, 0, 0),
+                entry_from);
+            llvm_direct_phi_add(cursor, entry_child, entry_from);
+            llvm_direct_branch(cursor, body, done);
+            llvm_direct_bind_block(body);
+            bumped = llvm_direct_binary(PLUS_OP, counter,
+                llvm_direct_constant(1, 0, 0));
+            args[0] = cursor;
+            args[1] = llvm_direct_constant(GOBJFIELD_SIBLING(), 0, 0);
+            sibling = llvm_direct_glulx_op("aload", args, 2);
+            body_from = llvm_direct_current_block();
+            llvm_direct_jump_block(head);
+            llvm_direct_phi_add(counter, bumped, body_from);
+            llvm_direct_phi_add(cursor, sibling, body_from);
+            llvm_direct_bind_block(done);
+            return counter;
         }
     default:
         llvm_direct_reject("unsupported system function");
@@ -3729,6 +3775,192 @@ static llvm_direct_value direct_checked_object_value(llvm_direct_value obj,
     llvm_direct_jump_block(join);
     llvm_direct_bind_block(join);
     return llvm_direct_phi(checked, passed_from, substitute, failed_from);
+}
+
+/* Statement-level strict guards (objectloop).  The quantity form mirrors
+   check_nonzero_at_runtime(AO, -1, rte): a failed check substitutes the
+   childless "Object" class-object.  AO is the parse-tree operand the
+   value came from, so provably valid constants skip the guard exactly
+   as classic does. */
+extern llvm_direct_value llvm_direct_check_object_operand(
+    llvm_direct_value obj, assembly_operand AO, int rte_number)
+{
+    if (!llvm_direct_can_generate()) return obj;
+    return direct_checked_object_value(obj,
+        AO.type == EXPRESSION_OT ? NULL : &AO, rte_number, FALSE);
+}
+
+/* The branch form mirrors check_nonzero_at_runtime(AO, label, rte):
+   report the error, then jump to the label. */
+extern void llvm_direct_check_object_branch(llvm_direct_value obj,
+    int rte_number, int label)
+{
+    llvm_direct_block fail_block, failed_from;
+    if (!llvm_direct_can_generate() || !obj) return;
+    fail_block = llvm_direct_source_block(label);
+    if (!fail_block) return;
+    (void)direct_check_object(obj, rte_number, FALSE, fail_block,
+        &failed_from);
+}
+
+/* Is this HAS/HASNT child a compile-time attribute constant? */
+static int direct_attr_constant(int node)
+{
+    return ET[node].down == -1
+        && direct_constant_operand(ET[node].value)
+        && ET[node].value.marker == 0;
+}
+
+/* Does this HAS/HASNT node need the branchy strict form?  Without the
+   strict guards every alternative is a pure aloadbit, so the flat
+   combined form in direct_expression_value is exact. */
+static int direct_attribute_needs_branches(int node)
+{
+    int first = ET[node].down, child;
+    if (!runtime_error_checking_switch || veneer_mode) return FALSE;
+    if (first == -1) return TRUE;
+    if (direct_object_check_needed(
+        ET[first].down == -1 ? &ET[first].value : NULL)) return TRUE;
+    for (child = ET[first].right; child != -1; child = ET[child].right)
+        if (!direct_attr_constant(child)) return TRUE;
+    return FALSE;
+}
+
+/* The branchy strict form of "x has a or b ..." / "x hasnt ...".  In
+   condition form (true_block given) branches are emitted and NULL is
+   returned; in value form (both blocks NULL) the 0/1 result is returned.
+
+   Classic tests each alternative in turn and re-runs the strict guards
+   every time, so a bad operand prints one error per alternative; a
+   failed guard abandons only the current alternative.  When the LAST
+   alternative's guard fails, classic's branch shape decides the whole
+   condition: an invalid object yields the chain's default outcome
+   (false for has, true for hasnt), while an invalid attribute number
+   falls through the final branch - into the true continuation in
+   condition context, but reading as false in value context. */
+static llvm_direct_value direct_attribute_test(int node,
+    llvm_direct_block true_block, llvm_direct_block false_block)
+{
+    int nodes[DIRECT_CALL_CHILDREN];
+    llvm_direct_value values[DIRECT_CALL_CHILDREN];
+    llvm_direct_value phi_values[3 * DIRECT_CALL_CHILDREN];
+    llvm_direct_block phi_blocks[3 * DIRECT_CALL_CHILDREN];
+    int is_hasnt = ET[node].operator_number == HASNT_OP;
+    int cond_form = (true_block != NULL);
+    int count, i, n_phi = 0, need_check;
+    llvm_direct_block join = NULL;
+
+    count = direct_collect_children(ET[node].down, nodes,
+        DIRECT_CALL_CHILDREN);
+    if (count < 2) {
+        llvm_direct_reject("invalid attribute test");
+        return NULL;
+    }
+    if (!direct_evaluate_children(nodes, values, count)) return NULL;
+    need_check = direct_object_check_needed(
+        ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL);
+    if (!cond_form)
+        join = llvm_direct_new_block();
+
+    for (i = 1; i < count; i++) {
+        int last = (i == count - 1);
+        int attr_const = direct_attr_constant(nodes[i]);
+        llvm_direct_value attribute, bit, r, args[2];
+        llvm_direct_block next = last ? NULL : llvm_direct_new_block();
+        llvm_direct_block test_from;
+
+        if (need_check) {
+            llvm_direct_block fail_to, failed_from;
+            if (!last)
+                fail_to = next;
+            else if (cond_form)
+                fail_to = is_hasnt ? true_block : false_block;
+            else
+                fail_to = join;
+            (void)direct_check_object(values[0], HAS_RTE, TRUE,
+                fail_to, &failed_from);
+            if (last && !cond_form) {
+                phi_values[n_phi] = llvm_direct_constant(
+                    is_hasnt ? 1 : 0, 0, 0);
+                phi_blocks[n_phi++] = failed_from;
+            }
+        }
+        if (!attr_const) {
+            /* A failed range check reports INVALIDATTR, then abandons
+               this alternative just as the object guard does - except
+               after the last alternative, where classic falls through
+               the final branch instead. */
+            llvm_direct_block attr_fail = llvm_direct_new_block();
+            llvm_direct_block attr_next = llvm_direct_new_block();
+            llvm_direct_block attr_ok = llvm_direct_new_block();
+            llvm_direct_block fail_to, failed_from;
+            llvm_direct_value eargs[3], comparison;
+            if (!last)
+                fail_to = next;
+            else if (cond_form)
+                fail_to = true_block;
+            else
+                fail_to = join;
+            comparison = llvm_direct_compare(LESS_OP, values[i],
+                llvm_direct_constant(0, 0, 0));
+            llvm_direct_branch(comparison, attr_fail, attr_next);
+            llvm_direct_bind_block(attr_next);
+            comparison = llvm_direct_compare(LESS_OP, values[i],
+                llvm_direct_constant(NUM_ATTR_BYTES * 8, 0, 0));
+            llvm_direct_branch(comparison, attr_ok, attr_fail);
+            llvm_direct_bind_block(attr_fail);
+            eargs[0] = llvm_direct_constant(19, 0, 0); /* INVALIDATTR */
+            eargs[1] = values[0];
+            eargs[2] = values[i];
+            (void)direct_veneer_call(RT__Err_VR, eargs, 3);
+            failed_from = llvm_direct_current_block();
+            if (last && !cond_form) {
+                phi_values[n_phi] = llvm_direct_constant(0, 0, 0);
+                phi_blocks[n_phi++] = failed_from;
+            }
+            llvm_direct_jump_block(fail_to);
+            llvm_direct_bind_block(attr_ok);
+        }
+        if (attr_const)
+            attribute = llvm_direct_constant(
+                ET[nodes[i]].value.value + 8, 0, 0);
+        else
+            attribute = llvm_direct_binary(PLUS_OP, values[i],
+                llvm_direct_constant(8, 0, 0));
+        args[0] = values[0];
+        args[1] = attribute;
+        bit = llvm_direct_glulx_op("aloadbit", args, 2);
+        r = llvm_direct_compare(is_hasnt ? CONDEQUALS_OP : NOTEQUAL_OP,
+            bit, llvm_direct_constant(0, 0, 0));
+        test_from = llvm_direct_current_block();
+        if (last) {
+            if (cond_form)
+                llvm_direct_branch(r, true_block, false_block);
+            else {
+                llvm_direct_jump_block(join);
+                phi_values[n_phi] = r;
+                phi_blocks[n_phi++] = test_from;
+            }
+        }
+        else {
+            /* A decided alternative short-circuits: set attributes end
+               a has-chain true, clear ones end a hasnt-chain false. */
+            if (cond_form)
+                llvm_direct_branch(r, is_hasnt ? next : true_block,
+                    is_hasnt ? false_block : next);
+            else {
+                llvm_direct_branch(r, is_hasnt ? next : join,
+                    is_hasnt ? join : next);
+                phi_values[n_phi] = r;
+                phi_blocks[n_phi++] = test_from;
+            }
+            llvm_direct_bind_block(next);
+        }
+    }
+    if (cond_form)
+        return NULL;
+    llvm_direct_bind_block(join);
+    return llvm_direct_phi_list(phi_values, phi_blocks, n_phi);
 }
 
 #define DIRECT_SWITCH_DEPTH 32
@@ -4004,75 +4236,44 @@ static llvm_direct_value direct_expression_value(int node)
 
     case HAS_OP:
     case HASNT_OP:
-        {   int nodes[2];
-            llvm_direct_value values[2], attribute, bit, args[2], result;
-            int strict = runtime_error_checking_switch && !veneer_mode;
-            int attr_constant, need_check;
-            llvm_direct_block false_block = NULL, join = NULL, result_from;
+        {   int nodes[DIRECT_CALL_CHILDREN];
+            llvm_direct_value values[DIRECT_CALL_CHILDREN];
+            llvm_direct_value attribute, bit, r, result, args[2];
+            int is_hasnt = ET[node].operator_number == HASNT_OP;
+            int count, i;
 
-            if (direct_collect_children(first, nodes, 2) != 2) {
+            if (direct_attribute_needs_branches(node))
+                return direct_attribute_test(node, NULL, NULL);
+
+            /* No strict guards are needed, so every alternative is a
+               pure aloadbit: evaluate them all and combine, like the
+               comparison or-lists above. */
+            count = direct_collect_children(first, nodes,
+                DIRECT_CALL_CHILDREN);
+            if (count < 2) {
                 llvm_direct_reject("invalid attribute test");
                 return NULL;
             }
-            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
-            attr_constant = ET[nodes[1]].down == -1
-                && direct_constant_operand(ET[nodes[1]].value)
-                && ET[nodes[1]].value.marker == 0;
-            need_check = strict && direct_object_check_needed(
-                ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL);
-            if (need_check || (strict && !attr_constant)) {
-                false_block = llvm_direct_new_block();
-                join = llvm_direct_new_block();
+            if (!direct_evaluate_children(nodes, values, count))
+                return NULL;
+            result = NULL;
+            for (i = 1; i < count; i++) {
+                if (direct_attr_constant(nodes[i]))
+                    attribute = llvm_direct_constant(
+                        ET[nodes[i]].value.value + 8, 0, 0);
+                else
+                    attribute = llvm_direct_binary(PLUS_OP, values[i],
+                        llvm_direct_constant(8, 0, 0));
+                args[0] = values[0];
+                args[1] = attribute;
+                bit = llvm_direct_glulx_op("aloadbit", args, 2);
+                r = llvm_direct_compare(
+                    is_hasnt ? CONDEQUALS_OP : NOTEQUAL_OP,
+                    bit, llvm_direct_constant(0, 0, 0));
+                result = result == NULL ? r : llvm_direct_binary(
+                    is_hasnt ? ARTAND_OP : ARTOR_OP, result, r);
             }
-            if (need_check) {
-                llvm_direct_block failed_from;
-                values[0] = direct_check_object(values[0], HAS_RTE,
-                    TRUE, false_block, &failed_from);
-            }
-            if (strict && !attr_constant) {
-                /* A failed attribute range check reports INVALIDATTR
-                   and makes the condition false, exactly as classic's
-                   branch to the post-condition label does. */
-                llvm_direct_block attr_fail = llvm_direct_new_block();
-                llvm_direct_block attr_next = llvm_direct_new_block();
-                llvm_direct_block attr_ok = llvm_direct_new_block();
-                llvm_direct_value eargs[3], comparison;
-                comparison = llvm_direct_compare(LESS_OP, values[1],
-                    llvm_direct_constant(0, 0, 0));
-                llvm_direct_branch(comparison, attr_fail, attr_next);
-                llvm_direct_bind_block(attr_next);
-                comparison = llvm_direct_compare(LESS_OP, values[1],
-                    llvm_direct_constant(NUM_ATTR_BYTES * 8, 0, 0));
-                llvm_direct_branch(comparison, attr_ok, attr_fail);
-                llvm_direct_bind_block(attr_fail);
-                eargs[0] = llvm_direct_constant(19, 0, 0); /* INVALIDATTR */
-                eargs[1] = values[0];
-                eargs[2] = values[1];
-                (void)direct_veneer_call(RT__Err_VR, eargs, 3);
-                llvm_direct_jump_block(false_block);
-                llvm_direct_bind_block(attr_ok);
-            }
-            if (attr_constant)
-                attribute = llvm_direct_constant(
-                    ET[nodes[1]].value.value + 8, 0, 0);
-            else
-                attribute = llvm_direct_binary(PLUS_OP, values[1],
-                    llvm_direct_constant(8, 0, 0));
-            args[0] = values[0];
-            args[1] = attribute;
-            bit = llvm_direct_glulx_op("aloadbit", args, 2);
-            result = llvm_direct_compare(
-                ET[node].operator_number == HAS_OP
-                    ? NOTEQUAL_OP : CONDEQUALS_OP,
-                bit, llvm_direct_constant(0, 0, 0));
-            if (!join) return result;
-            result_from = llvm_direct_current_block();
-            llvm_direct_jump_block(join);
-            llvm_direct_bind_block(false_block);
-            llvm_direct_jump_block(join);
-            llvm_direct_bind_block(join);
-            return llvm_direct_phi(result, result_from,
-                llvm_direct_constant(0, 0, 0), false_block);
+            return result;
         }
 
     case IN_OP:
@@ -4238,6 +4439,12 @@ static void direct_expression_condition(int node, llvm_direct_block true_block,
             direct_expression_condition(first, true_block, next);
         llvm_direct_bind_block(next);
         direct_expression_condition(second, true_block, false_block);
+        return;
+    }
+    if ((ET[node].operator_number == HAS_OP
+        || ET[node].operator_number == HASNT_OP)
+        && direct_attribute_needs_branches(node)) {
+        (void)direct_attribute_test(node, true_block, false_block);
         return;
     }
     value = direct_expression_value(node);

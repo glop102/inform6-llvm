@@ -3,9 +3,9 @@
 /*                                                                           */
 /*   Part of inform6-llvm. Not part of the upstream Inform 6 compiler.       */
 /*                                                                           */
-/*   The lifter (llvm_codegen.c) turns a captured routine into an IR         */
-/*   function; after LLVM's passes have run, this module turns the IR back   */
-/*   into Glulx instructions by rewriting the capture buffer in asm.c,       */
+/*   Direct code generation (llvm_codegen.c) builds each routine as IR;       */
+/*   after LLVM's passes, this module turns the IR back into Glulx            */
+/*   instructions by filling the output buffer in asm.c,                     */
 /*   which is then replayed through the classic encoder (so branch           */
 /*   shortening and backpatch markers are handled by existing machinery).    */
 /*                                                                           */
@@ -674,6 +674,19 @@ static void classify(LLVMValueRef in, valinfo *vi)
             if (strcmp(name, "i6.deref.store") == 0)
                 return;
 
+            if (strcmp(name, "i6.stkpush") == 0) {
+                /* A symbolic stack value spilled to the real stack. */
+                if (LLVMGetNumArgOperands(in) != 1)
+                    lfail("stkpush arg count");
+                return;
+            }
+            if (strcmp(name, "i6.stkpop") == 0) {
+                if (LLVMGetNumArgOperands(in) != 0)
+                    lfail("stkpop arg count");
+                if (LLVMGetFirstUse(in))
+                    vi->kind = VK_SLOT;
+                return;
+            }
             if (name_has_prefix(name, "i6.")) {
                 /* An opaque Glulx opcode. Validate the name and shape. */
                 char base[64];
@@ -1269,6 +1282,12 @@ static void emission_readset_core(LLVMValueRef in, readset *rs)
                     rs_pop(rs, LLVMGetOperand(in, 1));
                 return;
             }
+            if (strcmp(name, "i6.stkpush") == 0) {
+                rs_pop(rs, LLVMGetOperand(in, 0));
+                return;
+            }
+            if (strcmp(name, "i6.stkpop") == 0)
+                return;
             /* opaque i6.<opcode>[.s] call */
             {   char base[64];
                 size_t blen = strlen(name + 3);
@@ -2349,6 +2368,21 @@ static void fusion_pass(void)
                         (n_pend-j-1) * sizeof(pend[0]));
                     n_pend--;
                     break;
+                }
+            }
+
+            /* Spill traffic (stkpush/stkpop) moves the REAL stack top,
+               which the pending model cannot see: anything still fused
+               across it would be pushed above the spilled values or
+               popped in their place. Unfuse everything; a stkpop's own
+               result may then fuse below - it is already on top. */
+            if (LLVMIsACallInst(in)) {
+                const char *cname = called_fn_name(in);
+                if (cname && (strcmp(cname, "i6.stkpush") == 0
+                    || strcmp(cname, "i6.stkpop") == 0)) {
+                    for (j = 0; j < n_pend; j++)
+                        unfuse(pend[j]);
+                    n_pend = 0;
                 }
             }
 
@@ -3581,6 +3615,25 @@ static void emit_instruction(LLVMValueRef in)
                     deref_op(LLVMGetOperand(in, 0)));
                 return;
             }
+            if (strcmp(name, "i6.stkpush") == 0) {
+                gen_copy(resolve(LLVMGetOperand(in, 0)), stack_op());
+                return;
+            }
+            if (strcmp(name, "i6.stkpop") == 0) {
+                /* A stack-fused result is already on top: the consumer
+                   pops it directly and no instruction is emitted. */
+                assembly_operand pop_dst;
+                if (vi->kind == VK_STACK)
+                    return;
+                if (vi->fold_store)
+                    pop_dst = store_target_op(vi->fold_store);
+                else if (vi->kind == VK_SLOT)
+                    pop_dst = dst_op(vi);
+                else
+                    pop_dst = zero_operand;
+                gen_copy(stack_op(), pop_dst);
+                return;
+            }
             emit_opaque_call(in, vi, name);
         }
         return;
@@ -4068,7 +4121,7 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
     next_slot = n_params + 1;
 
     if (n_params != no_locals) {
-        /* The lifter defines params = locals; disagreement means a bug. */
+        /* Direct codegen defines params = locals; disagreement means a bug. */
         compiler_error("llvm_lower: param count mismatch");
         *fail_reason = "param count mismatch";
         return FALSE;

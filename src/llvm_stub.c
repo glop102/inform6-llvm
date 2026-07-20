@@ -15,6 +15,9 @@
 
 static int any_routine_captured;
 
+extern int llvm_codegen_available(void) { return FALSE; }
+extern void llvm_note_classic_routine(const char *reason) { (void)reason; }
+
 extern void llvm_direct_routine_begin(const char *name, int local_count,
     int embedded_flag, int stack_arguments)
 {
@@ -66,8 +69,6 @@ extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
 extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
     llvm_direct_value *arguments, int count)
 { (void)opcode; (void)arguments; (void)count; return NULL; }
-extern llvm_direct_value llvm_direct_quantity(assembly_operand AO)
-{ (void)AO; return NULL; }
 extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
 { (void)ai; }
 extern void llvm_direct_glulx_macro(const assembly_instruction *ai,
@@ -109,6 +110,13 @@ extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
     (void)first; (void)first_block; (void)second; (void)second_block;
     return NULL;
 }
+extern llvm_direct_value llvm_direct_phi_list(llvm_direct_value *values,
+    llvm_direct_block *blocks, int count)
+{ (void)values; (void)blocks; (void)count; return NULL; }
+extern llvm_direct_value llvm_direct_phi_empty(void) { return NULL; }
+extern void llvm_direct_phi_add(llvm_direct_value phi,
+    llvm_direct_value value, llvm_direct_block block)
+{ (void)phi; (void)value; (void)block; }
 extern int llvm_pipeline_routine(void)
 {
     any_routine_captured = TRUE;
@@ -117,10 +125,7 @@ extern int llvm_pipeline_routine(void)
 
 extern void llvm_codegen_free(void)
 {
-    /* $LLVM=1 is capture/replay by design, so only levels that promise
-       optimization deserve a note. Printed where the real pipeline prints
-       its statistics line. */
-    if (LLVM_CODEGEN >= 2 && any_routine_captured) {
+    if (LLVM_CODEGEN && any_routine_captured) {
         printf("LLVM: this compiler was built without LLVM support; "
             "all routines were compiled classically\n");
     }

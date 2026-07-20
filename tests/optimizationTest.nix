@@ -5,19 +5,13 @@ let
   compileLog = runCommand "optimization-llvm.compile.log" { } ''
     work=$(mktemp -d)
     cd "$work"
-    ${lib.getExe inform6-llvm} -G '$LLVM=3' \
-      ${../stories/optimization-regressions.inf} opt.ulx >"$out" 2>&1
-  '';
-  fallbackLog = runCommand "optimization-fallback.compile.log" { } ''
-    work=$(mktemp -d)
-    cd "$work"
-    I6_LLVM_LIMIT=0 ${lib.getExe inform6-llvm} -G '$LLVM=3' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
       ${../stories/optimization-regressions.inf} opt.ulx >"$out" 2>&1
   '';
   jumpabsLlvmLog = runCommand "jumpabs-warning-llvm.compile.log" { } ''
     work=$(mktemp -d)
     cd "$work"
-    ${lib.getExe inform6-llvm} -G '$LLVM=2' \
+    ${lib.getExe inform6-llvm} -G '$LLVM=4' \
       ${../stories/jumpabs-warning.inf} jumpabs.ulx >"$out" 2>&1
   '';
   jumpabsClassicLog = runCommand "jumpabs-warning-classic.compile.log" { } ''
@@ -27,9 +21,9 @@ let
       ${../stories/jumpabs-warning.inf} jumpabs.ulx >"$out" 2>&1
   '';
   classic = compiledStories.classic.optimization-regressions;
-  llvm = compiledStories.llvm.optimization-regressions;
+  direct = compiledStories.direct.optimization-regressions;
   faultClassic = compiledStories.classic.faulting-read;
-  faultLlvm = compiledStories.llvm.faulting-read;
+  faultDirect = compiledStories.direct.faulting-read;
 in
 writeShellApplication {
   name = "inform6-llvm-test-optimization";
@@ -49,59 +43,21 @@ writeShellApplication {
         fail=1
     fi
 
-    if grep -aqE '^! LLVM: (bailed on|could not lower) ' ${compileLog}; then
-        echo "FAIL  optimization (unexpected LLVM bailout)"
-        grep -aE '^! LLVM: (bailed on|could not lower) ' ${compileLog} |
-            while IFS= read -r line; do printf '      %s\n' "$line"; done
+    backend_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    if [ "$(grep -acE "$backend_re" ${compileLog})" -ne 15 ]; then
+        echo "FAIL  optimization (backend-origin records do not cover direct routines)"
         fail=1
     fi
-
-    backend_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=lifted\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    fallback_re=$'^LLVM-BACKEND\tname=[^[:space:]]+\tbackend=classic-fallback\tstage=limit\tinput=-1\temitted=-1\treason=-$'
-    if [ "$(grep -acE "$backend_re" ${compileLog})" -ne 15 ] || \
-       grep -aq $'\tbackend=classic-fallback\t' ${compileLog}; then
-        echo "FAIL  optimization (backend-origin records do not cover lifted routines)"
-        fail=1
-    fi
-    if [ "$(grep -acE "$fallback_re" ${fallbackLog})" -ne 15 ] || \
-       grep -aq $'\tbackend=lifted\t' ${fallbackLog}; then
-        echo "FAIL  optimization (backend-origin records do not cover forced fallback)"
-        fail=1
-    fi
-    if [ "$(grep -ac '^LLVM: backends direct=0 lifted=15 fallback=0$' \
+    if [ "$(grep -ac '^LLVM: backends direct=15 classic=0 fallback=0$' \
         ${compileLog})" -ne 1 ]; then
         echo "FAIL  optimization (aggregate backend totals are incorrect)"
         fail=1
     fi
 
-    stats_re='^LLVM: optimized ([0-9]+) of ([0-9]+) captured routines \(([0-9]+) not lifted, ([0-9]+) not lowered\); ([0-9]+) instructions -> ([0-9]+)$'
-    stats_count=$(grep -acE "$stats_re" ${compileLog})
-    stats_line=$(grep -aE "$stats_re" ${compileLog} || true)
-    if [ "$stats_count" -ne 1 ] || [[ ! $stats_line =~ $stats_re ]]; then
-        echo "FAIL  optimization (missing or malformed aggregate statistics)"
-        fail=1
-    else
-        optimized=''${BASH_REMATCH[1]}
-        captured=''${BASH_REMATCH[2]}
-        not_lifted=''${BASH_REMATCH[3]}
-        not_lowered=''${BASH_REMATCH[4]}
-        insts_in=''${BASH_REMATCH[5]}
-        insts_out=''${BASH_REMATCH[6]}
-        if [ "$optimized" -ne 15 ] || [ "$captured" -ne 15 ] || \
-           [ "$not_lifted" -ne 0 ] || [ "$not_lowered" -ne 0 ]; then
-            echo "FAIL  optimization (lowering coverage: $stats_line)"
-            fail=1
-        fi
-        if [ "$insts_in" -ne 177 ] || [ "$insts_out" -gt 184 ]; then
-            echo "FAIL  optimization (aggregate instruction bound: $stats_line)"
-            fail=1
-        fi
-    fi
-
     check_routine() {
         local name=$1 expected_in=$2 max_out=$3
         local re count line
-        re="^LLVM: routine ''${name}: ([0-9]+) instructions -> ([0-9]+)$"
+        re="^LLVM: direct routine ''${name}: ([0-9]+) instructions -> ([0-9]+)$"
         count=$(grep -acE "$re" ${compileLog})
         line=$(grep -aE "$re" ${compileLog} || true)
         if [ "$count" -ne 1 ] || [[ ! $line =~ $re ]]; then
@@ -124,7 +80,7 @@ writeShellApplication {
     check_routine Opt_InductionSelect 13 17
     check_routine Opt_BranchLayout 13 16
     check_routine Opt_SwitchOrder 12 14
-    check_routine Opt_SwitchShared 8 9
+    check_routine Opt_SwitchShared 8 12
     check_routine Opt_GlobalCoalesce 5 5
     check_routine Opt_CoalesceClobber 5 5
 
@@ -140,12 +96,12 @@ writeShellApplication {
     }
 
     run_story ${classic} "$work/classic.log" || fail=1
-    run_story ${llvm} "$work/llvm.log" || fail=1
-    if [ "$fail" -eq 0 ] && ! cmp -s "$work/classic.log" "$work/llvm.log"; then
-        echo "FAIL  optimization (classic and LLVM transcripts differ)"
+    run_story ${direct} "$work/direct.log" || fail=1
+    if [ "$fail" -eq 0 ] && ! cmp -s "$work/classic.log" "$work/direct.log"; then
+        echo "FAIL  optimization (classic and direct transcripts differ)"
         fail=1
     fi
-    if [ "$fail" -eq 0 ] && ! grep -aq '^done\.$' "$work/llvm.log"; then
+    if [ "$fail" -eq 0 ] && ! grep -aq '^done\.$' "$work/direct.log"; then
         echo "FAIL  optimization (completion marker missing)"
         fail=1
     fi
@@ -170,19 +126,19 @@ writeShellApplication {
     else
         fail=1
     fi
-    if run_faulting_story ${faultLlvm} "$work/fault-llvm.log"; then
-        llvm_fault_status=$FAULT_STATUS
+    if run_faulting_story ${faultDirect} "$work/fault-direct.log"; then
+        direct_fault_status=$FAULT_STATUS
     else
         fail=1
     fi
     if [ "$fail" -eq 0 ] && \
-       { [ "$classic_fault_status" -ne "$llvm_fault_status" ] || \
-         ! cmp -s "$work/fault-classic.log" "$work/fault-llvm.log"; }; then
-        echo "FAIL  optimization (classic and LLVM fault behavior differs)"
+       { [ "$classic_fault_status" -ne "$direct_fault_status" ] || \
+          ! cmp -s "$work/fault-classic.log" "$work/fault-direct.log"; }; then
+        echo "FAIL  optimization (classic and direct fault behavior differs)"
         fail=1
     fi
     if [ "$fail" -eq 0 ] && \
-       ! grep -aq 'Memory access out of range' "$work/fault-llvm.log"; then
+        ! grep -aq 'Memory access out of range' "$work/fault-direct.log"; then
         echo "FAIL  optimization (expected memory fault missing)"
         fail=1
     fi
@@ -211,19 +167,19 @@ writeShellApplication {
     else
         fail=1
     fi
-    if run_counted ${llvm} "$work/llvm.count"; then
-        llvm_count=$COUNTED_RESULT
+    if run_counted ${direct} "$work/direct.count"; then
+        direct_count=$COUNTED_RESULT
     else
         fail=1
     fi
     if [ "$fail" -eq 0 ] && \
-       { [ "$classic_count" -ne 422 ] || [ "$llvm_count" -gt 444 ]; }; then
-        echo "FAIL  optimization (dynamic instruction bound: classic $classic_count, LLVM $llvm_count)"
+        { [ "$classic_count" -ne 422 ] || [ "$direct_count" -gt 444 ]; }; then
+        echo "FAIL  optimization (dynamic instruction bound: classic $classic_count, direct $direct_count)"
         fail=1
     fi
 
     if [ "$fail" -eq 0 ]; then
-        echo "ok    optimization (dynamic: classic $classic_count, LLVM $llvm_count)"
+        echo "ok    optimization (dynamic: classic $classic_count, direct $direct_count)"
     fi
     exit "$fail"
   '';

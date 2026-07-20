@@ -172,9 +172,10 @@ The initial review found useful behavioral coverage but almost no
 optimization-quality regression coverage. The first test-suite work has since
 addressed the most serious harness gaps:
 
-- `tests/captureReplayTest.nix` proves that capture/replay remains byte-identical.
+- During migration, the now-deleted `tests/captureReplayTest.nix` proved that
+  capture/replay was byte-identical.
 - `tests/optimizationTest.nix` uses a real LLVM build and asserts that a
-  focused fixture lifts and lowers completely, and enforces aggregate,
+  focused fixture generates and lowers directly, and enforces aggregate,
   per-routine static, and dynamic instruction ceilings. It also compares
   classic and LLVM behavior for an unused faulting read.
 - `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
@@ -182,9 +183,7 @@ addressed the most serious harness gaps:
   conditions, short-circuit values, branches, loops, nested switches,
   break/continue edges, terminal loops, and unreachable source to lower from
   direct IR. It
-  compares behavior with upstream, checks exact direct/fallback diagnostics,
-  and verifies byte-identical shadow replay after forced builder and lowering
-  failures.
+  compares behavior with upstream and checks exact backend diagnostics.
 - `tests/zMachineTest.nix` requires byte-identical Z5 output from pinned
   upstream Inform and the fork for a focused shared-assembler fixture. It also
   extracts Z and Glulx debug sequence-point locations from fork and pinned
@@ -195,18 +194,17 @@ addressed the most serious harness gaps:
 - Interpreter and timeout statuses are checked explicitly.
 - The `glulxercise` gate asserts the exact count of known layout-sensitive
   failures rather than accepting an unlimited substring match.
-- Level 3 compiler output includes per-routine captured/emitted static counts
-  and `LLVM-BACKEND` TSV records identifying lifted output or categorized
-  classic fallback. The focused test also forces the lowering limit to zero
-  and asserts that every captured routine reports fallback.
+- `I6_LLVM_DIAGNOSTICS=1` includes per-routine input/emitted static counts and
+  `LLVM-BACKEND` TSV records identifying direct output, explicit classic
+  policy, or categorized fallback.
 - The real LLVM pipeline is not exercised by CI; the Windows build uses the
   no-LLVM stub.
 - The Z-machine baseline is intentionally focused; it does not yet run a broad
   Z-machine corpus or interpreter-level compliance suite.
 
-Direct IR (`$LLVM=4`) has been the production default since Phase 5; the
-lifter remains reachable at `$LLVM=2`/`3` as a diagnostic comparison
-until Phase 6 removes it. Phase 2 directly generates all
+Direct IR (`$LLVM=4`) has been the production default since Phase 5. Phase 6
+removed the lifter; every nonzero `$LLVM` value now selects direct generation.
+Phase 2 directly generated all
 straight-line source arithmetic, bitwise and signed comparison operators,
 comparison-to-word conversion, comma sequencing, local/global pre/post updates,
 symbolic constants, and value-producing assignments. Ordinary operands retain
@@ -441,11 +439,15 @@ dominate library dispatch code. The corpus test holds direct's ceiling;
 closing the gap to upstream is follow-on lowering work, not a Phase 4
 regression (direct is non-worse than the current production path).
 
-Glulxercise under direct IR is pinned at 124 direct / 108 fallback with an
-out-of-contract set of exactly one failure: the documented `jumpabs` case.
-The lifted path's ten catch-token failures disappear because
-`@catch`/`@throw` routines reject to classic generation — rejection is the
-current documented representation for catch tokens and throw edges.
+Glulxercise under direct IR was pinned at this point at 124 direct / 108
+fallback with an out-of-contract set of exactly one failure: the documented
+`jumpabs` case. `@catch`/`@throw` routines reject to classic generation —
+rejection is the current documented representation for catch tokens and
+throw edges. (The Phase 6 coverage work later moved the harness routines
+around those tests to direct generation, whose lowered frames differ from
+classic; glulxercise hardcodes classic frame depths, so its ten catch-token
+sub-checks rejoined the pinned out-of-contract set. Every catch *value*
+check still passes.)
 
 Compilation modes are now product policy with focused tests: debug-file
 builds (`-k`) bypass the LLVM pipeline entirely and are byte-identical to
@@ -538,10 +540,10 @@ lifted. Phase 4.1's exit gate is met on its primary arm; no accepted-gap
 rationale is needed. Interference-aware coalescing beyond the parameter
 case remains future work, but nothing measured still hangs on it.
 
-Phase 5 made direct generation the default Glulx mode: `$LLVM` now
-defaults to 4, and levels 1-3 (capture, lifter, lifter+dump) are retained
-only as explicitly selected diagnostic comparisons until Phase 6 deletes
-them. `tests/directIrTest.nix` proves a plain compile (no `$LLVM`
+Phase 5 made direct generation the default Glulx mode: `$LLVM` defaulted
+to 4, while levels 1-3 (capture, lifter, lifter+dump) remained explicitly
+selected diagnostic comparisons pending Phase 6. `tests/directIrTest.nix`
+proved a plain compile (no `$LLVM`
 setting) selects the direct backend and produces bytes identical to an
 explicit `$LLVM=4` compile. Direct build failures are now counted
 separately from lowerer failures (`LLVM: direct fallbacks build=N
@@ -562,6 +564,66 @@ fixpoint verifier hard-aborts the compiler process on library code);
 costs cloak +1,048, confirming it earns its place. The Life benchmark's
 repeated timings stay consistent with the dynamic ordering (direct
 fastest, then lifted, then classic).
+
+Phase 6 removed the assembly-to-LLVM lifter, including its symbolic stack
+reconstruction and label-entry stack inference. All nonzero `$LLVM` values now
+select direct generation; the capture/replay test and lifted corpus,
+compliance, and benchmark axes were deleted. No-LLVM and Visual Studio stub
+builds select classic Glulx generation before routine capture; a clean
+`WITH_LLVM=0` build was verified byte-identical between its default and
+explicit `$LLVM=0` output.
+
+The first shadow-removal coverage slice made in-routine directives and action
+statements direct, added direct top-level routine switch clauses, and routes
+C0 stack-argument routines directly to an explicit classic policy without
+capturing shadow assembly. Cloak moved from the Phase 5 baseline of 162,001 to
+161,118 dynamic dispatches while preserving its normalized transcript. Its
+diagnostic split at that point was 344 direct routines, 132 policy-classic C0
+routines, and 72 genuine fallbacks (71 build, one lower).
+
+The second coverage slice eliminated all 72 remaining cloak fallbacks:
+
+- Routine finish now seals a trailing unterminated-unreachable block with
+  `unreachable` instead of rejecting. The two benign shapes ending that way
+  (a compiler label bound where both branch arms returned, and a
+  continuation only reachable through front-end-folded constant branches)
+  carry no classic code, so sealing is exact. A single empty entry block
+  still rejects, guarding against raw-assembled bodies the builder never
+  saw; the three raw emitters (the `Stub` directive, `Main__`, and the
+  non-INFIX `Symb__Tab`) now announce their bodies through direct hooks.
+- `has`/`hasnt` supports `or`-alternative lists. Without strict guards the
+  alternatives are pure `aloadbit`s combined flat (OR for `has`, AND for
+  `hasnt`, matching classic's negated-`or` transform); with guards a
+  branchy chain runs every guard per alternative, exactly reproducing
+  classic's repeated runtime errors and its error-path truth values —
+  which also fixed a latent single-attribute divergence (`hasnt` of an
+  invalid object is TRUE, and a bad attribute number in condition context
+  falls into the true branch; both previously came out false).
+- `objectloop` (all four forms, with the strict-mode OBJECTLOOP/CHILD/
+  OBJECTLOOP2/OBJECTLOOP_BROKEN guards), `spaces`, `inversion`, and the
+  `children()` system function generate directly, using new phi-append
+  and N-ary phi builder APIs for their loops.
+- Inline assembly's symbolic stack now spills to the real VM stack at
+  control-flow points (real pushes at the same source position classic
+  pushed) instead of rejecting; sp reads past the symbolic window pop the
+  real stack via `i6.stkpush`/`i6.stkpop` opaque calls. The lowerer's
+  operand-fusion pass treats those calls as barriers (pending fused values
+  unfuse to slots), a stack-fused `stkpop` result elides entirely, and a
+  `stkpop` folded into a global store honors `fold_store`. This lifted the
+  WriteListR-style save/restore-around-call idiom into direct coverage.
+- The pointer-select unmerge pass generalized into a tag-based
+  de-pointerizer: any select/phi network over `i6.g` global pointers (the
+  optimizer merges global accesses through such networks) is mirrored by
+  an i32 tag network; loads become tag-driven select chains of direct
+  loads, stores write each candidate global with either the new value or
+  its own current value. This removed the last lower-stage fallback
+  (`InformLibrary.play`).
+
+Cloak now compiles with 416 direct routines, 132 policy-classic C0
+routines, and zero fallbacks, at 153,588 dynamic dispatches (upstream
+164,995); glulxercise moved to 135 direct / 79 fallback. These are current
+migration measurements, not final architecture guarantees; exact gates
+remain owned by `tests/corpusTest.nix`.
 
 The focused fixture currently requires 15 of 15 captured routines to lower,
 with zero lift or lowering bailouts. It checks exactly 177 aggregate input

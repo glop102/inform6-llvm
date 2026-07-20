@@ -405,19 +405,11 @@ static optiont alloptions[] = {
         "\
   LLVM routes routine code generation through LLVM IR so that LLVM's \n\
   optimization passes can be applied before bytecode is emitted (Glulx \n\
-  only). Routines which cannot be handled by the LLVM pipeline are \n\
-  compiled classically. Ignored when a debug file is being generated. \n\
-  Levels: 0 compiles classically; 4 (the default) generates LLVM IR \n\
-  directly from expression and statement parsing, optimizes it, and \n\
-  lowers it to Glulx bytecode, with per-routine classic fallback. \n\
-  Diagnostic levels retained for comparison during migration: 1 captures \n\
-  and replays each routine through the classic encoder without \n\
-  optimizing (byte-identical output, for testing the seam); 2 runs the \n\
-  old lifter pipeline: capture assembly, lift to IR, optimize, and \n\
-  lower; 3 is level 2 plus a dump of each routine's IR (before and \n\
-  after optimization) to inform6-llvm-dump.ll and reports of routines \n\
-  the pipeline could not handle. Set I6_LLVM_DIAGNOSTICS=1 for IR dumps \n\
-  and per-routine machine-readable backend records.\n",
+  only). Zero compiles classically; any nonzero value (the default is 4) \n\
+  generates LLVM IR directly from expression and statement parsing, \n\
+  optimizes it, and lowers it to Glulx bytecode. Ignored when a debug file \n\
+  is being generated. Set I6_LLVM_DIAGNOSTICS=1 for IR dumps and \n\
+  per-routine machine-readable backend records.\n",
         OPTUSE_GLULX,
         { OPTLIM_TOMAX, 4 },
         DEFAULTVALS(0, 4),

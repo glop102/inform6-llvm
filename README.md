@@ -1,10 +1,10 @@
 # inform6-llvm
 
 An Inform 6 compiler with an LLVM-based code generator for the Glulx target.
-Instead of encoding bytecode directly as it parses, routines are lifted to
-LLVM IR, run through LLVM's optimization passes, and lowered back to Glulx
-bytecode. LLVM is used as a mid-level optimizer; the result remains a normal
-Glulx story file interpreted by existing VMs.
+The Glulx backend generates LLVM IR while parsing routines, runs LLVM's
+optimization passes, and lowers the result to Glulx bytecode. LLVM is used as
+a mid-level optimizer; the result remains a normal Glulx story file interpreted
+by existing VMs.
 
 A fork of the upstream
 [Inform 6 compiler](https://github.com/DavidKinder/Inform6), with the
@@ -51,39 +51,27 @@ option (Glulx only) and is **on by default**:
 ```
 ./inform6-llvm -G game.inf game.ulx              # direct-IR pipeline (default)
 ./inform6-llvm -G '$LLVM=0' game.inf game.ulx    # classic upstream codegen
-./inform6-llvm -G '$LLVM=1' game.inf game.ulx    # capture/replay only (byte-identical)
-./inform6-llvm -G '$LLVM=2' game.inf game.ulx    # old lifter pipeline (diagnostic)
-./inform6-llvm -G '$LLVM=3' game.inf game.ulx    # lifter + dump IR to inform6-llvm-dump.ll
 ```
 
 The default, `$LLVM=4`, generates LLVM IR directly from expression and
-statement parsing, optimizes it, and lowers it to Glulx bytecode; routines
-the direct backend cannot represent fall back to classic code generation.
-With `$LLVM=0` eligible code uses the classic path. The remaining levels are
-diagnostic modes retained during the direct-IR migration: `$LLVM=1` routes
-each eligible Glulx routine through the capture buffer but replays it without
-optimizing (byte-identical to `$LLVM=0`); `$LLVM=2` is the old pipeline that
-lifts captured assembly to IR before optimizing; `$LLVM=3` additionally dumps
-each routine's IR before and after optimization and reports routines the
-pipeline could not handle. Debug-file builds, asterisk-traced routines, and
-Infix builds bypass capture and compile classically at every level.
+statement parsing, optimizes it, and lowers it to Glulx bytecode. Zero selects
+classic generation; any nonzero value selects direct IR. Set
+`I6_LLVM_DIAGNOSTICS=1` for per-routine backend records and IR dumps.
+Debug-file builds, asterisk-traced routines, Infix builds, and Glulx C0
+stack-argument routines compile classically.
 
 ## Architecture
 
 In Glulx mode the default path builds LLVM IR directly while expressions and
-statements are parsed, before Glulx instructions are selected. The classic
-assembly stream is still captured in parallel as shadow fallback during the
-migration. At routine end:
+statements are parsed, before Glulx instructions are selected. At routine end:
 
-1. `src/llvm_codegen.c` finalizes the directly built LLVM `i32` function (or,
-   under the diagnostic `$LLVM=2` lifter mode, lifts the captured assembly
-   stream into one).
-2. LLVM runs `mem2reg`, `instcombine`, `simplifycfg`, `reassociate`, LICM, GVN,
+1. `src/llvm_codegen.c` finalizes the directly built LLVM `i32` function.
+2. LLVM runs `mem2reg`, `instcombine`, `simplifycfg`, LICM, GVN,
    jump threading, DCE, and a final CFG simplification.
 3. `src/llvm_lower.c` validates the optimized shape, assigns Glulx
    representations, chooses block layout, and constructs a block/edge emission
-   plan before lowering it back into the capture buffer.
-4. `src/asm.c` replays either the optimized or original stream through the
+   plan before lowering it into an output buffer.
+4. `src/asm.c` sends the lowered stream through the
    classic encoder, preserving branch shortening, labels, and backpatching.
 
 Unsupported routines fall back independently to classic code generation. The
@@ -140,17 +128,16 @@ make bench                   # alias for nix run .#benchmarks
 The Nix apps are the reproducible path: each source under `stories/` is
 compiled in its own derivation, and the runners receive the resulting `.ulx`
 files together with the pinned interpreters. These derivations are grouped by
-compiler mode under `compiledStories.classic`, `compiledStories.capture`, and
-`compiledStories.llvm`; for example,
-`nix build .#compiledStories.llvm.glulxercise`. A compiled-story derivation's
+compiler mode under `compiledStories.classic`, `compiledStories.forkClassic`,
+and `compiledStories.direct`; for example,
+`nix build .#compiledStories.direct.glulxercise`. A compiled-story derivation's
 output is the `.ulx` file directly. Test and benchmark runners remain in the
 flake apps rather than the story packages.
 
-`tests/captureReplayTest.nix` checks that `$LLVM=1` output is byte-identical to
-classic Glulx output. `tests/optimizationTest.nix` requires complete lowering
-of a focused fixture and enforces aggregate, per-routine static, and dynamic
+`tests/optimizationTest.nix` checks direct lowering of a focused fixture and
+enforces aggregate, per-routine static, and dynamic
 instruction ceilings. `tests/complianceTest.nix` runs its mapped classic and
-LLVM stories under `glulxe` and requires identical behavior. Each test selects
+direct stories under `glulxe` and requires identical behavior. Each test selects
 its own stories from `compiledStories` during evaluation; `stories/default.nix`
 only defines the compilation machinery and outputs.
 
@@ -163,7 +150,7 @@ Two compliance tests exercise the API surface beyond ordinary game code:
 - `glulxercise.inf` is Andrew Plotkin's Glulx interpreter unit test
   (public domain, from <https://eblong.com/zarf/glulx/>), driven by
   `glulxercise.walk`. It is self-checking, so instead of a transcript
-  diff the classic build must pass every check and the LLVM build may fail only
+  diff the classic build must pass every check and the direct build may fail only
   the exact known layout-sensitive checks documented in
   `tests/complianceTest.nix` and
   [REVIEW.md](REVIEW.md).
@@ -208,5 +195,5 @@ default language include is capitalized "English", while the library ships
 - Resolve the correctness and LLVM-effect-model findings in the review.
 - Consider typed memory and fuller Glk modeling only after corpus validation
   shows that the additional optimization scope is worthwhile.
-- Consider lifting custom `@"..."` opcodes as opaque operations instead
-  of bailing the whole routine (low priority; rare outside test suites).
+- Represent custom `@"..."` opcodes directly where their operand and effect
+  declarations are trustworthy.

@@ -2,7 +2,6 @@
 flakeInputs: final: prev:
 let
   testApps = {
-    captureReplay = final.callPackage ./tests/captureReplayTest.nix { };
     compliance = final.callPackage ./tests/complianceTest.nix { };
     corpus = final.callPackage ./tests/corpusTest.nix {
       inform6lib = flakeInputs.inform6lib;

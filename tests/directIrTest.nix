@@ -50,24 +50,6 @@ let
     ${lib.getExe inform6-upstream} -G \
       ${../stories/direct-ir-phase1.inf} "$out"
   '';
-  forkClassic = runCommand "direct-ir-fork-classic.ulx" { } ''
-    ${lib.getExe inform6-llvm} -G '$LLVM=0' \
-      ${../stories/direct-ir-phase1.inf} "$out"
-  '';
-  forcedFallback = runCommand "direct-ir-forced-fallback" { } ''
-    mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 I6_LLVM_DIRECT_FAIL=1 \
-      ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/direct-ir-phase1.inf} "$out/story.ulx" \
-      >"$out/compile.log" 2>&1
-  '';
-  forcedLowerFallback = runCommand "direct-ir-forced-lower-fallback" { } ''
-    mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 I6_LLVM_DIRECT_FAIL=lower \
-      ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/direct-ir-phase1.inf} "$out/story.ulx" \
-      >"$out/compile.log" 2>&1
-  '';
   compileError = runCommand "direct-ir-error.compile.log" { } ''
     work=$(mktemp -d)
     set +e
@@ -148,12 +130,12 @@ writeShellApplication {
         echo "FAIL  direct-ir (quiet direct mode emitted per-routine diagnostics)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=67 lifted=0 fallback=7$' \
+    if [ "$(grep -ac '^LLVM: backends direct=70 classic=0 fallback=4$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (aggregate backend totals are incorrect)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: direct fallbacks build=7 lower=0$' \
+    if [ "$(grep -ac '^LLVM: direct fallbacks build=4 lower=0$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (direct fallback stage totals are incorrect)"
         fail=1
@@ -161,7 +143,7 @@ writeShellApplication {
 
     # Phase 5: a plain compile (no $LLVM setting) selects the direct
     # backend and produces the same bytes as an explicit $LLVM=4 compile.
-    if [ "$(grep -ac '^LLVM: backends direct=67 lifted=0 fallback=7$' \
+    if [ "$(grep -ac '^LLVM: backends direct=70 classic=0 fallback=4$' \
         ${defaultMode}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (default mode did not select the direct backend)"
         fail=1
@@ -356,13 +338,12 @@ writeShellApplication {
         echo "FAIL  direct-ir (strict memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=62 lifted=0 fallback=8$' \
+    if [ "$(grep -ac '^LLVM: backends direct=67 classic=3 fallback=0$' \
         ${memoryStrictDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (strict memory backend totals are incorrect)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: direct fallbacks build=8 lower=0$' \
-        ${memoryStrictDirect}/compile.log)" -ne 1 ]; then
+    if grep -aq '^LLVM: direct fallbacks' ${memoryStrictDirect}/compile.log; then
         echo "FAIL  direct-ir (strict memory fallback stage totals are incorrect)"
         fail=1
     fi
@@ -370,13 +351,12 @@ writeShellApplication {
         echo "FAIL  direct-ir (unchecked memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=54 lifted=0 fallback=6$' \
+    if [ "$(grep -ac '^LLVM: backends direct=57 classic=3 fallback=0$' \
         ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (unchecked memory backend totals are incorrect)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: direct fallbacks build=6 lower=0$' \
-        ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
+    if grep -aq '^LLVM: direct fallbacks' ${memoryLooseDirect}/compile.log; then
         echo "FAIL  direct-ir (unchecked memory fallback stage totals are incorrect)"
         fail=1
     fi
@@ -417,37 +397,6 @@ writeShellApplication {
         fail=1
     fi
 
-    if ! cmp -s ${upstream} ${forkClassic}; then
-        echo "FAIL  direct-ir (upstream and fork classic story files differ)"
-        fail=1
-    fi
-
-    if ! cmp -s ${forkClassic} ${forcedFallback}/story.ulx; then
-        echo "FAIL  direct-ir (forced failure did not replay shadow assembly)"
-        fail=1
-    fi
-    forced_total=$(grep -ac '^LLVM-BACKEND' ${forcedFallback}/compile.log)
-    forced_fallback=$(grep -ac \
-        $'backend=classic-fallback\tstage=direct-build' \
-        ${forcedFallback}/compile.log)
-    if [ "$forced_total" -lt 5 ] || [ "$forced_fallback" -ne "$forced_total" ]; then
-        echo "FAIL  direct-ir (forced fallback diagnostics are incomplete)"
-        fail=1
-    fi
-    if ! cmp -s ${forkClassic} ${forcedLowerFallback}/story.ulx; then
-        echo "FAIL  direct-ir (lowering failure did not preserve shadow assembly)"
-        fail=1
-    fi
-    if [ "$(grep -ac $'backend=classic-fallback\tstage=direct-lower' \
-        ${forcedLowerFallback}/compile.log)" -ne 67 ]; then
-        echo "FAIL  direct-ir (forced lowering fallback diagnostics are incomplete)"
-        fail=1
-    fi
-    if [ "$(grep -ac '^LLVM: direct fallbacks build=7 lower=67$' \
-        ${forcedLowerFallback}/compile.log)" -ne 1 ]; then
-        echo "FAIL  direct-ir (lowering failures are not counted separately)"
-        fail=1
-    fi
     if ! grep -aq 'Error:' ${compileError}; then
         echo "FAIL  direct-ir (error fixture did not report a source error)"
         fail=1

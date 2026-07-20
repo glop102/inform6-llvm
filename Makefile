@@ -8,7 +8,7 @@ BUILDDIR := build
 
 # LLVM is optional. llvm-config (the tool LLVM ships to report its install's
 # include/link flags) doubles as the detector: if it's found, build the real
-# pipeline; otherwise build the stub, which compiles everything classically.
+# pipeline; otherwise build the stub, which selects classic Glulx generation.
 # Override with WITH_LLVM=0/1 and LLVM_CONFIG=/path/to/llvm-config.
 LLVM_CONFIG ?= llvm-config
 WITH_LLVM ?= $(shell command -v $(LLVM_CONFIG) >/dev/null 2>&1 && echo 1 || echo 0)

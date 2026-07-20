@@ -20,14 +20,6 @@ let
       compiler = inform6-llvm;
       llvmMode = 0;
     };
-    capture = {
-      compiler = inform6-llvm;
-      llvmMode = 1;
-    };
-    llvm = {
-      compiler = inform6-llvm;
-      llvmMode = 2;
-    };
     direct = {
       compiler = inform6-llvm;
       llvmMode = 4;

@@ -2,7 +2,7 @@
 , glulxe-counted, glulxe-profiled, inform6-llvm, inform6-upstream, inform6lib }:
 
 # Full-library dynamic benchmark: cloak's scripted walkthrough compared
-# between upstream classic codegen and both LLVM paths. Unlike the corpus
+# between upstream classic codegen and direct LLVM generation. Unlike the corpus
 # test's pass/fail ceilings, this surfaces the attribution behind the
 # totals by default — per-routine self-op deltas and the opcode-mix diff —
 # so a regression names its hot routines and shapes instead of hiding
@@ -23,10 +23,6 @@ let
     mkdir "$out"
     ${lib.getExe inform6-llvm} -G '$LLVM=4' '$!asm' ${cloakArgs} \
       ${../stories/cloak.inf} "$out/story.ulx" >"$out/asm.log" 2>&1
-  '';
-  liftedBuild = runCommand "cloak-bench-lifted.ulx" { } ''
-    ${lib.getExe inform6-llvm} -G '$LLVM=3' ${cloakArgs} \
-      ${../stories/cloak.inf} "$out"
   '';
 in
 writeShellApplication {
@@ -57,16 +53,13 @@ writeShellApplication {
     up=$COUNTED_RESULT
     count_story ${directBuild}/story.ulx "$work/direct.count"
     direct=$COUNTED_RESULT
-    count_story ${liftedBuild} "$work/lifted.count"
-    lifted=$COUNTED_RESULT
-
     percent() {
         awk -v d="$(($1 - up))" -v base="$up" \
             'BEGIN { printf "%+.2f%%", 100 * d / base }'
     }
 
     echo "ok    cloak-bench"
-    echo "      dynamic: upstream $up, direct $direct ($(percent "$direct")), lifted $lifted ($(percent "$lifted"))"
+    echo "      dynamic: upstream $up, direct $direct ($(percent "$direct"))"
 
     timeout 120 glulxe-profiled --profile "$work/up.prof" \
         ${upstreamBuild}/story.ulx < ${./cloak.walk} >/dev/null 2>&1 || {

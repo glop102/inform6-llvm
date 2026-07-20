@@ -8,7 +8,7 @@ let
       ${../stories/z-machine-baseline.inf} "$out"
   '';
   fork = runCommand "z-machine-baseline-fork.z5" { } ''
-    ${lib.getExe inform6-llvm} '$LLVM=2' \
+    ${lib.getExe inform6-llvm} '$LLVM=4' \
       ${../stories/z-machine-baseline.inf} "$out"
   '';
   mkDebug = name: compiler: flags: runCommand name { } ''
@@ -20,7 +20,7 @@ let
   zDebugUpstream = mkDebug "z-machine-baseline-upstream.dbg"
     inform6-upstream "";
   zDebugFork = mkDebug "z-machine-baseline-fork.dbg"
-    inform6-llvm "'$LLVM=2'";
+    inform6-llvm "'$LLVM=4'";
   glulxDebugUpstream = mkDebug "glulx-baseline-upstream.dbg"
     inform6-upstream "-G";
   glulxDebugFork = mkDebug "glulx-baseline-fork.dbg"

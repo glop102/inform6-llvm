@@ -8,6 +8,9 @@
 
 #include "header.h"
 
+static void direct_operand_call(assembly_operand fn,
+    llvm_direct_value *arguments, int count);
+
 static int match_colon(void)
 {   get_next_token();
     if (token_type == SEP_TT)
@@ -195,42 +198,53 @@ static void parse_action(void)
 
     }
     else {
+        llvm_direct_value direct_args[4];
 
         AO = veneer_routine(R_Process_VR);
 
         switch (args) {
 
         case 0:
-            if (codegen_action) 
+            direct_args[0] = llvm_direct_quantity(AO2);
+            if (codegen_action)
                 AO2 = code_generate(AO2, QUANTITY_CONTEXT, -1);
             assembleg_call_1(AO, AO2, zero_operand);
             break;
 
         case 1:
+            direct_args[1] = llvm_direct_quantity(AO3);
             AO3 = code_generate(AO3, QUANTITY_CONTEXT, -1);
+            direct_args[0] = llvm_direct_quantity(AO2);
             if (codegen_action)
                 AO2 = code_generate(AO2, QUANTITY_CONTEXT, -1);
             assembleg_call_2(AO, AO2, AO3, zero_operand);
             break;
 
         case 2:
+            direct_args[2] = llvm_direct_quantity(AO4);
             AO4 = code_generate(AO4, QUANTITY_CONTEXT, -1);
+            direct_args[1] = llvm_direct_quantity(AO3);
             AO3 = code_generate(AO3, QUANTITY_CONTEXT, -1);
+            direct_args[0] = llvm_direct_quantity(AO2);
             if (codegen_action) 
                 AO2 = code_generate(AO2, QUANTITY_CONTEXT, -1);
             assembleg_call_3(AO, AO2, AO3, AO4, zero_operand);
             break;
 
         case 3:
+            direct_args[3] = llvm_direct_quantity(AO5);
             AO5 = code_generate(AO5, QUANTITY_CONTEXT, -1);
             if (!((AO5.type == LOCALVAR_OT) && (AO5.value == 0)))
                 assembleg_store(stack_pointer, AO5);
+            direct_args[2] = llvm_direct_quantity(AO4);
             AO4 = code_generate(AO4, QUANTITY_CONTEXT, -1);
             if (!((AO4.type == LOCALVAR_OT) && (AO4.value == 0)))
                 assembleg_store(stack_pointer, AO4);
+            direct_args[1] = llvm_direct_quantity(AO3);
             AO3 = code_generate(AO3, QUANTITY_CONTEXT, -1);
             if (!((AO3.type == LOCALVAR_OT) && (AO3.value == 0)))
                 assembleg_store(stack_pointer, AO3);
+            direct_args[0] = llvm_direct_quantity(AO2);
             if (codegen_action) 
                 AO2 = code_generate(AO2, QUANTITY_CONTEXT, -1);
             if (!((AO2.type == LOCALVAR_OT) && (AO2.value == 0)))
@@ -239,8 +253,12 @@ static void parse_action(void)
             break;
         }
 
-        if (level == 2) 
+        direct_operand_call(AO, direct_args, args + 1);
+
+        if (level == 2) {
+            llvm_direct_return_constant(1);
             assembleg_1(return_gc, one_operand);
+        }
 
     }
 }
@@ -513,6 +531,34 @@ static void direct_stream_char(int32 c)
 static void direct_stream_op(const char *opcode, llvm_direct_value v)
 {
     if (v) (void)llvm_direct_glulx_op(opcode, &v, 1);
+}
+
+/* Read or write an objectloop-style variable operand (a local or a
+   global; the parser has already rejected anything else). */
+static llvm_direct_value direct_variable_value(assembly_operand AO)
+{
+    if (AO.type == LOCALVAR_OT) return llvm_direct_load_local(AO.value);
+    return llvm_direct_load_global(AO.value);
+}
+
+static void direct_variable_store(assembly_operand AO, llvm_direct_value v)
+{
+    if (!v) return;
+    if (AO.type == LOCALVAR_OT)
+        (void)llvm_direct_store_local_value(AO.value, v);
+    else
+        (void)llvm_direct_store_global_value(AO.value, v);
+}
+
+/* aload of an object field, the classic object-tree access. */
+static llvm_direct_value direct_object_field(llvm_direct_value obj,
+    int32 field)
+{
+    llvm_direct_value args[2];
+    args[0] = obj;
+    args[1] = llvm_direct_constant(field, 0, 0);
+    if (!args[0] || !args[1]) return NULL;
+    return llvm_direct_glulx_op("aload", args, 2);
 }
 
 /* Call a routine named by an operand (a veneer routine or a print
@@ -1862,8 +1908,7 @@ static void parse_statement_g(int break_label, int continue_label)
     pre_unreach = execution_never_reaches_here;
 
     if ((token_type == SEP_TT) && (token_value == HASH_SEP))
-    {   llvm_direct_reject("directive in routine");
-        parse_directive(TRUE);
+    {   parse_directive(TRUE);
         parse_statement(break_label, continue_label); return;
     }
 
@@ -1886,8 +1931,7 @@ static void parse_statement_g(int break_label, int continue_label)
     }
 
     if ((token_type == SEP_TT) && (token_value == LESS_SEP))
-    {   llvm_direct_reject("action statement");
-        parse_action(); goto StatementTerminator; }
+    {   parse_action(); goto StatementTerminator; }
 
     if (token_type == EOF_TT)
     {   ebf_curtoken_error("statement"); return; }
@@ -2442,6 +2486,21 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case INVERSION_CODE:
+                 /* Direct form: read and stream the four version bytes
+                    from the header, as classic's copyb pairs do. */
+                 if (llvm_direct_can_generate()) {
+                     int k;
+                     for (k = 8; k <= 11; k++) {
+                         llvm_direct_value byte, bargs[2];
+                         bargs[0] = llvm_direct_constant(
+                             GLULX_HEADER_SIZE+k, 0, 0);
+                         bargs[1] = llvm_direct_constant(0, 0, 0);
+                         byte = llvm_direct_glulx_op("aloadb", bargs, 2);
+                         if (byte)
+                             (void)llvm_direct_glulx_op("streamchar",
+                                 &byte, 1);
+                     }
+                 }
                  INITAOTV(&AO2, DEREFERENCE_OT, GLULX_HEADER_SIZE+8);
                  assembleg_2(copyb_gc, AO2, stack_pointer);
                  assembleg_1(streamchar_gc, stack_pointer);
@@ -2591,17 +2650,25 @@ static void parse_statement_g(int break_label, int continue_label)
                        this runs through objects in a different order from
                        the new way, and there may be existing Inform code
                        relying on this.                                    */
-                     assembly_operand AO4, AO5;
+                     assembly_operand AO4, AO5, domain_tree;
+                     llvm_direct_value dv, cursor;
                      INITAO(&AO5);
 
                      sequence_point_follows = TRUE;
-                     AO2 = code_generate(parse_expression(QUANTITY_CONTEXT),
+                     domain_tree = parse_expression(QUANTITY_CONTEXT);
+                     dv = llvm_direct_quantity(domain_tree);
+                     AO2 = code_generate(domain_tree,
                          QUANTITY_CONTEXT, -1);
                      match_close_bracket();
                      if (ln == 1) {
-                         if (runtime_error_checking_switch)
+                         if (runtime_error_checking_switch) {
+                             dv = llvm_direct_check_object_operand(dv,
+                                 domain_tree, OBJECTLOOP_RTE);
                              AO2 = check_nonzero_at_runtime(AO2, -1,
                                  OBJECTLOOP_RTE);
+                         }
+                         dv = direct_object_field(dv, GOBJFIELD_PARENT());
+                         dv = direct_object_field(dv, GOBJFIELD_CHILD());
                          INITAOTV(&AO4, BYTECONSTANT_OT, GOBJFIELD_PARENT());
                          assembleg_3(aload_gc, AO2, AO4, stack_pointer);
                          INITAOTV(&AO4, BYTECONSTANT_OT, GOBJFIELD_CHILD());
@@ -2611,9 +2678,12 @@ static void parse_statement_g(int break_label, int continue_label)
                      else if (ln == 3) {
                          if (runtime_error_checking_switch) {
                              AO5 = AO2;
+                             dv = llvm_direct_check_object_operand(dv,
+                                 domain_tree, CHILD_RTE);
                              AO2 = check_nonzero_at_runtime(AO2, -1,
                                  CHILD_RTE);
                          }
+                         dv = direct_object_field(dv, GOBJFIELD_CHILD());
                          INITAOTV(&AO4, BYTECONSTANT_OT, GOBJFIELD_CHILD());
                          assembleg_3(aload_gc, AO2, AO4, stack_pointer);
                          AO2 = stack_pointer;
@@ -2621,13 +2691,27 @@ static void parse_statement_g(int break_label, int continue_label)
                      else {
                          /* do nothing */
                      }
+                     direct_variable_store(AO, dv);
                      assembleg_store(AO, AO2);
-                     assembleg_1_branch(jz_gc, AO, ln2 = alloc_label());
-                     assemble_label_no(ln4 = alloc_label());
+                     ln2 = alloc_label();
+                     if (dv) {
+                         llvm_direct_block enter = llvm_direct_new_block();
+                         llvm_direct_branch(dv, enter,
+                             llvm_direct_source_block(ln2));
+                         llvm_direct_bind_block(enter);
+                     }
+                     assembleg_1_branch(jz_gc, AO, ln2);
+                     ln4 = alloc_label();
+                     llvm_direct_bind_label(ln4);
+                     assemble_label_no(ln4);
                      parse_code_block(ln2, ln3 = alloc_label(), 0);
                      sequence_point_follows = FALSE;
+                     llvm_direct_bind_label(ln3);
                      assemble_label_no(ln3);
+                     cursor = direct_variable_value(AO);
                      if (runtime_error_checking_switch) {
+                         llvm_direct_check_object_branch(cursor,
+                             OBJECTLOOP2_RTE, ln2);
                          AO2 = check_nonzero_at_runtime(AO, ln2,
                               OBJECTLOOP2_RTE);
                          if ((ln == 3)
@@ -2638,9 +2722,31 @@ static void parse_statement_g(int break_label, int continue_label)
                              INITAO(&en_ao);
                              en_ao.value = OBJECTLOOP_BROKEN_RTE;
                              set_constant_ot(&en_ao);
+                             if (llvm_direct_can_generate()) {
+                                 /* AO5 is re-read each iteration, exactly
+                                    as classic's jeq does. */
+                                 llvm_direct_value par, cmp, eargs[2];
+                                 llvm_direct_block intact =
+                                     llvm_direct_new_block();
+                                 llvm_direct_block broken =
+                                     llvm_direct_new_block();
+                                 par = direct_object_field(cursor,
+                                     GOBJFIELD_PARENT());
+                                 cmp = llvm_direct_compare(CONDEQUALS_OP,
+                                     par, llvm_direct_quantity(AO5));
+                                 llvm_direct_branch(cmp, intact, broken);
+                                 llvm_direct_bind_block(broken);
+                                 eargs[0] = llvm_direct_constant(
+                                     OBJECTLOOP_BROKEN_RTE, 0, 0);
+                                 eargs[1] = cursor;
+                                 direct_operand_call(
+                                     veneer_routine(RT__Err_VR), eargs, 2);
+                                 llvm_direct_jump(ln2);
+                                 llvm_direct_bind_block(intact);
+                             }
                              INITAOTV(&AO4, BYTECONSTANT_OT, GOBJFIELD_PARENT());
                              assembleg_3(aload_gc, AO, AO4, stack_pointer);
-                             assembleg_2_branch(jeq_gc, stack_pointer, AO5, 
+                             assembleg_2_branch(jeq_gc, stack_pointer, AO5,
                                  label);
                              assembleg_call_2(veneer_routine(RT__Err_VR),
                                  en_ao, AO, zero_operand);
@@ -2651,9 +2757,17 @@ static void parse_statement_g(int break_label, int continue_label)
                      else {
                          AO2 = AO;
                      }
+                     cursor = direct_object_field(cursor,
+                         GOBJFIELD_SIBLING());
+                     direct_variable_store(AO, cursor);
+                     if (cursor)
+                         llvm_direct_branch(cursor,
+                             llvm_direct_source_block(ln4),
+                             llvm_direct_source_block(ln2));
                      INITAOTV(&AO4, BYTECONSTANT_OT, GOBJFIELD_SIBLING());
                      assembleg_3(aload_gc, AO2, AO4, AO);
                      assembleg_1_branch(jnz_gc, AO, ln4);
+                     llvm_direct_bind_label(ln2);
                      assemble_label_no(ln2);
                      return;
                  }
@@ -2669,9 +2783,13 @@ static void parse_statement_g(int break_label, int continue_label)
                      AO2.value = symbols[ln].value;
                      AO2.marker = OBJECT_MV;
                  }
+                 direct_variable_store(AO, llvm_direct_constant(AO2.value,
+                     AO2.marker, AO2.symindex));
                  assembleg_store(AO, AO2);
 
-                 assemble_label_no(ln = alloc_label());
+                 ln = alloc_label();
+                 llvm_direct_bind_label(ln);
+                 assemble_label_no(ln);
                  ln2 = alloc_label();
                  ln3 = alloc_label();
                  if (flag)
@@ -2685,10 +2803,20 @@ static void parse_statement_g(int break_label, int continue_label)
                  parse_code_block(ln2, ln3, 0);
 
                  sequence_point_follows = FALSE;
+                 llvm_direct_bind_label(ln3);
                  assemble_label_no(ln3);
+                 {   llvm_direct_value next_obj = direct_object_field(
+                         direct_variable_value(AO), GOBJFIELD_CHAIN());
+                     direct_variable_store(AO, next_obj);
+                     if (next_obj)
+                         llvm_direct_branch(next_obj,
+                             llvm_direct_source_block(ln),
+                             llvm_direct_source_block(ln2));
+                 }
                  INITAOTV(&AO4, BYTECONSTANT_OT, GOBJFIELD_CHAIN());
                  assembleg_3(aload_gc, AO, AO4, AO);
                  assembleg_1_branch(jnz_gc, AO, ln);
+                 llvm_direct_bind_label(ln2);
                  assemble_label_no(ln2);
                  return;
 
@@ -2773,15 +2901,41 @@ static void parse_statement_g(int break_label, int continue_label)
     /*  -------------------------------------------------------------------- */
 
         case SPACES_CODE:
-                 AO = code_generate(parse_expression(QUANTITY_CONTEXT),
-                     QUANTITY_CONTEXT, -1);
+                 {   assembly_operand stree =
+                         parse_expression(QUANTITY_CONTEXT);
+                     direct_qv1 = llvm_direct_quantity(stree);
+                     AO = code_generate(stree, QUANTITY_CONTEXT, -1);
+                 }
+
+                 /* Direct form: a countdown phi loop printing spaces. */
+                 if (direct_qv1) {
+                     llvm_direct_value counter, space, decremented;
+                     llvm_direct_block entry_from, loop, loop_from, done;
+                     llvm_direct_value cmp = llvm_direct_compare(LESS_OP,
+                         direct_qv1, llvm_direct_constant(1, 0, 0));
+                     entry_from = llvm_direct_current_block();
+                     loop = llvm_direct_new_block();
+                     done = llvm_direct_new_block();
+                     llvm_direct_branch(cmp, done, loop);
+                     llvm_direct_bind_block(loop);
+                     counter = llvm_direct_phi_empty();
+                     llvm_direct_phi_add(counter, direct_qv1, entry_from);
+                     space = llvm_direct_constant(32, 0, 0);
+                     (void)llvm_direct_glulx_op("streamchar", &space, 1);
+                     decremented = llvm_direct_binary(MINUS_OP, counter,
+                         llvm_direct_constant(1, 0, 0));
+                     loop_from = llvm_direct_current_block();
+                     llvm_direct_branch(decremented, loop, done);
+                     llvm_direct_phi_add(counter, decremented, loop_from);
+                     llvm_direct_bind_block(done);
+                 }
 
                  assembleg_store(temp_var1, AO);
 
                  INITAO(&AO);
                  AO.value = 32; set_constant_ot(&AO);
 
-                 assembleg_2_branch(jlt_gc, temp_var1, one_operand, 
+                 assembleg_2_branch(jlt_gc, temp_var1, one_operand,
                      ln = alloc_label());
                  assemble_label_no(ln2 = alloc_label());
                  assembleg_1(streamchar_gc, AO);

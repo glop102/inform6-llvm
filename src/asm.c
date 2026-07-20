@@ -1699,7 +1699,7 @@ extern void assembleg_instruction(const assembly_instruction *AI)
 
     if (llvm_capturing && !llvm_replaying) {
         opcodeg capture_opco = internal_number_to_opcode_g(AI->internal_number);
-        if (LLVM_CODEGEN >= 2 && AI->internal_number == jumpabs_gc)
+        if (LLVM_CODEGEN && AI->internal_number == jumpabs_gc)
             warning("LLVM optimization does not preserve generated code "
                 "addresses used by @jumpabs");
         llvm_capture_instruction(AI);
@@ -2309,8 +2309,9 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
        builds are excluded: sequence points and the asterisk-trace preamble
        (which is already encoded above, with live labels) don't survive
        reordering. */
-    if (LLVM_CODEGEN && glulx_mode && !debugfile_switch
-        && !routine_asterisked && !define_INFIX_switch) {
+    if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
+        && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
+        && !stackargs) {
         llvm_capturing = TRUE;
         llvm_event_count = 0;
         llvm_header_ha_end = zcode_ha_size;
@@ -2322,6 +2323,10 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
             llvm_direct_compiler_errors = no_compiler_errors;
         }
     }
+    else if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
+        && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
+        && stackargs)
+        llvm_note_classic_routine("stack-argument routine");
 
     return rv;
 }
