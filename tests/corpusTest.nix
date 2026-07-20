@@ -18,6 +18,13 @@ let
     ${lib.getExe inform6-upstream} -G ${cloakArgs} \
       ${../stories/cloak.inf} "$out"
   '';
+  # Cloak has zero fallbacks, so disabling shadow-event retention
+  # (I6_LLVM_SHADOW=0) must not change a single byte: parse bookkeeping
+  # alone carries the front end across a full library game.
+  cloakNoShadow = runCommand "corpus-cloak-no-shadow.ulx" { } ''
+    I6_LLVM_SHADOW=0 ${lib.getExe inform6-llvm} -G '$LLVM=4' ${cloakArgs} \
+      ${../stories/cloak.inf} "$out"
+  '';
   glulxerciseDirect = runCommand "corpus-glulxercise-direct" { } ''
     mkdir "$out"
     I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
@@ -71,6 +78,17 @@ writeShellApplication {
     if grep -aq '^LLVM: direct fallbacks' ${cloakDirect}/compile.log; then
         echo "FAIL  corpus (cloak fallback stage totals changed)"
         grep -a '^LLVM: direct fallbacks' ${cloakDirect}/compile.log || true
+        fail=1
+    fi
+    # The classic bucket is a closed policy set: stack-argument routines
+    # only. Any other reason here is a new construct silently opting out.
+    if grep -a $'backend=classic\t' ${cloakDirect}/compile.log \
+        | grep -aqv 'reason=stack-argument routine$'; then
+        echo "FAIL  corpus (cloak policy-classic set gained a new reason)"
+        fail=1
+    fi
+    if ! cmp -s ${cloakNoShadow} ${cloakDirect}/story.ulx; then
+        echo "FAIL  corpus (disabling shadow retention changed cloak's bytes)"
         fail=1
     fi
     if [ "$(grep -ac $'^LLVM-BACKEND\tname=SetTime\tbackend=direct\tstage=lower\tinput=6\temitted=7\treason=-$' \
@@ -131,6 +149,11 @@ writeShellApplication {
         ${glulxerciseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  corpus (glulxercise fallback stage totals changed)"
         grep -a '^LLVM: direct fallbacks' ${glulxerciseDirect}/compile.log || true
+        fail=1
+    fi
+    if grep -a $'backend=classic\t' ${glulxerciseDirect}/compile.log \
+        | grep -aqv 'reason=stack-argument routine$'; then
+        echo "FAIL  corpus (glulxercise policy-classic set gained a new reason)"
         fail=1
     fi
     timeout 60 glulxe ${glulxerciseDirect}/story.ulx < ${./glulxercise.walk} \

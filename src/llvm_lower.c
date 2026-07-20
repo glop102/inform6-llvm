@@ -4203,11 +4203,8 @@ extern int llvm_lower_routine(LLVMModuleRef m, LLVMValueRef fn,
         return FALSE;
     }
 
-    for (i = 0; i < llvm_event_count; i++)
-        if (!llvm_events[i].is_label) {
-            llvm_lower_insts_in++;
-            (*insts_in)++;
-        }
+    llvm_lower_insts_in += llvm_shadow_instruction_count;
+    *insts_in = llvm_shadow_instruction_count;
     n_emitted = 0;
 
     llvm_buffer_reset();

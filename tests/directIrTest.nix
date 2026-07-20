@@ -112,6 +112,28 @@ let
     ${lib.getExe inform6-upstream} -~S -G \
       ${../stories/direct-ir-memory.inf} "$out"
   '';
+  # Parser bookkeeping is separate from shadow-event storage: with
+  # retention disabled (I6_LLVM_SHADOW=0), bookkeeping alone must carry
+  # parsing, and a story with zero fallbacks must come out byte-identical.
+  noShadow = runCommand "direct-ir-no-shadow" { } ''
+    mkdir "$out"
+    I6_LLVM_SHADOW=0 I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${../stories/direct-ir-memory.inf} "$out/story.ulx" \
+      >"$out/compile.log" 2>&1
+  '';
+  # A story whose routines genuinely fall back cannot be emitted without
+  # the retained shadow stream: the compile must fail cleanly, with the
+  # retention error and no output file, never a silent empty routine.
+  noShadowFallback = runCommand "direct-ir-no-shadow-fallback.compile.log" { } ''
+    work=$(mktemp -d)
+    set +e
+    I6_LLVM_SHADOW=0 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${../stories/direct-ir-phase1.inf} "$work/story.ulx" >"$out" 2>&1
+    status=$?
+    set -e
+    test "$status" -ne 0
+    test ! -e "$work/story.ulx"
+  '';
 in
 writeShellApplication {
   name = "inform6-llvm-test-direct-ir";
@@ -150,6 +172,22 @@ writeShellApplication {
     fi
     if ! cmp -s ${defaultMode}/story.ulx ${direct}/story.ulx; then
         echo "FAIL  direct-ir (default mode output differs from explicit direct mode)"
+        fail=1
+    fi
+
+    # Phase 6: parser bookkeeping is independent of shadow-event storage.
+    if ! cmp -s ${noShadow}/story.ulx ${memoryStrictDirect}/story.ulx; then
+        echo "FAIL  direct-ir (no-shadow output differs from shadowed direct build)"
+        fail=1
+    fi
+    if [ "$(grep -ac '^LLVM: backends direct=67 classic=3 fallback=0$' \
+        ${noShadow}/compile.log)" -ne 1 ]; then
+        echo "FAIL  direct-ir (no-shadow backend totals are incorrect)"
+        fail=1
+    fi
+    if ! grep -aq 'shadow retention disabled (I6_LLVM_SHADOW=0)' \
+        ${noShadowFallback}; then
+        echo "FAIL  direct-ir (no-shadow fallback did not report the retention error)"
         fail=1
     fi
 
@@ -345,6 +383,12 @@ writeShellApplication {
     fi
     if grep -aq '^LLVM: direct fallbacks' ${memoryStrictDirect}/compile.log; then
         echo "FAIL  direct-ir (strict memory fallback stage totals are incorrect)"
+        fail=1
+    fi
+    # Classic-by-policy is a closed set: stack-argument routines only.
+    if grep -a $'backend=classic\t' ${memoryStrictDirect}/compile.log \
+        | grep -aqv 'reason=stack-argument routine$'; then
+        echo "FAIL  direct-ir (strict memory policy-classic set gained a new reason)"
         fail=1
     fi
     if [ "$(grep -acE "$mem_re" ${memoryLooseDirect}/compile.log)" -ne 34 ]; then

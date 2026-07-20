@@ -970,23 +970,6 @@ typedef struct assembly_instruction_t
     assembly_operand operand[8];
 } assembly_instruction;
 
-/* One captured code-generation event for the LLVM pipeline: either an
-   instruction or a label definition. See the capture seam in asm.c. */
-typedef struct llvm_event_s
-{   int is_label;           /* TRUE: label event; FALSE: instruction event   */
-    int label;              /* label number, for label events                */
-    int exec_state;         /* execution_never_reaches_here at capture time  */
-    int seq_point;          /* sequence_point_follows at capture time        */
-    assembly_instruction ai;
-    /* Snapshot of the custom @"..." opcode (ai.internal_number == -1).
-       The assembler keeps only the most recently parsed custom opcode in
-       a static, so it must be restored before this event is replayed. */
-    int32 custom_code;
-    int custom_flags;
-    int custom_op_rules;
-    int custom_no;
-} llvm_event;
-
 /* Glulx opcode flag bits, as reported by glulx_opcode_flags(). These match
    the internal St/Br/Rf/St2 flags in asm.c. */
 #define OPFLAG_STORE   1    /* last operand is a store */
@@ -2261,10 +2244,10 @@ extern int   no_sequence_points;
 extern assembly_instruction AI;
 extern int32 *named_routine_symbols;
 
-/* The LLVM capture seam (asm.c) and pipeline (llvm_codegen.c). */
-extern llvm_event *llvm_events;
-extern int   llvm_event_count;
-extern int   llvm_capturing;
+/* The LLVM capture seam (asm.c) and pipeline (llvm_codegen.c). The event
+   buffer itself is private to asm.c; the pipeline sees only this count of
+   front-end instructions in the routine being compiled. */
+extern int   llvm_shadow_instruction_count;
 extern const char *glulx_opcode_name(int32 internal_number);
 extern int   glulx_opcode_flags(int32 internal_number);
 extern int   glulx_opcode_operand_count(int32 internal_number);

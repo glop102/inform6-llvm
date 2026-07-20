@@ -1653,7 +1653,7 @@ static void direct_fallback(const char *stage, const char *detail)
     direct_reason = NULL;
 }
 
-static void process_direct_routine(void)
+static int process_direct_routine(void)
 {
     char *errmsg = NULL;
     const char *why = NULL;
@@ -1662,7 +1662,7 @@ static void process_direct_routine(void)
     if (LLVMVerifyModule(direct_mod, LLVMReturnStatusAction, &errmsg)) {
         direct_fallback("direct-verify", errmsg ? errmsg : "verification failed");
         LLVMDisposeMessage(errmsg);
-        return;
+        return FALSE;
     }
     LLVMDisposeMessage(errmsg);
     dump_module(direct_mod, "direct-pre-opt");
@@ -1675,7 +1675,7 @@ static void process_direct_routine(void)
             char *msg = LLVMGetErrorMessage(err);
             direct_fallback("direct-optimize", msg ? msg : "pass failure");
             LLVMDisposeErrorMessage(msg);
-            return;
+            return FALSE;
         }
     }
 
@@ -1685,7 +1685,7 @@ static void process_direct_routine(void)
         direct_fallback("direct-post-verify",
             errmsg ? errmsg : "post-optimization verification failed");
         LLVMDisposeMessage(errmsg);
-        return;
+        return FALSE;
     }
     LLVMDisposeMessage(errmsg);
     dump_module(direct_mod, "direct-post-opt");
@@ -1693,7 +1693,7 @@ static void process_direct_routine(void)
     if (!llvm_lower_routine(direct_mod, direct_fn, &why,
             &insts_in, &insts_out)) {
         direct_fallback("direct-lower", why ? why : "lowering failed");
-        return;
+        return FALSE;
     }
     report_backend("direct", "lower", insts_in, insts_out);
     no_routines_direct++;
@@ -1703,15 +1703,19 @@ static void process_direct_routine(void)
     direct_dispose_ir();
     direct_state = DIRECT_INACTIVE;
     direct_reason = NULL;
+    return TRUE;
 }
 
-/* Verify, optimize, and lower the directly generated routine. The lowered
-   instruction stream is replayed through the classic encoder by asm.c. */
+/* Verify, optimize, and lower the directly generated routine. Returns
+   TRUE when lowering succeeded and the event buffer holds the lowered
+   stream; FALSE when asm.c must replay the front-end shadow stream
+   instead. Either way the buffer is replayed through the classic
+   encoder by asm.c. */
 extern int llvm_pipeline_routine(void)
 {
     if (direct_state == DIRECT_READY)
-        process_direct_routine();
-    else if (direct_state == DIRECT_REJECTED)
+        return process_direct_routine();
+    if (direct_state == DIRECT_REJECTED)
         direct_fallback("direct-build", direct_reason);
     else if (direct_state == DIRECT_BUILDING)
         direct_fallback("direct-finish", "builder was not finalized");

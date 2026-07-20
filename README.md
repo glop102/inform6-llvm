@@ -57,8 +57,11 @@ The default, `$LLVM=4`, generates LLVM IR directly from expression and
 statement parsing, optimizes it, and lowers it to Glulx bytecode. Zero selects
 classic generation; any nonzero value selects direct IR. Set
 `I6_LLVM_DIAGNOSTICS=1` for per-routine backend records and IR dumps.
-Debug-file builds, asterisk-traced routines, Infix builds, and Glulx C0
-stack-argument routines compile classically.
+`I6_LLVM_SHADOW=0` disables retention of the classic fallback stream (a
+diagnostic that proves parsing is independent of it; a routine that then
+falls back is a compile error). Debug-file builds, asterisk-traced
+routines, Infix builds, and Glulx C0 stack-argument routines compile
+classically.
 
 ## Architecture
 

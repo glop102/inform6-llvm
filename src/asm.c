@@ -1055,29 +1055,72 @@ static void make_opcode_syntax_g(opcodeg opco)
 /*   LLVM capture seam (Glulx only).                                          */
 /*                                                                            */
 /*   When LLVM_CODEGEN is set, each routine's instruction and label stream    */
-/*   is captured into a buffer instead of being encoded immediately. At       */
-/*   assemble_routine_end() time the buffer is handed to the LLVM pipeline    */
-/*   (lift -> optimize -> lower), or -- if the routine can't be handled, or   */
-/*   the pipeline isn't built in yet -- replayed verbatim through the         */
-/*   classic encoder, producing byte-identical output.                        */
+/*   is suppressed instead of being encoded immediately; the direct backend   */
+/*   builds LLVM IR from the same parse in parallel. At                       */
+/*   assemble_routine_end() time the LLVM pipeline lowers that IR into the    */
+/*   event buffer and it is replayed through the classic encoder; if the      */
+/*   routine can't be handled (or the pipeline isn't built in), the           */
+/*   front-end shadow stream retained in the same buffer is replayed          */
+/*   verbatim instead, producing byte-identical classic output.               */
 /*                                                                            */
-/*   The capture stubs must mirror the parse-visible side effects of the      */
-/*   encoder, because statement parsing depends on them:                      */
-/*     - consuming sequence_point_follows,                                    */
-/*     - updating execution_never_reaches_here from the opcode's Rf flag,     */
-/*     - counting forward branches in labeluse[] (read back by                */
-/*       assemble_forward_label_no and the label-strip logic).                */
-/*   At replay time the encoder recomputes all of this; labeluse[] is reset   */
-/*   first so the counts aren't doubled (transfer_routine_g decrements them   */
-/*   as it optimizes branches away, so exact counts matter).                  */
+/*   The seam separates two concerns:                                         */
+/*                                                                            */
+/*   1. Parser bookkeeping. Statement parsing depends on side effects of      */
+/*      instruction and label emission, so the capture stubs must mirror      */
+/*      them through the backend-independent asm_parser_* helpers:            */
+/*        - consuming sequence_point_follows,                                 */
+/*        - updating execution_never_reaches_here from the opcode's Rf flag,  */
+/*        - counting forward branches in labeluse[] (read back by             */
+/*          assemble_forward_label_no and the label-strip logic).             */
+/*      This bookkeeping runs for every suppressed instruction whether or     */
+/*      not its event is stored, and must have exactly one writer: the        */
+/*      capture stubs at parse time, the encoder at replay time.              */
+/*                                                                            */
+/*   2. Output buffering. Storing the shadow events exists only so a          */
+/*      routine the pipeline rejects can still be emitted classically.        */
+/*      llvm_shadow_store gates it; I6_LLVM_SHADOW=0 (a diagnostic mode)      */
+/*      disables retention to prove parsing does not depend on                */
+/*      the stored stream, at the cost of a compile error should any          */
+/*      routine actually fall back. Lowered output always lands in the        */
+/*      buffer regardless, via llvm_buffer_reset()/append.                    */
+/*                                                                            */
+/*   At replay time the encoder recomputes all bookkeeping; labeluse[] is     */
+/*   reset first so the counts aren't doubled (transfer_routine_g             */
+/*   decrements them as it optimizes branches away, so exact counts           */
+/*   matter).                                                                 */
 /* ------------------------------------------------------------------------- */
 
-llvm_event *llvm_events;    /* the captured routine (typedef in header.h)   */
-static memory_list llvm_events_memlist;
-int llvm_event_count;
+/* One captured code-generation event: either an instruction or a label
+   definition. */
+typedef struct llvm_event_s
+{   int is_label;           /* TRUE: label event; FALSE: instruction event   */
+    int label;              /* label number, for label events                */
+    int exec_state;         /* execution_never_reaches_here at capture time  */
+    int seq_point;          /* sequence_point_follows at capture time        */
+    assembly_instruction ai;
+    /* Snapshot of the custom @"..." opcode (ai.internal_number == -1).
+       The assembler keeps only the most recently parsed custom opcode in
+       a static, so it must be restored before this event is replayed. */
+    int32 custom_code;
+    int custom_flags;
+    int custom_op_rules;
+    int custom_no;
+} llvm_event;
 
-int llvm_capturing;         /* capturing the current routine's code          */
+static llvm_event *llvm_events;      /* the captured routine                 */
+static memory_list llvm_events_memlist;
+static int llvm_event_count;
+
+static int llvm_capturing;  /* suppressing encoding for the current routine  */
 static int llvm_replaying;  /* replaying the buffer through the encoder      */
+static int llvm_shadow_store; /* retaining shadow events for fallback replay */
+int llvm_shadow_instruction_count; /* front-end instructions this routine    */
+
+/* Diagnostic mode: I6_LLVM_SHADOW=0 disables shadow event retention. */
+static int llvm_shadow_enabled(void)
+{   const char *value = getenv("I6_LLVM_SHADOW");
+    return !(value && value[0] && strcmp(value, "0") == 0);
+}
 static int llvm_direct_started;
 static int llvm_direct_errors;
 static int llvm_direct_compiler_errors;
@@ -1138,6 +1181,17 @@ static void llvm_capture_label(int n)
 
 }
 
+/* The parse-visible side effects of assembling one Glulx instruction,
+   without encoding it. The single writer of this state at parse time. */
+static void shadow_note_instruction(const assembly_instruction *ai,
+    const opcodeg *opco)
+{
+    (void) asm_parser_take_sequence_point();
+    asm_parser_note_opcode((opco->flags & Rf) != 0);
+    if ((opco->flags & Br) && ai->operand_count == opco->no)
+        asm_parser_note_branch(ai->operand[ai->operand_count-1].value);
+}
+
 /* Replay the captured routine through the classic encoder, then reset the
    capture state. */
 static void llvm_replay_routine(void)
@@ -1195,10 +1249,7 @@ extern void llvm_buffer_reset(void)
 extern void llvm_buffer_append_instruction(const assembly_instruction *AI2)
 {   opcodeg opco = internal_number_to_opcode_g(AI2->internal_number);
     llvm_capture_instruction(AI2);
-    (void) asm_parser_take_sequence_point();
-    asm_parser_note_opcode((opco.flags & Rf) != 0);
-    if ((opco.flags & Br) && AI2->operand_count == opco.no)
-        asm_parser_note_branch(AI2->operand[AI2->operand_count-1].value);
+    shadow_note_instruction(AI2, &opco);
 }
 
 extern void llvm_buffer_append_label(int n)
@@ -1702,13 +1753,12 @@ extern void assembleg_instruction(const assembly_instruction *AI)
         if (LLVM_CODEGEN && AI->internal_number == jumpabs_gc)
             warning("LLVM optimization does not preserve generated code "
                 "addresses used by @jumpabs");
-        llvm_capture_instruction(AI);
-        (void) asm_parser_take_sequence_point();
-        asm_parser_note_opcode((capture_opco.flags & Rf) != 0);
-        if ((capture_opco.flags & Br)
-            && AI->operand_count == capture_opco.no)
-            asm_parser_note_branch(
-                AI->operand[AI->operand_count-1].value);
+        llvm_shadow_instruction_count++;
+        /* Storage first: the event snapshots sequence_point_follows and
+           execution_never_reaches_here before bookkeeping consumes them. */
+        if (llvm_shadow_store)
+            llvm_capture_instruction(AI);
+        shadow_note_instruction(AI, &capture_opco);
         return;
     }
 
@@ -2021,7 +2071,8 @@ extern void assemble_label_no(int n)
     }
 
     if (llvm_capturing && !llvm_replaying) {
-        llvm_capture_label(n);
+        if (llvm_shadow_store)
+            llvm_capture_label(n);
     }
     else {
         if (asm_trace_level > 0)
@@ -2313,7 +2364,9 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
         && !stackargs) {
         llvm_capturing = TRUE;
+        llvm_shadow_store = llvm_shadow_enabled();
         llvm_event_count = 0;
+        llvm_shadow_instruction_count = 0;
         llvm_header_ha_end = zcode_ha_size;
         if (no_errors == 0 && no_compiler_errors == 0) {
             llvm_direct_routine_begin(current_routine_name.data, no_locals,
@@ -2323,6 +2376,17 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
             llvm_direct_compiler_errors = no_compiler_errors;
         }
     }
+    /* Stack-argument (type C0) routines are classic by policy, not by
+       gap. Dynamic attribution on the cloak walkthrough put the whole C0
+       set at 8.35% of self-ops, 96% of it in CA__Pr alone, whose
+       inline-assembly-heavy veneer siblings gained between nothing
+       (CP__Tab, RT__ChLDB) and 8% (Z__Region) from direct IR: a
+       projected saving under half a percent of total dispatches, and
+       zero on Life. That does not pay for modeling varargs entry state
+       (arguments left on the VM stack, _vararg_count popped by the
+       header). Revisit only with new attribution evidence; the tests
+       pin "stack-argument routine" as the only permitted classic-policy
+       reason. */
     else if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
         && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
         && stackargs)
@@ -2358,9 +2422,10 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
         }
     }
     
-    /* If this routine was captured for the LLVM pipeline, emit it now.
-       llvm_pipeline_routine() returns TRUE if it emitted code itself;
-       otherwise fall back to replaying the capture buffer verbatim
+    /* If this routine's encoding was suppressed for the LLVM pipeline,
+       emit it now. llvm_pipeline_routine() returns TRUE when lowering
+       succeeded and the event buffer holds the lowered stream; FALSE
+       when the front-end shadow stream must be replayed verbatim
        through the classic encoder.                                          */
 
     if (llvm_direct_started) {
@@ -2373,7 +2438,12 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
     }
 
     if (llvm_capturing) {
-        if (llvm_pipeline_routine()) {
+        if (!llvm_pipeline_routine() && !llvm_shadow_store) {
+            /* The shadow stream was not retained (I6_LLVM_SHADOW=0), so
+               the routine cannot be emitted classically. */
+            error_named("Routine fell back to classic generation with "
+                "shadow retention disabled (I6_LLVM_SHADOW=0):",
+                current_routine_name.data);
             llvm_capturing = FALSE;
             llvm_event_count = 0;
         }
@@ -4248,6 +4318,8 @@ extern void init_asm_vars(void)
     llvm_event_count = 0;
     llvm_capturing = FALSE;
     llvm_replaying = FALSE;
+    llvm_shadow_store = TRUE;
+    llvm_shadow_instruction_count = 0;
 }
 
 extern void asm_begin_pass(void)
@@ -4261,7 +4333,9 @@ extern void asm_begin_pass(void)
     execution_never_reaches_here = EXECSTATE_REACHABLE;
     llvm_capturing = FALSE;
     llvm_replaying = FALSE;
+    llvm_shadow_store = TRUE;
     llvm_event_count = 0;
+    llvm_shadow_instruction_count = 0;
 }
 
 extern void asm_allocate_arrays(void)
