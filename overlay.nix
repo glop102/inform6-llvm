@@ -15,6 +15,9 @@ let
     cloak = final.callPackage ./tests/cloakBenchmark.nix {
       inform6lib = flakeInputs.inform6lib;
     };
+    advent = final.callPackage ./tests/adventBenchmark.nix {
+      inform6-testing = flakeInputs.inform6-testing;
+    };
   };
 in {
   cheapglk = final.stdenv.mkDerivation {

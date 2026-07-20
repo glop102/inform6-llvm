@@ -50,6 +50,22 @@
         "type": "github"
       }
     },
+    "inform6-testing": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1777331561,
+        "narHash": "sha256-V62kO2L4zJOCYNMkZM/ZdFKB++LN1qmm0rneHFG/O4s=",
+        "owner": "erkyrath",
+        "repo": "Inform6-Testing",
+        "rev": "c6aae29dfaaec9ebb511bbb5be2cad9ecb0b7156",
+        "type": "github"
+      },
+      "original": {
+        "owner": "erkyrath",
+        "repo": "Inform6-Testing",
+        "type": "github"
+      }
+    },
     "inform6-upstream": {
       "flake": false,
       "locked": {
@@ -104,6 +120,7 @@
         "cheapglk": "cheapglk",
         "flake-utils": "flake-utils",
         "glulxe": "glulxe",
+        "inform6-testing": "inform6-testing",
         "inform6-upstream": "inform6-upstream",
         "inform6lib": "inform6lib",
         "nixpkgs": "nixpkgs"

@@ -19,6 +19,13 @@
       url = "gitlab:DavidGriffith/inform6lib";
       flake = false;
     };
+    # Andrew Plotkin's Inform 6 compiler regression corpus. We pull the
+    # Colossal Cave (Advent) benchmark and its bundled 6/11 library from here
+    # rather than vendoring them; see tests/adventBenchmark.nix.
+    inform6-testing = {
+      url = "github:erkyrath/Inform6-Testing";
+      flake = false;
+    };
     # Classic Glulx oracle, pinned to the source revision this fork started from.
     inform6-upstream = {
       url = "github:DavidKinder/Inform6/d1066bc214a45ee0f600d2ae7f94ad0210606317";
@@ -61,6 +68,7 @@
               text = ''
                 ${pkgs.lib.getExe pkgs.benchmarkApps.life}
                 ${pkgs.lib.getExe pkgs.benchmarkApps.cloak}
+                ${pkgs.lib.getExe pkgs.benchmarkApps.advent}
               '';
             });
           };
