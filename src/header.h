@@ -2258,6 +2258,12 @@ extern char *llvm_current_routine_name(void);
 extern int   llvm_codegen_available(void);
 extern void  llvm_note_classic_routine(const char *reason);
 extern int   llvm_pipeline_routine(void);
+/* Deferred lowering: at routine end the finished direct IR is retained
+   (module moved out of the current routine, returning a handle >= 0, or
+   -1 if there is no direct IR to retain); at end of pass the retained
+   module for a handle is lowered through the normal pipeline. */
+extern int   llvm_retain_direct_routine(void);
+extern int   llvm_lower_retained_routine(int handle);
 extern void  llvm_direct_routine_begin(const char *name, int local_count,
                  int embedded_flag, int stack_arguments);
 extern void  llvm_direct_routine_finish(int embedded_flag,
@@ -2361,6 +2367,8 @@ extern int alloc_label(void);
 extern int32 assemble_routine_header(int debug_flag,
     char *name, int embedded_flag, int the_symbol);
 extern void assemble_routine_end(int embedded_flag, debug_locations locations);
+extern int  deferred_lowering_active(void);
+extern void emit_deferred_routines(void);
 
 extern void assemblez_0(int internal_number);
 extern void assemblez_0_to(int internal_number, assembly_operand o1);
@@ -3075,6 +3083,8 @@ extern void compile_initial_routine(void);
 extern assembly_operand veneer_routine(int code);
 extern char *veneer_routine_name(int code);
 extern void compile_veneer(void);
+extern void veneer_backpatch_addresses(void);
+extern void grammar_backpatch_routines(void);
 
 /* ------------------------------------------------------------------------- */
 /*   Extern definitions for "verbs"                                          */

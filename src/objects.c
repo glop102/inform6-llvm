@@ -1290,10 +1290,28 @@ the names \"%s\" and \"%s\" actually refer to the same property",
                 ensure_memory_list_available(&embedded_function_name, strlen(prefix)+strlen(sep)+strlen(sym)+1);
                 sprintf(embedded_function_name.data, "%s%s%s", prefix, sep, sym);
 
-                /* parse_routine() releases lexer text! */
-                AO.value = parse_routine(NULL, TRUE, embedded_function_name.data, FALSE, -1);
-                AO.type = LONG_CONSTANT_OT;
-                AO.marker = IROUTINE_MV;
+                if (deferred_lowering_active()) {
+                    /* Mint a symbol for this anonymous embedded routine so
+                       its address is deferred through SYMBOL_MV (see the
+                       matching site below). */
+                    int es = symbol_index(embedded_function_name.data, -1, NULL);
+                    /* parse_routine() releases lexer text! */
+                    AO.value = parse_routine(NULL, TRUE,
+                        embedded_function_name.data, FALSE, es);
+                    assign_symbol(es, AO.value, ROUTINE_T);
+                    symbols[es].flags |= AUTOGEN_SFLAG | USED_SFLAG;
+                    AO.value = es;
+                    AO.type = CONSTANT_OT;
+                    AO.marker = SYMBOL_MV;
+                    AO.symindex = es;
+                }
+                else {
+                    /* parse_routine() releases lexer text! */
+                    AO.value = parse_routine(NULL, TRUE,
+                        embedded_function_name.data, FALSE, -1);
+                    AO.type = LONG_CONSTANT_OT;
+                    AO.marker = IROUTINE_MV;
+                }
 
                 directives.enabled = FALSE;
                 segment_markers.enabled = TRUE;
@@ -1556,9 +1574,29 @@ the names \"%s\" and \"%s\" actually refer to the same property",
                 sprintf(embedded_function_name.data, "%s%s%s", prefix, sep, sym);
 
                 INITAOT(&AO, CONSTANT_OT);
-                /* parse_routine() releases lexer text! */
-                AO.value = parse_routine(NULL, TRUE, embedded_function_name.data, FALSE, -1);
-                AO.marker = IROUTINE_MV;
+                if (deferred_lowering_active()) {
+                    /* This anonymous embedded routine has no symbol, so under
+                       deferred lowering mint one (from the mangled name we
+                       already built) and reference it through SYMBOL_MV, so
+                       its address is assigned at end of pass like any routine.
+                       AUTOGEN_SFLAG tags it for the post-backpatch cleanup and
+                       keeps it out of unused-symbol warnings. */
+                    int es = symbol_index(embedded_function_name.data, -1, NULL);
+                    /* parse_routine() releases lexer text! */
+                    AO.value = parse_routine(NULL, TRUE,
+                        embedded_function_name.data, FALSE, es);
+                    assign_symbol(es, AO.value, ROUTINE_T);
+                    symbols[es].flags |= AUTOGEN_SFLAG | USED_SFLAG;
+                    AO.value = es;
+                    AO.marker = SYMBOL_MV;
+                    AO.symindex = es;
+                }
+                else {
+                    /* parse_routine() releases lexer text! */
+                    AO.value = parse_routine(NULL, TRUE,
+                        embedded_function_name.data, FALSE, -1);
+                    AO.marker = IROUTINE_MV;
+                }
 
                 directives.enabled = FALSE;
                 segment_markers.enabled = TRUE;

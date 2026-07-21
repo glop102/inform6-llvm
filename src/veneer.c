@@ -2450,6 +2450,22 @@ override the standard definition) but cannot use it for anything else:",
     compile_symbol_table_routine();
 }
 
+/* Under deferred lowering, veneer routine addresses are only assigned when
+   the routines are emitted at end of pass, after compile_veneer() has run.
+   Re-read each compiled veneer routine's address from its symbol so the
+   VROUTINE_MV backpatch table is correct before backpatching. */
+extern void veneer_backpatch_addresses(void)
+{
+    int i, j;
+    VeneerRoutine *VRs = (!glulx_mode) ? VRs_z : VRs_g;
+    for (i = 0; i < VENEER_ROUTINES; i++)
+    {   if (veneer_routine_needs_compilation[i] == VR_COMPILED)
+        {   j = symbol_index(VRs[i].name, -1, NULL);
+            veneer_routine_address[i] = symbols[j].value;
+        }
+    }
+}
+
 /* ========================================================================= */
 /*   Data structure management routines                                      */
 /* ------------------------------------------------------------------------- */

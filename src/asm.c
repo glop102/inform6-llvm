@@ -2134,6 +2134,172 @@ extern void define_symbol_label(int symbol)
     labels[label].symbol = symbol;
 }
 
+/* ------------------------------------------------------------------------- */
+/*   Deferred lowering (end-of-pass emission).                               */
+/*                                                                           */
+/*   When active, no routine is written into the code area during parsing.   */
+/*   Each finished routine is stashed -- its captured stream and, for a      */
+/*   direct routine, a handle to its retained IR module -- and the whole     */
+/*   program's routines are lowered, addressed, and emitted in one pass      */
+/*   after parsing and the veneer are complete. Routine addresses are        */
+/*   therefore assigned at end of pass, which every reference already        */
+/*   resolves through the routine symbol (SYMBOL_MV / ROUTINE_T), so the     */
+/*   emitted story is byte-identical to eager emission.                      */
+/*                                                                           */
+/*   Gated off for modes whose routines cannot be deferred: Z-code, debug/   */
+/*   traced/infix builds (live preambles and sequence points), and dead-     */
+/*   routine stripping (which records emission PCs at parse time).           */
+/* ------------------------------------------------------------------------- */
+
+extern int deferred_lowering_active(void)
+{
+    return glulx_mode && LLVM_CODEGEN && llvm_codegen_available()
+        && !debugfile_switch && !define_INFIX_switch
+        && (trace_fns_setting == 0) && !track_unused_routines;
+}
+
+typedef struct deferred_routine_s {
+    int    routine_symbol;      /* symbol to receive the emitted address    */
+    char  *name;                /* owned copy, for diagnostics              */
+    int    no_locals;
+    int    embedded_flag;
+    int    stackargs;
+    int    shadow_store;
+    int    shadow_instruction_count;
+    int    next_label;          /* label count reached while parsing         */
+    int    ir_handle;           /* retained direct module, or -1 (classic)  */
+    llvm_event *events;         /* owned deep copy of the captured stream   */
+    int    event_count;
+} deferred_routine;
+
+static deferred_routine *deferred_routines;
+static int deferred_routine_count, deferred_routine_cap;
+
+/* Emit a Glulx routine header (type byte, locals-format list, and the
+   stack-arg count copy for C0 functions) into the holding area, recording
+   its span so llvm_patch_routine_locals() can rewrite the local count. */
+static void emit_glulx_routine_header(int stackargs, int locals)
+{
+    int i, j;
+    cur_emit.header_ha_start = zcode_ha_size;
+    cur_emit.header_stackargs = stackargs;
+    if (stackargs) byteout(0xC0, 0); else byteout(0xC1, 0);
+    i = locals;
+    while (i) { j = (i > 255) ? 255 : i; byteout(4, 0); byteout(j, 0); i -= j; }
+    byteout(0, 0); byteout(0, 0);
+    if (stackargs) { byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0); }
+    cur_emit.header_ha_end = zcode_ha_size;
+}
+
+/* Snapshot the just-parsed routine (its captured stream deep-copied, and a
+   handle to any retained direct IR) for emission at end of pass. */
+static void stash_deferred_routine(int embedded_flag, int ir_handle)
+{
+    deferred_routine *d;
+    int len;
+    if (deferred_routine_count >= deferred_routine_cap) {
+        int nc = deferred_routine_cap ? deferred_routine_cap * 2 : 256;
+        deferred_routine *n = realloc(deferred_routines, (size_t)nc * sizeof *n);
+        if (!n) fatalerror("Out of memory stashing deferred routines");
+        deferred_routines = n; deferred_routine_cap = nc;
+    }
+    d = &deferred_routines[deferred_routine_count++];
+    d->routine_symbol = routine_symbol;
+    len = strlen(current_routine_name.data) + 1;
+    d->name = malloc(len);
+    if (!d->name) fatalerror("Out of memory stashing deferred routine name");
+    memcpy(d->name, current_routine_name.data, len);
+    d->no_locals = no_locals;
+    d->embedded_flag = embedded_flag;
+    d->stackargs = cur_emit.header_stackargs;
+    d->shadow_store = cur_emit.shadow_store;
+    d->shadow_instruction_count = llvm_shadow_instruction_count;
+    d->next_label = next_label;
+    d->ir_handle = ir_handle;
+    d->event_count = cur_emit.event_count;
+    if (cur_emit.event_count > 0) {
+        d->events = malloc((size_t)cur_emit.event_count * sizeof(llvm_event));
+        if (!d->events) fatalerror("Out of memory stashing deferred routine");
+        memcpy(d->events, cur_emit.events,
+            (size_t)cur_emit.event_count * sizeof(llvm_event));
+    } else {
+        d->events = NULL;
+    }
+}
+
+/* End of pass: lower, address, and emit every stashed routine in the order
+   it was parsed, so the code-area layout matches eager emission. */
+extern void emit_deferred_routines(void)
+{
+    int idx;
+    for (idx = 0; idx < deferred_routine_count; idx++) {
+        deferred_routine *d = &deferred_routines[idx];
+        int len = strlen(d->name) + 1;
+
+        /* Restore the per-routine context the emission path reads. */
+        no_locals = d->no_locals;
+        ensure_memory_list_available(&current_routine_name, len);
+        memcpy(current_routine_name.data, d->name, len);
+        routine_symbol = d->routine_symbol;
+        llvm_shadow_instruction_count = d->shadow_instruction_count;
+        cur_emit.shadow_store = d->shadow_store;
+
+        /* Load the captured stream into the working buffer. */
+        cur_emit.event_count = d->event_count;
+        if (d->event_count > 0) {
+            ensure_memory_list_available(&cur_emit.events_memlist, d->event_count);
+            memcpy(cur_emit.events, d->events,
+                (size_t)d->event_count * sizeof(llvm_event));
+        }
+
+        /* Restore per-routine label state. next_label must reach the count
+           parsed so the captured stream's label numbers are allocated (a
+           direct routine's lowering allocates further labels above it, as in
+           eager emission); labeluse[] and the offset list are rebuilt by
+           replay. Reachability starts true, as assemble_routine_header sets
+           it, and is driven per-instruction by the replay thereafter. */
+        next_label = d->next_label; next_sequence_point = 0;
+        first_label = -1; last_label = -1; labeluse_size = 0;
+        execution_never_reaches_here = EXECSTATE_REACHABLE;
+
+        /* Assign the routine's address (every reference resolves through
+           this symbol value at backpatch), then emit its header. */
+        routine_start_pc = zmachine_pc;
+        if (d->routine_symbol >= 0)
+            symbols[d->routine_symbol].value = zmachine_pc;
+        emit_glulx_routine_header(d->stackargs, d->no_locals);
+
+        /* Lower the retained direct IR (which refills the buffer with the
+           lowered stream), or fall back to the captured classic stream,
+           then replay and transfer -- mirroring eager emission. */
+        {   int lowered = (d->ir_handle >= 0)
+                ? llvm_lower_retained_routine(d->ir_handle) : FALSE;
+            if (!lowered && !cur_emit.shadow_store) {
+                error_named("Routine fell back to classic generation with "
+                    "shadow retention disabled (I6_LLVM_SHADOW=0):", d->name);
+                cur_emit.event_count = 0;
+            } else {
+                llvm_replay_routine();
+            }
+        }
+        transfer_routine_g();
+
+        free(d->events); d->events = NULL;
+        free(d->name);   d->name = NULL;
+    }
+    deferred_routine_count = 0;
+    free(deferred_routines);
+    deferred_routines = NULL;
+    deferred_routine_cap = 0;
+
+    /* Leave the per-routine state as eager emission would after the last
+       routine, so later compilation (e.g. property-name strings, whose
+       compile_string() behaviour depends on reachability) is unaffected. */
+    execution_never_reaches_here = EXECSTATE_REACHABLE;
+    next_label = 0; next_sequence_point = 0;
+    first_label = -1; last_label = -1; labeluse_size = 0;
+}
+
 /* The local variables must already be set up; no_locals indicates
    how many exist. */
 extern int32 assemble_routine_header(int routine_asterisked, char *name,
@@ -2264,36 +2430,14 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
     else {
         rv = zmachine_pc;
 
-        cur_emit.header_ha_start = zcode_ha_size;
         cur_emit.header_stackargs = stackargs;
-
-        if (stackargs)
-            byteout(0xC0, 0); /* Glulx type byte for function */
-        else
-            byteout(0xC1, 0); /* Glulx type byte for function */
-
-        /* Now the locals format list. This is simple; we only use
-           four-byte locals. That's a single pair, unless we have more
-           than 255 locals, or none at all. */
-        i = no_locals;
-        while (i) {
-            int j = i;
-            if (j > 255)
-                j = 255;
-            byteout(4, 0); 
-            byteout(j, 0);
-            i -= j;
-        }
-        /* Terminate the list with a (0, 0) pair. */
-        byteout(0, 0);
-        byteout(0, 0);
-
-        if (stackargs) {
-            /* The top stack value is the number of function arguments. Let's
-               move that into the first local, which is _vararg_count. */
-            /* @copy sp _vararg_count; */
-            byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0);
-        }
+        /* A routine defers only if it will be captured; an asterisk-traced
+           routine is not (its live trace preamble can't be replayed), so it
+           emits eagerly even inside a deferred compile. For a deferred
+           routine the header is emitted at end of pass, when its address is
+           assigned; rv is a placeholder the end-of-pass address overwrites. */
+        if (!(deferred_lowering_active() && !routine_asterisked))
+            emit_glulx_routine_header(stackargs, no_locals);
 
         next_label = 0; next_sequence_point = 0;
         first_label = -1; last_label = -1; 
@@ -2384,19 +2528,32 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
        reordering. */
     if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
         && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
-        && !stackargs) {
+        && (!stackargs || deferred_lowering_active())) {
         cur_emit.capturing = TRUE;
         cur_emit.shadow_store = llvm_shadow_enabled();
         cur_emit.event_count = 0;
         llvm_shadow_instruction_count = 0;
         cur_emit.header_ha_end = zcode_ha_size;
-        if (no_errors == 0 && no_compiler_errors == 0) {
+        /* Stack-argument routines stay classic (see below), but under
+           deferred lowering they are still captured so they can be emitted
+           at end of pass with everything else; they just get no direct IR. */
+        if (!stackargs && no_errors == 0 && no_compiler_errors == 0) {
             llvm_direct_routine_begin(current_routine_name.data, no_locals,
                 embedded_flag, stackargs);
             cur_emit.direct_started = TRUE;
             cur_emit.direct_errors = no_errors;
             cur_emit.direct_compiler_errors = no_compiler_errors;
         }
+        else {
+            /* No direct IR will be built (a stack-argument/policy-classic
+               routine): under deferred lowering the captured stream is this
+               routine's only output -- not a fallback -- so it must be
+               retained even when the fallback shadow is disabled
+               (I6_LLVM_SHADOW=0). */
+            cur_emit.shadow_store = TRUE;
+        }
+        if (stackargs)
+            llvm_note_classic_routine("stack-argument routine");
     }
     /* Stack-argument (type C0) routines are classic by policy, not by
        gap. Dynamic attribution on the cloak walkthrough put the whole C0
@@ -2459,27 +2616,39 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
         cur_emit.direct_started = FALSE;
     }
 
-    if (cur_emit.capturing) {
-        if (!llvm_pipeline_routine() && !cur_emit.shadow_store) {
-            /* The shadow stream was not retained (I6_LLVM_SHADOW=0), so
-               the routine cannot be emitted classically. */
-            error_named("Routine fell back to classic generation with "
-                "shadow retention disabled (I6_LLVM_SHADOW=0):",
-                current_routine_name.data);
-            cur_emit.capturing = FALSE;
-            cur_emit.event_count = 0;
-        }
-        else
-            llvm_replay_routine();
+    if (deferred_lowering_active() && cur_emit.capturing) {
+        /* Defer: retain the IR (if any) and stash the captured stream for
+           end-of-pass emission. Nothing is written to the code area now,
+           so no address is assigned here. A non-captured routine (e.g.
+           asterisk-traced) falls through to eager emission below. */
+        int handle = llvm_retain_direct_routine();  /* -1 if classic */
+        stash_deferred_routine(embedded_flag, handle);
+        cur_emit.capturing = FALSE;
+        cur_emit.event_count = 0;
     }
+    else {
+        if (cur_emit.capturing) {
+            if (!llvm_pipeline_routine() && !cur_emit.shadow_store) {
+                /* The shadow stream was not retained (I6_LLVM_SHADOW=0), so
+                   the routine cannot be emitted classically. */
+                error_named("Routine fell back to classic generation with "
+                    "shadow retention disabled (I6_LLVM_SHADOW=0):",
+                    current_routine_name.data);
+                cur_emit.capturing = FALSE;
+                cur_emit.event_count = 0;
+            }
+            else
+                llvm_replay_routine();
+        }
 
-    /* Dump the contents of the current routine into longer-term Z-code
-       storage                                                               */
+        /* Dump the contents of the current routine into longer-term Z-code
+           storage                                                           */
 
-    if (!glulx_mode)
-        transfer_routine_z();
-    else
-        transfer_routine_g();
+        if (!glulx_mode)
+            transfer_routine_z();
+        else
+            transfer_routine_g();
+    }
 
     if (track_unused_routines)
         df_note_function_end(zmachine_pc);

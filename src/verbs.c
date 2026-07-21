@@ -125,6 +125,45 @@ actioninfo *actions; /* Allocated to no_actions */
 memory_list actions_memlist;
 int32   *grammar_token_routine; /* Allocated to no_grammar_token_routines */
 static memory_list grammar_token_routine_memlist;
+
+/* Deferred lowering: a GV2 grammar token bakes a routine's address into
+   grammar_lines[] while parsing, before that routine has been addressed.
+   Record (offset, symbol) for each so grammar_backpatch_routines() can
+   rewrite them once end-of-pass address assignment has run. */
+static int grammar_pending_routine_sym = -1;
+typedef struct { int32 offset; int symbol; } grammar_rfixup_t;
+static grammar_rfixup_t *grammar_rfixups;
+static int grammar_rfixup_count, grammar_rfixup_cap;
+
+static void record_grammar_rfixup(int32 offset, int symbol)
+{
+    if (grammar_rfixup_count >= grammar_rfixup_cap) {
+        int nc = grammar_rfixup_cap ? grammar_rfixup_cap * 2 : 64;
+        grammar_rfixup_t *n = realloc(grammar_rfixups, (size_t)nc * sizeof *n);
+        if (!n) fatalerror("Out of memory recording grammar routine fixups");
+        grammar_rfixups = n; grammar_rfixup_cap = nc;
+    }
+    grammar_rfixups[grammar_rfixup_count].offset = offset;
+    grammar_rfixups[grammar_rfixup_count].symbol = symbol;
+    grammar_rfixup_count++;
+}
+
+extern void grammar_backpatch_routines(void)
+{
+    int i;
+    for (i = 0; i < grammar_rfixup_count; i++) {
+        int32 v = symbols[grammar_rfixups[i].symbol].value;
+        int32 o = grammar_rfixups[i].offset;
+        grammar_lines[o]     = (v >> 24) & 0xFF;
+        grammar_lines[o + 1] = (v >> 16) & 0xFF;
+        grammar_lines[o + 2] = (v >> 8) & 0xFF;
+        grammar_lines[o + 3] = v & 0xFF;
+    }
+    grammar_rfixup_count = 0;
+    free(grammar_rfixups);
+    grammar_rfixups = NULL;
+    grammar_rfixup_cap = 0;
+}
 actionsort *sorted_actions; /* only used if GRAMMAR_META_FLAG */
 int no_meta_actions; /* only used if GRAMMAR_META_FLAG */
 
@@ -1017,6 +1056,7 @@ static int grammar_line(int verbnum, int allmeta, int line)
     do
     {   get_next_token();
         bytecode = 0; wordcode = 0;
+        grammar_pending_routine_sym = -1;
         if ((token_type == SEP_TT) && (token_value == SEMICOLON_SEP))
         {   discard_token_location(beginning_debug_location);
             ebf_curtoken_error("'->' clause");
@@ -1078,7 +1118,7 @@ static int grammar_line(int verbnum, int allmeta, int line)
                      }
                      else if (grammar_version_number == 2)
                      {   bytecode = 0x83;
-                         wordcode = symbols[token_value].value;
+                         wordcode = symbols[token_value].value; grammar_pending_routine_sym = token_value;
                      }
                      else if (grammar_version_number == 3)
                      {   bytecode = 0x83;
@@ -1148,7 +1188,7 @@ are using grammar version 2 or later");
                  }
                  else if (grammar_version_number == 2)
                  {   bytecode = 0x85;
-                     wordcode = symbols[token_value].value;
+                     wordcode = symbols[token_value].value; grammar_pending_routine_sym = token_value;
                  }
                  else if (grammar_version_number == 3)
                  {   bytecode = 0x85;
@@ -1175,7 +1215,7 @@ are using grammar version 2 or later");
                  if (symbols[token_value].type==ATTRIBUTE_T)
                  {   if (grammar_version_number == 1)
                          bytecode = 128 + symbols[token_value].value;
-                     else { bytecode = 4; wordcode = symbols[token_value].value; }
+                     else { bytecode = 4; wordcode = symbols[token_value].value; grammar_pending_routine_sym = token_value; }
                  }
                  else
                  {   if (grammar_version_number == 1)
@@ -1184,7 +1224,7 @@ are using grammar version 2 or later");
                      }
                      else if (grammar_version_number == 2)
                      {   bytecode = 0x86;
-                         wordcode = symbols[token_value].value;
+                         wordcode = symbols[token_value].value; grammar_pending_routine_sym = token_value;
                      }
                      else if (grammar_version_number == 3)
                      {   bytecode = 0x86;
@@ -1224,6 +1264,11 @@ tokens in any line (for grammar version 3)");
                 }
             }
             else {
+                /* A baked routine address here is a placeholder under
+                   deferred lowering; record it for later rewrite. */
+                if (grammar_pending_routine_sym >= 0
+                    && deferred_lowering_active())
+                    record_grammar_rfixup(mark, grammar_pending_routine_sym);
                 grammar_lines[mark++] = ((wordcode >> 24) & 0xFF);
                 grammar_lines[mark++] = ((wordcode >> 16) & 0xFF);
                 grammar_lines[mark++] = ((wordcode >> 8) & 0xFF);

@@ -1041,6 +1041,19 @@ static void run_pass(void)
     issue_unused_warnings();
     compile_veneer();
 
+    /* Under deferred lowering nothing has been written to the code area
+       yet: every routine (game and veneer) was stashed. Lower, address,
+       and emit them all now, then refresh the tables that captured routine
+       addresses before those addresses were assigned: the veneer address
+       table and the action table (find_the_actions reads each ...Sub
+       routine's symbol value). */
+    if (deferred_lowering_active()) {
+        emit_deferred_routines();
+        veneer_backpatch_addresses();
+        find_the_actions();
+        grammar_backpatch_routines();
+    }
+
     lexer_endpass();
 
     issue_debug_symbol_warnings();

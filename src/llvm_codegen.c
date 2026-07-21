@@ -1737,10 +1737,65 @@ extern int llvm_pipeline_routine(void)
     return FALSE;
 }
 
+/* --- Deferred lowering ------------------------------------------------- */
+/* Under deferred lowering, a finished routine is not lowered at parse
+   time. Its whole IR container is moved into a retained array (the module
+   lives on in the shared llctx), keyed by handle, and reset so the next
+   routine builds cleanly. At end of pass asm.c restores each handle and
+   runs the normal pipeline. Rejected/absent IR retains nothing (-1); the
+   routine then replays its shadow stream. */
+static routine_unit *retained_units;
+static int retained_unit_count, retained_unit_cap;
+
+extern int llvm_retain_direct_routine(void)
+{
+    if (direct_ru.state != DIRECT_READY) {
+        /* No lowerable IR: log the build fallback (counts and diagnostics)
+           exactly as the eager pipeline would, so end-of-pass totals match.
+           The routine's captured shadow stream is replayed at end of pass. A
+           classic (INACTIVE) routine had no direct attempt and was already
+           noted, so it logs nothing here. */
+        if (direct_ru.state == DIRECT_REJECTED)
+            direct_fallback("direct-build", direct_ru.reason);
+        else if (direct_ru.state == DIRECT_BUILDING)
+            direct_fallback("direct-finish", "builder was not finalized");
+        return -1;
+    }
+    if (retained_unit_count >= retained_unit_cap) {
+        int nc = retained_unit_cap ? retained_unit_cap * 2 : 128;
+        routine_unit *n = realloc(retained_units, (size_t)nc * sizeof *n);
+        if (!n)
+            fatalerror("Out of memory retaining direct routines");
+        retained_units = n;
+        retained_unit_cap = nc;
+    }
+    retained_units[retained_unit_count] = direct_ru;  /* move ownership */
+    memset(&direct_ru, 0, sizeof direct_ru);
+    direct_ru.state = DIRECT_INACTIVE;
+    return retained_unit_count++;
+}
+
+extern int llvm_lower_retained_routine(int handle)
+{
+    if (handle < 0 || handle >= retained_unit_count)
+        return FALSE;
+    /* direct_dispose_ir (reached via the pipeline) frees the container's
+       resources, so hand it the retained copy and blank the slot. */
+    direct_ru = retained_units[handle];
+    memset(&retained_units[handle], 0, sizeof retained_units[handle]);
+    return llvm_pipeline_routine();
+}
+
 extern void llvm_codegen_free(void)
 {
     direct_dispose_ir();
     direct_ru.state = DIRECT_INACTIVE;
+    /* Any retained modules should have been consumed by end-of-pass
+       lowering; free the tracking array (the modules themselves die with
+       the context below). */
+    free(retained_units);
+    retained_units = NULL;
+    retained_unit_count = retained_unit_cap = 0;
     if (no_routines_direct || no_routines_classic
         || no_routines_direct_fallback) {
         printf("LLVM: backends direct=%d classic=%d fallback=%d\n",
