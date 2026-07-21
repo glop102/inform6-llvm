@@ -1057,6 +1057,42 @@ gains on additional VM dispatches.
   affect interpreted instruction count, but should be measured if larger
   corpus testing exposes compiler-time problems.
 
+### Backend State Containers
+
+The per-routine backend state was historically kept in scattered file
+statics. Gathering it into containers is low-risk (pure regrouping is
+byte-identical) and is a prerequisite for end-of-pass deferral and
+selective inlining (see the inlining plan). Status:
+
+- **Done — IR build state (`llvm_codegen.c`).** The 13 loose statics
+  (`direct_mod`/`direct_fn`/`direct_bld`, locals, labels, symbolic stack,
+  state, reason) are now one `routine_unit` struct with a single live
+  instance (`direct_ru`). This removes the "one live LLVM module at a
+  time" assumption so a finished routine's `{mod, fn}` can be retained as
+  a single value.
+- **Done — per-routine emission record (`asm.c`).** The direct-IR
+  capture/emission state is now one `routine_emission` struct with a
+  single live instance (`cur_emit`): the lowered stream
+  (`events`/`event_count`/`events_memlist`), the capture/replay flags
+  (`capturing`, `replaying`, `shadow_store`, `direct_started`,
+  `direct_errors`, `direct_compiler_errors`), and header bookkeeping
+  (`header_ha_start`/`_end`/`_stackargs`). Bundling these is the vehicle
+  end-of-pass deferral needs to capture and replay a routine out of parse
+  order (a copy of one record rather than ten globals). **Caveat honored:**
+  the record holds only the retainable product; the parse-visible
+  single-writer flags (`execution_never_reaches_here`,
+  `sequence_point_follows`, `labeluse[]`) stay loose globals because the
+  parser reads and writes them while generating the rest of the routine.
+  Two items were deliberately left out: `llvm_shadow_instruction_count`
+  (a cross-module reported metric, extern in `header.h` / read by
+  `llvm_lower.c`), and the general assembler identity
+  (`routine_symbol`, `current_routine_name`, `routine_start_pc`), which
+  the classic and debug paths also write; Phase 1 can reference those
+  without owning them.
+- **Already factored — the lowerer (`llvm_lower.c`).** `valinfo`,
+  `blockinfo`, `readset`, `treebuf`, `edgeplan`, `emitblock`, and
+  `emitplan` already carry their state; no regrouping is warranted there.
+
 ## Recommended Order of Work
 
 1. Resolved as policy: computed code addresses (including cross-routine

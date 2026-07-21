@@ -1078,7 +1078,7 @@ static void make_opcode_syntax_g(opcodeg opco)
 /*                                                                            */
 /*   2. Output buffering. Storing the shadow events exists only so a          */
 /*      routine the pipeline rejects can still be emitted classically.        */
-/*      llvm_shadow_store gates it; I6_LLVM_SHADOW=0 (a diagnostic mode)      */
+/*      cur_emit.shadow_store gates it; I6_LLVM_SHADOW=0 (a diagnostic mode)      */
 /*      disables retention to prove parsing does not depend on                */
 /*      the stored stream, at the cost of a compile error should any          */
 /*      routine actually fall back. Lowered output always lands in the        */
@@ -1107,13 +1107,42 @@ typedef struct llvm_event_s
     int custom_no;
 } llvm_event;
 
-static llvm_event *llvm_events;      /* the captured routine                 */
-static memory_list llvm_events_memlist;
-static int llvm_event_count;
+/* Per-routine direct-IR capture/emission state, gathered into one
+   container. Today exactly one routine is captured at a time (`cur_emit`,
+   reset at each routine header), so this is a byte-identical regrouping
+   of the former loose statics. The point is the datatype: end-of-pass
+   deferral (see the inlining plan) needs to capture a routine's lowered
+   stream and replay it out of parse order, which becomes a copy of this
+   record rather than wrangling ten globals.
 
-static int llvm_capturing;  /* suppressing encoding for the current routine  */
-static int llvm_replaying;  /* replaying the buffer through the encoder      */
-static int llvm_shadow_store; /* retaining shadow events for fallback replay */
+   The parse-visible single-writer flags (execution_never_reaches_here,
+   sequence_point_follows, labeluse[]) deliberately stay loose globals:
+   the parser reads and writes them while generating the rest of the
+   routine, so they are not part of the retainable emission product. */
+typedef struct routine_emission_s {
+    /* The captured/lowered instruction+label stream for this routine. */
+    llvm_event  *events;
+    memory_list  events_memlist;
+    int          event_count;
+    /* Capture/replay control for the current routine. */
+    int          capturing;    /* suppressing encoding for this routine   */
+    int          replaying;    /* replaying the buffer through the encoder */
+    int          shadow_store; /* retaining shadow events for fallback     */
+    /* Whether the direct IR builder ran for this routine, plus the error
+       counts at that point (a later error abandons the direct attempt). */
+    int          direct_started;
+    int          direct_errors;
+    int          direct_compiler_errors;
+    /* The Glulx routine header's location in the holding area, so a
+       local-count rewrite (llvm_patch_routine_locals) can find it. */
+    int32        header_ha_start;
+    int32        header_ha_end;
+    int          header_stackargs;
+} routine_emission;
+
+/* The one routine currently being captured/emitted. */
+static routine_emission cur_emit;
+
 int llvm_shadow_instruction_count; /* front-end instructions this routine    */
 
 /* Diagnostic mode: I6_LLVM_SHADOW=0 disables shadow event retention. */
@@ -1121,9 +1150,6 @@ static int llvm_shadow_enabled(void)
 {   const char *value = getenv("I6_LLVM_SHADOW");
     return !(value && value[0] && strcmp(value, "0") == 0);
 }
-static int llvm_direct_started;
-static int llvm_direct_errors;
-static int llvm_direct_compiler_errors;
 
 /* Opcode metadata accessors for the LLVM pipeline. The OPFLAG_* bits in
    header.h are defined to match the St/Br/Rf/St2 flag bits used here. */
@@ -1144,8 +1170,8 @@ static void llvm_capture_instruction(const assembly_instruction *AI)
 {   llvm_event *ev;
     opcodeg opco = internal_number_to_opcode_g(AI->internal_number);
 
-    ensure_memory_list_available(&llvm_events_memlist, llvm_event_count+1);
-    ev = &llvm_events[llvm_event_count++];
+    ensure_memory_list_available(&cur_emit.events_memlist, cur_emit.event_count+1);
+    ev = &cur_emit.events[cur_emit.event_count++];
     ev->is_label = FALSE;
     ev->label = -1;
     ev->exec_state = execution_never_reaches_here;
@@ -1168,8 +1194,8 @@ static void llvm_capture_instruction(const assembly_instruction *AI)
 static void llvm_capture_label(int n)
 {   llvm_event *ev;
 
-    ensure_memory_list_available(&llvm_events_memlist, llvm_event_count+1);
-    ev = &llvm_events[llvm_event_count++];
+    ensure_memory_list_available(&cur_emit.events_memlist, cur_emit.event_count+1);
+    ev = &cur_emit.events[cur_emit.event_count++];
     ev->is_label = TRUE;
     ev->label = n;
     /* The strip-label check has already run (and declined to strip), so it
@@ -1197,13 +1223,13 @@ static void shadow_note_instruction(const assembly_instruction *ai,
 static void llvm_replay_routine(void)
 {   int i;
 
-    llvm_replaying = TRUE;
+    cur_emit.replaying = TRUE;
 
     /* The encoder recounts branch uses as it goes. */
     labeluse_size = 0;
 
-    for (i=0; i<llvm_event_count; i++) {
-        llvm_event *ev = &llvm_events[i];
+    for (i=0; i<cur_emit.event_count; i++) {
+        llvm_event *ev = &cur_emit.events[i];
         execution_never_reaches_here = ev->exec_state;
         if (ev->is_label) {
             /* assemble_label_no clears the label's symbol association
@@ -1226,9 +1252,9 @@ static void llvm_replay_routine(void)
         }
     }
 
-    llvm_replaying = FALSE;
-    llvm_capturing = FALSE;
-    llvm_event_count = 0;
+    cur_emit.replaying = FALSE;
+    cur_emit.capturing = FALSE;
+    cur_emit.event_count = 0;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1241,7 +1267,7 @@ static void llvm_replay_routine(void)
 /* ------------------------------------------------------------------------- */
 
 extern void llvm_buffer_reset(void)
-{   llvm_event_count = 0;
+{   cur_emit.event_count = 0;
     execution_never_reaches_here = EXECSTATE_REACHABLE;
     sequence_point_follows = FALSE;
 }
@@ -1272,22 +1298,18 @@ extern int32 glulx_opcode_by_name(const char *name)
    before the routine body is captured. If lowering needs more local slots
    than the source declared, the header must be rewritten; these record
    where it is so llvm_patch_routine_locals() can rewind and re-emit it. */
-static int32 llvm_header_ha_start;  /* zcode_ha_size at the type byte        */
-static int32 llvm_header_ha_end;    /* zcode_ha_size when capture began      */
-static int   llvm_header_stackargs; /* 0xC0 function with _vararg_count      */
-
 extern int llvm_patch_routine_locals(int newcount)
 {   int i;
 
     /* If anything else landed in the holding area since the header (it
        never should), rewriting would corrupt it; the caller falls back. */
-    if (zcode_ha_size != llvm_header_ha_end)
+    if (zcode_ha_size != cur_emit.header_ha_end)
         return FALSE;
 
-    zmachine_pc -= (zcode_ha_size - llvm_header_ha_start);
-    zcode_ha_size = llvm_header_ha_start;
+    zmachine_pc -= (zcode_ha_size - cur_emit.header_ha_start);
+    zcode_ha_size = cur_emit.header_ha_start;
 
-    byteout(llvm_header_stackargs ? 0xC0 : 0xC1, 0);
+    byteout(cur_emit.header_stackargs ? 0xC0 : 0xC1, 0);
     i = newcount;
     while (i) {
         int j = i;
@@ -1299,7 +1321,7 @@ extern int llvm_patch_routine_locals(int newcount)
     }
     byteout(0, 0);
     byteout(0, 0);
-    if (llvm_header_stackargs) {
+    if (cur_emit.header_stackargs) {
         /* @copy sp _vararg_count; */
         byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0);
     }
@@ -1748,7 +1770,7 @@ extern void assembleg_instruction(const assembly_instruction *AI)
         return;
     }
 
-    if (llvm_capturing && !llvm_replaying) {
+    if (cur_emit.capturing && !cur_emit.replaying) {
         opcodeg capture_opco = internal_number_to_opcode_g(AI->internal_number);
         if (LLVM_CODEGEN && AI->internal_number == jumpabs_gc)
             warning("LLVM optimization does not preserve generated code "
@@ -1756,7 +1778,7 @@ extern void assembleg_instruction(const assembly_instruction *AI)
         llvm_shadow_instruction_count++;
         /* Storage first: the event snapshots sequence_point_follows and
            execution_never_reaches_here before bookkeeping consumes them. */
-        if (llvm_shadow_store)
+        if (cur_emit.shadow_store)
             llvm_capture_instruction(AI);
         shadow_note_instruction(AI, &capture_opco);
         return;
@@ -2070,8 +2092,8 @@ extern void assemble_label_no(int n)
         return;
     }
 
-    if (llvm_capturing && !llvm_replaying) {
-        if (llvm_shadow_store)
+    if (cur_emit.capturing && !cur_emit.replaying) {
+        if (cur_emit.shadow_store)
             llvm_capture_label(n);
     }
     else {
@@ -2242,8 +2264,8 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
     else {
         rv = zmachine_pc;
 
-        llvm_header_ha_start = zcode_ha_size;
-        llvm_header_stackargs = stackargs;
+        cur_emit.header_ha_start = zcode_ha_size;
+        cur_emit.header_stackargs = stackargs;
 
         if (stackargs)
             byteout(0xC0, 0); /* Glulx type byte for function */
@@ -2363,17 +2385,17 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
     if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
         && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
         && !stackargs) {
-        llvm_capturing = TRUE;
-        llvm_shadow_store = llvm_shadow_enabled();
-        llvm_event_count = 0;
+        cur_emit.capturing = TRUE;
+        cur_emit.shadow_store = llvm_shadow_enabled();
+        cur_emit.event_count = 0;
         llvm_shadow_instruction_count = 0;
-        llvm_header_ha_end = zcode_ha_size;
+        cur_emit.header_ha_end = zcode_ha_size;
         if (no_errors == 0 && no_compiler_errors == 0) {
             llvm_direct_routine_begin(current_routine_name.data, no_locals,
                 embedded_flag, stackargs);
-            llvm_direct_started = TRUE;
-            llvm_direct_errors = no_errors;
-            llvm_direct_compiler_errors = no_compiler_errors;
+            cur_emit.direct_started = TRUE;
+            cur_emit.direct_errors = no_errors;
+            cur_emit.direct_compiler_errors = no_compiler_errors;
         }
     }
     /* Stack-argument (type C0) routines are classic by policy, not by
@@ -2428,24 +2450,24 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
        when the front-end shadow stream must be replayed verbatim
        through the classic encoder.                                          */
 
-    if (llvm_direct_started) {
-        if (no_errors != llvm_direct_errors
-            || no_compiler_errors != llvm_direct_compiler_errors)
+    if (cur_emit.direct_started) {
+        if (no_errors != cur_emit.direct_errors
+            || no_compiler_errors != cur_emit.direct_compiler_errors)
             llvm_direct_routine_abandon();
         else
             llvm_direct_routine_finish(embedded_flag, fallthrough_reachable);
-        llvm_direct_started = FALSE;
+        cur_emit.direct_started = FALSE;
     }
 
-    if (llvm_capturing) {
-        if (!llvm_pipeline_routine() && !llvm_shadow_store) {
+    if (cur_emit.capturing) {
+        if (!llvm_pipeline_routine() && !cur_emit.shadow_store) {
             /* The shadow stream was not retained (I6_LLVM_SHADOW=0), so
                the routine cannot be emitted classically. */
             error_named("Routine fell back to classic generation with "
                 "shadow retention disabled (I6_LLVM_SHADOW=0):",
                 current_routine_name.data);
-            llvm_capturing = FALSE;
-            llvm_event_count = 0;
+            cur_emit.capturing = FALSE;
+            cur_emit.event_count = 0;
         }
         else
             llvm_replay_routine();
@@ -4314,11 +4336,11 @@ extern void init_asm_vars(void)
 
     zcode_area = NULL;
 
-    llvm_events = NULL;
-    llvm_event_count = 0;
-    llvm_capturing = FALSE;
-    llvm_replaying = FALSE;
-    llvm_shadow_store = TRUE;
+    cur_emit.events = NULL;
+    cur_emit.event_count = 0;
+    cur_emit.capturing = FALSE;
+    cur_emit.replaying = FALSE;
+    cur_emit.shadow_store = TRUE;
     llvm_shadow_instruction_count = 0;
 }
 
@@ -4331,10 +4353,10 @@ extern void asm_begin_pass(void)
     next_sequence_point = 0;
     zcode_ha_size = 0;
     execution_never_reaches_here = EXECSTATE_REACHABLE;
-    llvm_capturing = FALSE;
-    llvm_replaying = FALSE;
-    llvm_shadow_store = TRUE;
-    llvm_event_count = 0;
+    cur_emit.capturing = FALSE;
+    cur_emit.replaying = FALSE;
+    cur_emit.shadow_store = TRUE;
+    cur_emit.event_count = 0;
     llvm_shadow_instruction_count = 0;
 }
 
@@ -4376,8 +4398,8 @@ extern void asm_allocate_arrays(void)
         sizeof(char), 64, NULL,
         "routine name currently being defined");
 
-    initialise_memory_list(&llvm_events_memlist,
-        sizeof(llvm_event), 400, (void**)&llvm_events,
+    initialise_memory_list(&cur_emit.events_memlist,
+        sizeof(llvm_event), 400, (void**)&cur_emit.events,
         "llvm capture events");
 }
 
@@ -4397,7 +4419,7 @@ extern void asm_free_arrays(void)
     deallocate_memory_list(&named_routine_symbols_memlist);
     deallocate_memory_list(&zcode_area_memlist);
     deallocate_memory_list(&current_routine_name);
-    deallocate_memory_list(&llvm_events_memlist);
+    deallocate_memory_list(&cur_emit.events_memlist);
     llvm_codegen_free();
 }
 
