@@ -14,6 +14,7 @@
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Error.h>
+#include <llvm-c/Linker.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <llvm/Config/llvm-config.h>
 
@@ -106,6 +107,7 @@ typedef struct routine_unit_s {
     int            symstack_depth;
     int            spilled;      /* values our code left on the real stack */
     int32          assigned_pc;  /* reserved: Phase 1 end-of-pass address  */
+    int            routine_symbol; /* which routine this is (for inlining)  */
 } routine_unit;
 
 /* The one routine currently being built. */
@@ -484,6 +486,11 @@ extern void llvm_note_classic_routine(const char *reason)
     putchar('\n');
 }
 
+/* While lowering a retained routine (deferred/end-of-pass), its module is
+   not owned by direct_ru -- it stays in retained_units so callees remain
+   available for inlining -- and is freed later with the context. */
+static int direct_lowering_retained;
+
 static void direct_dispose_ir(void)
 {
     if (direct_ru.bld) {
@@ -491,7 +498,8 @@ static void direct_dispose_ir(void)
         direct_ru.bld = NULL;
     }
     if (direct_ru.mod) {
-        LLVMDisposeModule(direct_ru.mod);
+        if (!direct_lowering_retained)
+            LLVMDisposeModule(direct_ru.mod);
         direct_ru.mod = NULL;
     }
     free(direct_ru.locals);
@@ -1668,11 +1676,210 @@ static void direct_fallback(const char *stage, const char *detail)
     direct_ru.reason = NULL;
 }
 
+/* ---- Selective inlining (Phase 2) ------------------------------------- */
+/* Before a routine is optimized and lowered, small direct callees whose IR
+   is still retained are spliced in: the callee module is cloned and linked
+   in, each opaque i6.callf* to it becomes a real call to the clone (marked
+   alwaysinline), and an always-inline pass folds them in. This removes the
+   call/return dispatch and the opaque-call optimization barrier for hot
+   leaf helpers (e.g. Z__Region). Inlining is off unless I6_LLVM_INLINE is
+   set while the transform is under evaluation. */
+
+#define INLINE_MAX_BLOCKS 16
+#define INLINE_MAX_INSTS  70
+
+static const char *const inline_call_names[4] =
+    { "i6.callf", "i6.callfi", "i6.callfii", "i6.callfiii" };
+
+static routine_unit *retained_for_symbol(int symindex);  /* defined below */
+
+static int inlining_enabled(void)
+{   const char *v = getenv("I6_LLVM_INLINE");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+static int is_call_to(LLVMValueRef call, const char *name)
+{
+    LLVMValueRef f;
+    if (!call || !LLVMIsACallInst(call)) return 0;
+    f = LLVMGetCalledValue(call);
+    if (!f || !LLVMIsAFunction(f)) return 0;
+    return strcmp(LLVMGetValueName(f), name) == 0;
+}
+
+static int fn_within_size(LLVMValueRef fn, int max_blocks, int max_insts)
+{
+    int blocks = 0, insts = 0;
+    LLVMBasicBlockRef bb;
+    for (bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef in;
+        if (++blocks > max_blocks) return 0;
+        for (in = LLVMGetFirstInstruction(bb); in;
+             in = LLVMGetNextInstruction(in))
+            if (++insts > max_insts) return 0;
+    }
+    return 1;
+}
+
+static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
+    int caller_symbol)
+{
+    LLVMBasicBlockRef bb;
+    LLVMValueRef calls[128];
+    int callee_sym[128];
+    int arity[128];
+    int ncalls = 0, i, did = 0;
+    LLVMBuilderRef bld;
+
+    if (!inlining_enabled()) return 0;
+
+    /* Collect eligible i6.callf* (0..3 arg) calls to a retained direct
+       routine other than ourselves whose body is within the size caps. */
+    for (bb = LLVMGetFirstBasicBlock(caller_fn); bb;
+         bb = LLVMGetNextBasicBlock(bb)) {
+        LLVMValueRef in;
+        for (in = LLVMGetFirstInstruction(bb); in;
+             in = LLVMGetNextInstruction(in)) {
+            int n;
+            if (!LLVMIsACallInst(in)) continue;
+            for (n = 0; n <= 3; n++) {
+                LLVMValueRef func;
+                routine_unit *ce;
+                int32 marker, value, symindex, callee_symbol;
+                if (!is_call_to(in, inline_call_names[n])) continue;
+                func = LLVMGetOperand(in, 0);
+                if (!is_call_to(func, "i6.sym")) break;
+                marker = (int32)LLVMConstIntGetSExtValue(LLVMGetOperand(func, 0));
+                value  = (int32)LLVMConstIntGetSExtValue(LLVMGetOperand(func, 1));
+                symindex =
+                    (int32)LLVMConstIntGetSExtValue(LLVMGetOperand(func, 2));
+                /* Resolve the reference to the callee's routine symbol. A
+                   direct routine reference is SYMBOL_MV (address deferred
+                   through the symbol) or occasionally the baked IROUTINE_MV,
+                   both carrying the symbol in operand 2. A veneer reference
+                   is VROUTINE_MV carrying the veneer index in operand 1. */
+                if (marker == SYMBOL_MV || marker == IROUTINE_MV)
+                    callee_symbol = symindex;
+                else if (marker == VROUTINE_MV)
+                    callee_symbol = veneer_symbol_for_index(value);
+                else break;
+                if (callee_symbol < 0 || callee_symbol == caller_symbol) break;
+                ce = retained_for_symbol(callee_symbol);
+                if (ce && ce->mod && ce->fn && ncalls < 128
+                    && fn_within_size(ce->fn, INLINE_MAX_BLOCKS,
+                        INLINE_MAX_INSTS)) {
+                    calls[ncalls] = in;
+                    callee_sym[ncalls] = callee_symbol;
+                    arity[ncalls] = n;
+                    ncalls++;
+                }
+                break;
+            }
+        }
+    }
+    if (ncalls == 0) return 0;
+
+    bld = LLVMCreateBuilderInContext(llctx);
+    for (i = 0; i < ncalls; i++) {
+        routine_unit *ce = retained_for_symbol(callee_sym[i]);
+        LLVMModuleRef clone;
+        LLVMValueRef cfn, target, real;
+        LLVMTypeRef fty;
+        unsigned nparams, p;
+        LLVMValueRef args[16];
+        char uniq[48];
+
+        if (!ce || !ce->mod || !ce->fn) continue;
+        clone = LLVMCloneModule(ce->mod);
+        cfn = LLVMGetNamedFunction(clone, LLVMGetValueName(ce->fn));
+        if (!cfn) { LLVMDisposeModule(clone); continue; }
+        sprintf(uniq, "i6.inl.%d.%d", caller_symbol, i);
+        LLVMSetValueName2(cfn, uniq, strlen(uniq));
+        /* Keep external linkage across the link so the linker does not
+           dead-strip this (as yet unreferenced) function; it is made
+           internal below, once the real call references it. */
+        {   unsigned kind =
+                LLVMGetEnumAttributeKindForName("alwaysinline", 12);
+            LLVMAddAttributeAtIndex(cfn, LLVMAttributeFunctionIndex,
+                LLVMCreateEnumAttribute(llctx, kind, 0));
+        }
+        if (LLVMLinkModules2(mod, clone)) continue;  /* clone consumed */
+        target = LLVMGetNamedFunction(mod, uniq);
+        if (!target) continue;
+        /* Now referenced by the call built below; internal + alwaysinline
+           lets the always-inline pass fold it in and delete it. */
+        LLVMSetLinkage(target, LLVMInternalLinkage);
+        fty = LLVMGlobalGetValueType(target);
+        nparams = LLVMCountParams(target);
+        if (nparams > 16) continue;
+        /* Glulx passes each argument to the matching local; missing locals
+           default to 0, extra arguments are discarded. */
+        for (p = 0; p < nparams; p++)
+            args[p] = ((int)p < arity[i])
+                ? LLVMGetOperand(calls[i], 1 + p)
+                : LLVMConstInt(i32t, 0, FALSE);
+        LLVMPositionBuilderBefore(bld, calls[i]);
+        real = LLVMBuildCall2(bld, fty, target, args, nparams, "inl");
+        LLVMReplaceAllUsesWith(calls[i], real);
+        LLVMInstructionEraseFromParent(calls[i]);
+        did++;
+    }
+    LLVMDisposeBuilder(bld);
+
+    if (did) {
+        LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+        LLVMErrorRef err = LLVMRunPasses(mod, "always-inline", NULL, opts);
+        if (err) LLVMConsumeError(err);
+        LLVMDisposePassBuilderOptions(opts);
+    }
+    return did;
+}
+
+/* Optimize and lower `fn` in `mod`, filling the event buffer on success.
+   On failure sets the stage and why strings to the failing phase and returns FALSE with
+   no other side effects (no fallback logging, no disposal), so the caller
+   can retry a different module. */
+static int try_optimize_and_lower(LLVMModuleRef mod, LLVMValueRef fn,
+    const char **stage, const char **why, int *insts_in, int *insts_out)
+{
+    char *errmsg = NULL;
+    {   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+        LLVMErrorRef err = LLVMRunPasses(mod, LLVM_PASS_PIPELINE, NULL, opts);
+        LLVMDisposePassBuilderOptions(opts);
+        if (err) {
+            *stage = "direct-optimize";
+            *why = "optimization pass failure";
+            LLVMConsumeError(err);
+            return FALSE;
+        }
+    }
+    unmerge_pointer_selects(fn);
+    if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &errmsg)) {
+        *stage = "direct-post-verify";
+        *why = "post-optimization verification failed";
+        LLVMDisposeMessage(errmsg);
+        return FALSE;
+    }
+    LLVMDisposeMessage(errmsg);
+    dump_module(mod, "direct-post-opt");
+    if (!llvm_lower_routine(mod, fn, why, insts_in, insts_out)) {
+        *stage = "direct-lower";
+        if (!*why) *why = "lowering failed";
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static int process_direct_routine(void)
 {
     char *errmsg = NULL;
     const char *why = NULL;
     int insts_in = 0, insts_out = 0;
+
+    const char *stage = NULL;
+    LLVMModuleRef inl;
+    LLVMValueRef inl_fn;
+    int inlined_ok = 0;
 
     if (LLVMVerifyModule(direct_ru.mod, LLVMReturnStatusAction, &errmsg)) {
         direct_fallback("direct-verify", errmsg ? errmsg : "verification failed");
@@ -1682,32 +1889,26 @@ static int process_direct_routine(void)
     LLVMDisposeMessage(errmsg);
     dump_module(direct_ru.mod, "direct-pre-opt");
 
-    {   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-        LLVMErrorRef err = LLVMRunPasses(
-            direct_ru.mod, LLVM_PASS_PIPELINE, NULL, opts);
-        LLVMDisposePassBuilderOptions(opts);
-        if (err) {
-            char *msg = LLVMGetErrorMessage(err);
-            direct_fallback("direct-optimize", msg ? msg : "pass failure");
-            LLVMDisposeErrorMessage(msg);
-            return FALSE;
-        }
+    /* Try inlining on a throwaway clone: if the inlined form optimizes and
+       lowers, use it; otherwise fall back to the un-inlined module, so
+       inlining can never make a routine worse than it already was (e.g. by
+       bloating a hot caller past a lowerer limit into a classic fallback). */
+    if (direct_lowering_retained && inlining_enabled()) {
+        inl = LLVMCloneModule(direct_ru.mod);
+        inl_fn = LLVMGetNamedFunction(inl, LLVMGetValueName(direct_ru.fn));
+        if (inl_fn
+            && inline_direct_calls(inl, inl_fn, direct_ru.routine_symbol) > 0
+            && try_optimize_and_lower(inl, inl_fn, &stage, &why,
+                   &insts_in, &insts_out))
+            inlined_ok = 1;
+        LLVMDisposeModule(inl);
     }
 
-    unmerge_pointer_selects(direct_ru.fn);
-    errmsg = NULL;
-    if (LLVMVerifyModule(direct_ru.mod, LLVMReturnStatusAction, &errmsg)) {
-        direct_fallback("direct-post-verify",
-            errmsg ? errmsg : "post-optimization verification failed");
-        LLVMDisposeMessage(errmsg);
-        return FALSE;
-    }
-    LLVMDisposeMessage(errmsg);
-    dump_module(direct_ru.mod, "direct-post-opt");
-
-    if (!llvm_lower_routine(direct_ru.mod, direct_ru.fn, &why,
-            &insts_in, &insts_out)) {
-        direct_fallback("direct-lower", why ? why : "lowering failed");
+    if (!inlined_ok
+        && !try_optimize_and_lower(direct_ru.mod, direct_ru.fn, &stage, &why,
+               &insts_in, &insts_out)) {
+        direct_fallback(stage ? stage : "direct-lower",
+            why ? why : "lowering failed");
         return FALSE;
     }
     report_backend("direct", "lower", insts_in, insts_out);
@@ -1747,7 +1948,20 @@ extern int llvm_pipeline_routine(void)
 static routine_unit *retained_units;
 static int retained_unit_count, retained_unit_cap;
 
-extern int llvm_retain_direct_routine(void)
+/* The retained unit for a routine symbol, or NULL. Used by the inliner to
+   find a callee's module. Linear scan; routine counts are modest and this
+   only runs when inlining is enabled. */
+static routine_unit *retained_for_symbol(int symindex)
+{
+    int i;
+    if (symindex < 0) return NULL;
+    for (i = 0; i < retained_unit_count; i++)
+        if (retained_units[i].mod && retained_units[i].routine_symbol == symindex)
+            return &retained_units[i];
+    return NULL;
+}
+
+extern int llvm_retain_direct_routine(int routine_symbol)
 {
     if (direct_ru.state != DIRECT_READY) {
         /* No lowerable IR: log the build fallback (counts and diagnostics)
@@ -1769,6 +1983,12 @@ extern int llvm_retain_direct_routine(void)
         retained_units = n;
         retained_unit_cap = nc;
     }
+    /* The per-build scratch (allocas/blocks) is dead once the function is
+       finalized; only the module and function are needed to lower or inline
+       it. Free it now so the retained unit holds just those. */
+    free(direct_ru.locals); direct_ru.locals = NULL; direct_ru.local_count = 0;
+    free(direct_ru.labels); direct_ru.labels = NULL; direct_ru.label_count = 0;
+    direct_ru.routine_symbol = routine_symbol;
     retained_units[retained_unit_count] = direct_ru;  /* move ownership */
     memset(&direct_ru, 0, sizeof direct_ru);
     direct_ru.state = DIRECT_INACTIVE;
@@ -1781,9 +2001,17 @@ extern int llvm_lower_retained_routine(int handle)
         return FALSE;
     /* direct_dispose_ir (reached via the pipeline) frees the container's
        resources, so hand it the retained copy and blank the slot. */
+    /* Lower a non-owning view of the retained unit: the module stays in
+       retained_units[handle] (alive for other routines to inline) and is
+       freed with the context, not here. */
     direct_ru = retained_units[handle];
-    memset(&retained_units[handle], 0, sizeof retained_units[handle]);
-    return llvm_pipeline_routine();
+    direct_lowering_retained = TRUE;
+    {   int ok = llvm_pipeline_routine();
+        direct_lowering_retained = FALSE;
+        memset(&direct_ru, 0, sizeof direct_ru);
+        direct_ru.state = DIRECT_INACTIVE;
+        return ok;
+    }
 }
 
 extern void llvm_codegen_free(void)

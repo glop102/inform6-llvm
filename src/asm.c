@@ -2621,7 +2621,7 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
            end-of-pass emission. Nothing is written to the code area now,
            so no address is assigned here. A non-captured routine (e.g.
            asterisk-traced) falls through to eager emission below. */
-        int handle = llvm_retain_direct_routine();  /* -1 if classic */
+        int handle = llvm_retain_direct_routine(routine_symbol); /* -1 classic */
         stash_deferred_routine(embedded_flag, handle);
         cur_emit.capturing = FALSE;
         cur_emit.event_count = 0;

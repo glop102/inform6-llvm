@@ -2454,6 +2454,17 @@ override the standard definition) but cannot use it for anything else:",
    the routines are emitted at end of pass, after compile_veneer() has run.
    Re-read each compiled veneer routine's address from its symbol so the
    VROUTINE_MV backpatch table is correct before backpatching. */
+/* The routine symbol of a compiled veneer routine by its index, or -1.
+   Used by the inliner to find a veneer callee (VROUTINE_MV) module. */
+extern int veneer_symbol_for_index(int index)
+{
+    VeneerRoutine *VRs = (!glulx_mode) ? VRs_z : VRs_g;
+    if (index < 0 || index >= VENEER_ROUTINES
+        || veneer_routine_needs_compilation[index] != VR_COMPILED)
+        return -1;
+    return symbol_index(VRs[index].name, -1, NULL);
+}
+
 extern void veneer_backpatch_addresses(void)
 {
     int i, j;

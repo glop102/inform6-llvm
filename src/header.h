@@ -2262,7 +2262,7 @@ extern int   llvm_pipeline_routine(void);
    (module moved out of the current routine, returning a handle >= 0, or
    -1 if there is no direct IR to retain); at end of pass the retained
    module for a handle is lowered through the normal pipeline. */
-extern int   llvm_retain_direct_routine(void);
+extern int   llvm_retain_direct_routine(int routine_symbol);
 extern int   llvm_lower_retained_routine(int handle);
 extern void  llvm_direct_routine_begin(const char *name, int local_count,
                  int embedded_flag, int stack_arguments);
@@ -3084,6 +3084,7 @@ extern assembly_operand veneer_routine(int code);
 extern char *veneer_routine_name(int code);
 extern void compile_veneer(void);
 extern void veneer_backpatch_addresses(void);
+extern int  veneer_symbol_for_index(int index);
 extern void grammar_backpatch_routines(void);
 
 /* ------------------------------------------------------------------------- */
