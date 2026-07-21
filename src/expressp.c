@@ -137,6 +137,17 @@ but not used as a value:", unicode);
                         v = symbol;
                         break;
                     }
+                    /* In Glulx, resolve routine addresses through the symbol
+                       (SYMBOL_MV) rather than baking the address here, so
+                       end-of-pass address assignment (deferred lowering) can
+                       set symbols[symbol].value after this reference is
+                       emitted. Same final address; the operand is a 4-byte
+                       backpatched constant either way. */
+                    if (glulx_mode)
+                    {   current_token.marker = SYMBOL_MV;
+                        v = symbol;
+                        break;
+                    }
                     current_token.marker = IROUTINE_MV;
                     break;
                 case GLOBAL_VARIABLE_T:

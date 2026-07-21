@@ -775,8 +775,11 @@ static void parse_print_g(int finally_return)
                           }
                           else
                           {   INITAOT(&AO, CONSTANT_OT);
-                              AO.value = symbols[token_value].value;
-                              AO.marker = IROUTINE_MV;
+                              /* Defer the address through the symbol so
+                                 end-of-pass address assignment can set it;
+                                 same final address (Glulx). */
+                              AO.value = token_value;
+                              AO.marker = SYMBOL_MV;
                               AO.symindex = token_value;
                               if (symbols[token_value].type != ROUTINE_T)
                                 ebf_curtoken_error("printing routine name");
