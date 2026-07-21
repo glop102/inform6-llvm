@@ -219,7 +219,13 @@ extern int parse_directive(int internal_flag)
                The first time we see a definition for symbol X, we
                copy it to Y -- that's the "original" form of the
                function. */
-            if (symbols[rep_symbol].value == 0) {
+            if (deferred_lowering_active()) {
+                /* X has no address yet (it is assigned at end of pass);
+                   attach Y to the just-stashed definition instead of
+                   copying the parse-time placeholder. */
+                defer_replace_original(rep_symbol);
+            }
+            else if (symbols[rep_symbol].value == 0) {
                 assign_symbol(rep_symbol, symbols[routine_symbol].value, ROUTINE_T);
             }
         }

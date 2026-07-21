@@ -2147,19 +2147,46 @@ extern void define_symbol_label(int symbol)
 /*   emitted story is byte-identical to eager emission.                      */
 /*                                                                           */
 /*   Gated off for modes whose routines cannot be deferred: Z-code, debug/   */
-/*   traced/infix builds (live preambles and sequence points), and dead-     */
+/*   infix builds (sequence points don't survive reordering), and dead-      */
 /*   routine stripping (which records emission PCs at parse time).           */
+/*   Asterisk-traced routines (and -g builds) DO defer: their runtime trace  */
+/*   preamble is ordinary captured code, they just take no direct IR.        */
+/*                                                                           */
+/*   The decision is LATCHED once per pass, before Main__ compiles. It must  */
+/*   not be re-derived from the live switches: a mid-source 'Switches'       */
+/*   directive runs after Main__ has already been stashed, and flipping the  */
+/*   gate then would strand the stash (Main__ never emitted) while later     */
+/*   routines emit eagerly from pc 0.                                        */
 /* ------------------------------------------------------------------------- */
 
-extern int deferred_lowering_active(void)
+static int deferred_lowering_latch = -1;    /* -1 until latched by the pass */
+
+static int deferred_lowering_wanted(void)
 {
     return glulx_mode && LLVM_CODEGEN && llvm_codegen_available()
         && !debugfile_switch && !define_INFIX_switch
-        && (trace_fns_setting == 0) && !track_unused_routines;
+        && !track_unused_routines;
+}
+
+extern int deferred_lowering_active(void)
+{
+    return (deferred_lowering_latch >= 0)
+        ? deferred_lowering_latch : deferred_lowering_wanted();
+}
+
+/* TRUE if a switch change since the latch would alter the deferral
+   decision -- i.e. a 'Switches' directive tried to enable a mode the
+   latched pass cannot honour. The directive handler treats this as fatal. */
+extern int deferred_lowering_latch_conflict(void)
+{
+    return deferred_lowering_latch >= 0
+        && deferred_lowering_latch != deferred_lowering_wanted();
 }
 
 typedef struct deferred_routine_s {
     int    routine_symbol;      /* symbol to receive the emitted address    */
+    int    also_assign_symbol;  /* "Replace X Y": Y takes this address too,
+                                   or -1 (see defer_replace_original)       */
     char  *name;                /* owned copy, for diagnostics              */
     int    no_locals;
     int    embedded_flag;
@@ -2205,6 +2232,7 @@ static void stash_deferred_routine(int embedded_flag, int ir_handle)
     }
     d = &deferred_routines[deferred_routine_count++];
     d->routine_symbol = routine_symbol;
+    d->also_assign_symbol = -1;
     len = strlen(current_routine_name.data) + 1;
     d->name = malloc(len);
     if (!d->name) fatalerror("Out of memory stashing deferred routine name");
@@ -2225,6 +2253,35 @@ static void stash_deferred_routine(int embedded_flag, int ir_handle)
     } else {
         d->events = NULL;
     }
+}
+
+/* "Replace X Y": Y must receive the address of X's *first* definition,
+   which under deferred lowering does not exist until end of pass (copying
+   symbols[X].value at parse time, as the eager path does, would bake the
+   placeholder 0 and resolve Y to the code-area start). Attach Y to the
+   just-stashed record of that first definition; emission assigns Y
+   alongside the routine's own symbol. The first-definition rule is kept by
+   refusing a second attachment of the same Y. */
+extern void defer_replace_original(int rep_symbol)
+{
+    int i;
+    if (deferred_routine_count == 0
+        || deferred_routines[deferred_routine_count-1].routine_symbol
+               != routine_symbol) {
+        compiler_error("Replace target routine was not the last stashed");
+        return;
+    }
+    if (symbols[rep_symbol].value != 0) return;
+    for (i = 0; i < deferred_routine_count; i++)
+        if (deferred_routines[i].also_assign_symbol == rep_symbol)
+            return;
+    deferred_routines[deferred_routine_count-1].also_assign_symbol
+        = rep_symbol;
+    /* The Replace directive defined Y as a zero CONSTANT_T. Give it its
+       routine identity now, with the same placeholder value every deferred
+       routine symbol carries, so references between here and end of pass
+       compile as SYMBOL_MV routine operands (not a literal 0). */
+    assign_symbol(rep_symbol, 0, ROUTINE_T);
 }
 
 /* End of pass: lower, address, and emit every stashed routine in the order
@@ -2267,6 +2324,8 @@ extern void emit_deferred_routines(void)
         routine_start_pc = zmachine_pc;
         if (d->routine_symbol >= 0)
             symbols[d->routine_symbol].value = zmachine_pc;
+        if (d->also_assign_symbol >= 0)
+            assign_symbol(d->also_assign_symbol, zmachine_pc, ROUTINE_T);
         emit_glulx_routine_header(d->stackargs, d->no_locals);
 
         /* Lower the retained direct IR (which refills the buffer with the
@@ -2431,17 +2490,52 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         rv = zmachine_pc;
 
         cur_emit.header_stackargs = stackargs;
-        /* A routine defers only if it will be captured; an asterisk-traced
-           routine is not (its live trace preamble can't be replayed), so it
-           emits eagerly even inside a deferred compile. For a deferred
-           routine the header is emitted at end of pass, when its address is
-           assigned; rv is a placeholder the end-of-pass address overwrites. */
-        if (!(deferred_lowering_active() && !routine_asterisked))
+        /* For a deferred routine the header is emitted at end of pass,
+           when its address is assigned; rv is a placeholder the
+           end-of-pass assignment overwrites. */
+        if (!deferred_lowering_active())
             emit_glulx_routine_header(stackargs, no_locals);
 
         next_label = 0; next_sequence_point = 0;
-        first_label = -1; last_label = -1; 
+        first_label = -1; last_label = -1;
         labeluse_size = 0;
+
+        /* Begin capturing this routine's code for the LLVM pipeline.
+           This sits above the asterisk-trace preamble so that under
+           deferred lowering the preamble -- ordinary runtime code -- is
+           part of the captured stream: a traced routine then defers like
+           any other classic-captured routine (it just builds no direct
+           IR). In eager mode traced routines stay uncaptured classic, as
+           do stack-argument routines. Debug builds are excluded:
+           sequence points don't survive reordering. */
+        if (LLVM_CODEGEN && llvm_codegen_available()
+            && !debugfile_switch && !define_INFIX_switch
+            && (deferred_lowering_active()
+                || (!routine_asterisked && !stackargs))) {
+            cur_emit.capturing = TRUE;
+            cur_emit.shadow_store = llvm_shadow_enabled();
+            cur_emit.event_count = 0;
+            llvm_shadow_instruction_count = 0;
+            cur_emit.header_ha_end = zcode_ha_size;
+            if (!stackargs && !routine_asterisked
+                && no_errors == 0 && no_compiler_errors == 0) {
+                llvm_direct_routine_begin(current_routine_name.data,
+                    no_locals, embedded_flag, stackargs);
+                cur_emit.direct_started = TRUE;
+                cur_emit.direct_errors = no_errors;
+                cur_emit.direct_compiler_errors = no_compiler_errors;
+            }
+            else {
+                /* No direct IR will be built (a stack-argument or
+                   asterisk-traced classic-policy routine): under deferred
+                   lowering the captured stream is this routine's only
+                   output -- not a fallback -- so it must be retained even
+                   when the fallback shadow is disabled (I6_LLVM_SHADOW=0). */
+                cur_emit.shadow_store = TRUE;
+            }
+            if (stackargs && !routine_asterisked)
+                llvm_note_classic_routine("stack-argument routine");
+        }
 
         if ((routine_asterisked) || (define_INFIX_switch)) {
             int ix;
@@ -2522,39 +2616,6 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         }
     }
 
-    /* Begin capturing this routine's code for the LLVM pipeline. Debug
-       builds are excluded: sequence points and the asterisk-trace preamble
-       (which is already encoded above, with live labels) don't survive
-       reordering. */
-    if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
-        && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
-        && (!stackargs || deferred_lowering_active())) {
-        cur_emit.capturing = TRUE;
-        cur_emit.shadow_store = llvm_shadow_enabled();
-        cur_emit.event_count = 0;
-        llvm_shadow_instruction_count = 0;
-        cur_emit.header_ha_end = zcode_ha_size;
-        /* Stack-argument routines stay classic (see below), but under
-           deferred lowering they are still captured so they can be emitted
-           at end of pass with everything else; they just get no direct IR. */
-        if (!stackargs && no_errors == 0 && no_compiler_errors == 0) {
-            llvm_direct_routine_begin(current_routine_name.data, no_locals,
-                embedded_flag, stackargs);
-            cur_emit.direct_started = TRUE;
-            cur_emit.direct_errors = no_errors;
-            cur_emit.direct_compiler_errors = no_compiler_errors;
-        }
-        else {
-            /* No direct IR will be built (a stack-argument/policy-classic
-               routine): under deferred lowering the captured stream is this
-               routine's only output -- not a fallback -- so it must be
-               retained even when the fallback shadow is disabled
-               (I6_LLVM_SHADOW=0). */
-            cur_emit.shadow_store = TRUE;
-        }
-        if (stackargs)
-            llvm_note_classic_routine("stack-argument routine");
-    }
     /* Stack-argument (type C0) routines are classic by policy, not by
        gap. Dynamic attribution on the cloak walkthrough put the whole C0
        set at 8.35% of self-ops, 96% of it in CA__Pr alone, whose
@@ -2565,8 +2626,10 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
        (arguments left on the VM stack, _vararg_count popped by the
        header). Revisit only with new attribution evidence; the tests
        pin "stack-argument routine" as the only permitted classic-policy
-       reason. */
-    else if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
+       reason. Captured (deferred) stack-argument routines were noted
+       above; this covers the eager uncaptured case. */
+    if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
+        && !deferred_lowering_active()
         && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
         && stackargs)
         llvm_note_classic_routine("stack-argument routine");
@@ -2619,8 +2682,9 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
     if (deferred_lowering_active() && cur_emit.capturing) {
         /* Defer: retain the IR (if any) and stash the captured stream for
            end-of-pass emission. Nothing is written to the code area now,
-           so no address is assigned here. A non-captured routine (e.g.
-           asterisk-traced) falls through to eager emission below. */
+           so no address is assigned here. Under an active (latched) gate
+           every Glulx routine is captured, so the eager branch below runs
+           only when deferral is off. */
         int handle = llvm_retain_direct_routine(routine_symbol); /* -1 classic */
         stash_deferred_routine(embedded_flag, handle);
         cur_emit.capturing = FALSE;
@@ -4515,6 +4579,7 @@ extern void init_asm_vars(void)
 
 extern void asm_begin_pass(void)
 {   no_instructions = 0;
+    deferred_lowering_latch = deferred_lowering_wanted();
     zmachine_pc = 0;
     no_sequence_points = 0;
     next_label = 0;

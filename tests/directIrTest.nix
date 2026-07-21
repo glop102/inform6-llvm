@@ -28,6 +28,34 @@ let
         return x % y;
     ];
   '';
+  # Regression canary for deferred-lowering address timing. Three
+  # historically silent miscompiles are exercised at once:
+  # - "Switches g" runs after Main__ is compiled and stashed; the latched
+  #   deferral decision must survive it (traced routines defer as
+  #   classic-captured code rather than emitting eagerly at the code-area
+  #   start, where the Glulx header's start-function field points).
+  # - An asterisk-traced routine likewise must not displace Main__.
+  # - "Replace X Y" must resolve Y to X's *first* definition even though
+  #   routine addresses are assigned at end of pass.
+  deferredTimingSource = writeText "direct-ir-deferred-timing.inf" ''
+    Switches g;
+    Replace Orig NewOrig;
+    [ Orig; return 100; ];
+    [ Traced * x; return x + 5; ];
+    [ Orig; return NewOrig() + 1; ];
+    [ Main win dummy;
+        @setiosys 2 0;
+        @copy 0 sp;
+        @copy 3 sp;
+        @copy 0 sp;
+        @copy 0 sp;
+        @copy 0 sp;
+        @glk $0023 5 win;
+        @copy win sp;
+        @glk $002F 1 dummy;
+        print "orig=", Orig(), " traced=", Traced(2), "^";
+    ];
+  '';
   direct = runCommand "direct-ir-build" { } ''
     mkdir "$out"
     I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
@@ -91,6 +119,14 @@ let
   '';
   uncheckedRemainderUpstream = runCommand "direct-ir-unchecked-remainder-upstream.ulx" { } ''
     ${lib.getExe inform6-upstream} -~S -G ${uncheckedRemainderSource} "$out"
+  '';
+  deferredTimingDirect = runCommand "direct-ir-deferred-timing" { } ''
+    mkdir "$out"
+    ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${deferredTimingSource} "$out/story.ulx" >"$out/compile.log" 2>&1
+  '';
+  deferredTimingUpstream = runCommand "direct-ir-deferred-timing-upstream.ulx" { } ''
+    ${lib.getExe inform6-upstream} -G ${deferredTimingSource} "$out"
   '';
   memoryStrictDirect = runCommand "direct-ir-memory-strict" { } ''
     mkdir "$out"
@@ -370,6 +406,23 @@ writeShellApplication {
         ${uncheckedDivisionUpstream} ${uncheckedDivisionDirect}
     check_unchecked_fault unchecked-remainder \
         ${uncheckedRemainderUpstream} ${uncheckedRemainderDirect}
+
+    set +e
+    timeout 30 glulxe ${deferredTimingUpstream} </dev/null \
+        >"$work/deferred-timing-upstream.log" 2>&1
+    deferred_upstream_status=$?
+    timeout 30 glulxe ${deferredTimingDirect}/story.ulx </dev/null \
+        >"$work/deferred-timing-direct.log" 2>&1
+    deferred_direct_status=$?
+    set -e
+    if [ "$deferred_upstream_status" -eq 124 ] || \
+       [ "$deferred_direct_status" -eq 124 ] || \
+       [ "$deferred_upstream_status" -ne "$deferred_direct_status" ] || \
+       ! cmp -s "$work/deferred-timing-upstream.log" \
+                "$work/deferred-timing-direct.log"; then
+        echo "FAIL  direct-ir (deferred address-timing behavior differs)"
+        fail=1
+    fi
 
     mem_re=$'^LLVM-BACKEND\tname=Mem_(Note|WordRead|WordWrite|ByteRW|ArrInc|Order|Computed|Has|Hasnt|In|Notin|Ofclass|Provides|PropRead|PropWrite|PropInc|PropAddr|PropLen|PropCall|Parent|Child|Sibling|Random|RandomVar|Print|PrintChar|PrintOrder|PrintRet|PrintObj|Style|GiveMove|Quit|Shifts|ShiftVar)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
     if [ "$(grep -acE "$mem_re" ${memoryStrictDirect}/compile.log)" -ne 34 ]; then

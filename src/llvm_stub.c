@@ -123,6 +123,21 @@ extern int llvm_pipeline_routine(void)
     return FALSE;
 }
 
+/* Deferred lowering never activates in a stub build (its gate requires
+   llvm_codegen_available()), so these are link-time placeholders only. */
+extern int llvm_retain_direct_routine(int routine_symbol)
+{
+    (void)routine_symbol;
+    any_routine_captured = TRUE;
+    return -1;
+}
+
+extern int llvm_lower_retained_routine(int handle)
+{
+    (void)handle;
+    return FALSE;
+}
+
 extern void llvm_codegen_free(void)
 {
     if (LLVM_CODEGEN && any_routine_captured) {

@@ -128,8 +128,9 @@ and emitted in one end-of-pass pass after `parse_program` +
 `I6_LLVM_INLINE` (clone the callee module, link into the caller, rewrite
 the opaque `i6.callf*` as a real call marked alwaysinline, run the
 always-inline pass). A full skeptical audit (2026-07-21, all findings
-independently reproduced) follows. **Verdict: not landable until the
-blocking defects are fixed.**
+independently reproduced) follows. **The four blocking defects it found
+are now fixed** (see that section); the inlining design gaps and
+secondary defects remain open.
 
 ### Verified claims (adversarially checked, hold)
 
@@ -158,7 +159,29 @@ blocking defects are fixed.**
   (missing attributes default to full-barrier); no double-frees in the
   retained-module lifetime.
 
-### Blocking defects (all reproduced, all silent miscompiles or breaks)
+### Blocking defects (all reproduced; ALL FIXED 2026-07-21)
+
+Resolutions, in order: (1+3) the deferral decision is latched once in
+`asm_begin_pass` (`deferred_lowering_wanted()` no longer consults
+`trace_fns_setting` at all), and asterisk-traced / `-g` routines are now
+captured and deferred as classic-policy routines — the capture block in
+`assemble_routine_header` moved above the trace preamble so the preamble
+is ordinary captured code; nothing emits eagerly under an active gate, so
+`Main__` is always first and a mid-source `Switches g` compiles
+correctly (a directive change that *would* alter the latched decision is
+a `fatalerror` via `deferred_lowering_latch_conflict()`, as a backstop —
+upstream already blocks `-k` in `Switches`). (2) `defer_replace_original`
+attaches Y to the just-stashed first definition of X (and gives Y its
+`ROUTINE_T` placeholder identity immediately, since the `Replace`
+directive had defined it as a zero constant); `emit_deferred_routines`
+assigns Y alongside the routine's own symbol. (4) the two stubs were
+added to `llvm_stub.c`. All fixed outputs are byte-identical to master's
+eager output (asterisk, `Replace`, `-g` cases verified byte-for-byte),
+the full corpus sweep and all nine gates stay green, and a combined
+regression fixture (`direct-ir-deferred-timing` in
+`tests/directIrTest.nix`: `Switches g` + `[ Traced * ]` + two-symbol
+`Replace`, compared behaviorally against upstream) now guards all three
+miscompiles. The original findings, kept for the record:
 
 1. **An asterisked routine hijacks program startup.** `[ Foo * ...; ]`
    routines emit eagerly (uncapturable), and under deferral nothing else
@@ -323,23 +346,13 @@ parse and end-of-pass.
 
 ### Recommended fix order for the branch
 
-1. Latch the deferral gate at `begin_pass`; error on later `Switches`
-   changes.
-2. Make eager emission impossible before `Main__` (defer asterisked
-   routines or refuse deferral when one exists), or resolve the header
-   start function through the `Main__` symbol.
-3. Re-resolve `Replace` preserved-original symbols at end of pass.
-4. Add the two `llvm_stub.c` stubs; add a `WITH_LLVM=0` link to the test
-   checklist.
-5. Snapshot callee modules before their own lowering; dispose retained
+1. ~~Blocking defects 1-4~~ — done, with the `direct-ir-deferred-timing`
+   regression fixture (see above).
+2. Snapshot callee modules before their own lowering; dispose retained
    modules when inlining is off (fixes the RSS regression together).
-6. Fix the secondary defects (AUTOGEN collision guard + comment, silent
+3. Fix the secondary defects (AUTOGEN collision guard + comment, silent
    second `find_the_actions`, dead Z branch, attribute fixup).
-7. Then, and only then, build the profitability gate and re-tune.
-
-Regression fixtures for 1-3 belong in the suite (asterisked routine,
-two-symbol `Replace`, mid-source `Switches`) — they are exactly the gaps
-the corpus never covers.
+4. Then, and only then, build the profitability gate and re-tune.
 
 ## Open Correctness Work
 

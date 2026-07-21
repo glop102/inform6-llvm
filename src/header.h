@@ -2368,6 +2368,8 @@ extern int32 assemble_routine_header(int debug_flag,
     char *name, int embedded_flag, int the_symbol);
 extern void assemble_routine_end(int embedded_flag, debug_locations locations);
 extern int  deferred_lowering_active(void);
+extern int  deferred_lowering_latch_conflict(void);
+extern void defer_replace_original(int rep_symbol);
 extern void emit_deferred_routines(void);
 
 extern void assemblez_0(int internal_number);

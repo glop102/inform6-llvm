@@ -947,6 +947,15 @@ extern int parse_given_directive(int internal_flag)
             }
             obsolete_warning("the Switches directive is deprecated and may produce incorrect results. Use command-line arguments or header comments.");
             switches(token_text, 0);                       /* see "inform.c" */
+            /* The LLVM deferred-lowering decision was latched at the start
+               of the pass, before Main__ was compiled (and stashed). A
+               switch that would now change that decision (-k, -X, -G)
+               cannot be honoured mid-compile: continuing would strand the
+               stashed routines. */
+            if (deferred_lowering_latch_conflict())
+                fatalerror("A 'Switches' directive cannot change this "
+                    "compilation mode under LLVM code generation; give the "
+                    "switch on the command line or in a header comment");
         }
         break;
 
