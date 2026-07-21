@@ -68,22 +68,12 @@ static int llvm_diagnostics_enabled(void)
     "function(mem2reg,instcombine,simplifycfg," \
     "loop-mssa(licm),gvn,jump-threading,dce,simplifycfg)"
 
-/* Per-routine state. */
+/* The i32 type; context-owned, so it is stable for the whole compile. */
 static LLVMTypeRef    i32t;
 
 enum direct_state_e {
     DIRECT_INACTIVE, DIRECT_BUILDING, DIRECT_REJECTED, DIRECT_READY
 };
-static enum direct_state_e direct_state;
-static LLVMModuleRef direct_mod;
-static LLVMBuilderRef direct_bld;
-static LLVMValueRef direct_fn;
-static LLVMValueRef *direct_locals;
-static int direct_local_count;
-static LLVMBasicBlockRef *direct_labels;
-static int direct_label_count;
-static int direct_suspended;
-static const char *direct_reason;
 
 /* Inline assembly's "sp" operands ride a parse-time symbolic stack of
    SSA values. A symbolic value has no runtime stack presence, so
@@ -92,19 +82,44 @@ static const char *direct_reason;
    classic pushed); sp reads past the symbolic window then pop the real
    stack, exactly as classic's would. */
 #define DIRECT_SYMSTACK_MAX 64
-static LLVMValueRef direct_symstack[DIRECT_SYMSTACK_MAX];
-static int direct_symstack_depth;
-static int direct_spilled;   /* values our code left on the real stack */
+
+/* All per-routine IR-build state, gathered into one container. Today
+   exactly one routine is live at a time (`direct_ru`, reset at each
+   routine_begin), so this is a pure regrouping of the former loose
+   statics with identical timing. The point is the datatype: a finished
+   routine's module and function can then be retained past its own
+   lowering as a single value -- the prerequisite for end-of-pass
+   deferral (Phase 1) and for making a callee's IR visible to a caller
+   when inlining (Phase 2). */
+typedef struct routine_unit_s {
+    enum direct_state_e state;
+    LLVMModuleRef  mod;
+    LLVMBuilderRef bld;
+    LLVMValueRef   fn;
+    LLVMValueRef  *locals;
+    int            local_count;
+    LLVMBasicBlockRef *labels;
+    int            label_count;
+    int            suspended;
+    const char    *reason;
+    LLVMValueRef   symstack[DIRECT_SYMSTACK_MAX];
+    int            symstack_depth;
+    int            spilled;      /* values our code left on the real stack */
+    int32          assigned_pc;  /* reserved: Phase 1 end-of-pass address  */
+} routine_unit;
+
+/* The one routine currently being built. */
+static routine_unit direct_ru;
 
 static LLVMValueRef direct_opaque_call_ex(const char *name,
     LLVMValueRef *args, int count, int void_return);
 
 static LLVMValueRef direct_sympop(void)
 {
-    if (direct_symstack_depth > 0)
-        return direct_symstack[--direct_symstack_depth];
-    if (direct_spilled > 0) {
-        direct_spilled--;
+    if (direct_ru.symstack_depth > 0)
+        return direct_ru.symstack[--direct_ru.symstack_depth];
+    if (direct_ru.spilled > 0) {
+        direct_ru.spilled--;
         return direct_opaque_call_ex("i6.stkpop", NULL, 0, FALSE);
     }
     llvm_direct_reject("sp read with empty symbolic stack");
@@ -113,11 +128,11 @@ static LLVMValueRef direct_sympop(void)
 
 static void direct_sympush(LLVMValueRef v)
 {
-    if (direct_symstack_depth >= DIRECT_SYMSTACK_MAX) {
+    if (direct_ru.symstack_depth >= DIRECT_SYMSTACK_MAX) {
         llvm_direct_reject("symbolic stack overflow");
         return;
     }
-    direct_symstack[direct_symstack_depth++] = v;
+    direct_ru.symstack[direct_ru.symstack_depth++] = v;
 }
 
 /* Materialize pending symbolic values onto the real VM stack (bottom
@@ -126,17 +141,17 @@ static int direct_symstack_spill(void)
 {
     LLVMBasicBlockRef bb;
     int i;
-    if (direct_symstack_depth == 0) return TRUE;
-    bb = LLVMGetInsertBlock(direct_bld);
+    if (direct_ru.symstack_depth == 0) return TRUE;
+    bb = LLVMGetInsertBlock(direct_ru.bld);
     if (!bb || LLVMGetBasicBlockTerminator(bb)) {
         llvm_direct_reject("VM stack value carried across control flow");
         return FALSE;
     }
-    for (i = 0; i < direct_symstack_depth; i++)
+    for (i = 0; i < direct_ru.symstack_depth; i++)
         (void)direct_opaque_call_ex("i6.stkpush",
-            &direct_symstack[i], 1, TRUE);
-    direct_spilled += direct_symstack_depth;
-    direct_symstack_depth = 0;
+            &direct_ru.symstack[i], 1, TRUE);
+    direct_ru.spilled += direct_ru.symstack_depth;
+    direct_ru.symstack_depth = 0;
     return TRUE;
 }
 
@@ -471,55 +486,55 @@ extern void llvm_note_classic_routine(const char *reason)
 
 static void direct_dispose_ir(void)
 {
-    if (direct_bld) {
-        LLVMDisposeBuilder(direct_bld);
-        direct_bld = NULL;
+    if (direct_ru.bld) {
+        LLVMDisposeBuilder(direct_ru.bld);
+        direct_ru.bld = NULL;
     }
-    if (direct_mod) {
-        LLVMDisposeModule(direct_mod);
-        direct_mod = NULL;
+    if (direct_ru.mod) {
+        LLVMDisposeModule(direct_ru.mod);
+        direct_ru.mod = NULL;
     }
-    free(direct_locals);
-    direct_locals = NULL;
-    free(direct_labels);
-    direct_labels = NULL;
-    direct_fn = NULL;
-    direct_local_count = 0;
-    direct_label_count = 0;
+    free(direct_ru.locals);
+    direct_ru.locals = NULL;
+    free(direct_ru.labels);
+    direct_ru.labels = NULL;
+    direct_ru.fn = NULL;
+    direct_ru.local_count = 0;
+    direct_ru.label_count = 0;
 }
 
 extern void llvm_direct_reject(const char *reason)
 {
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
-    direct_reason = reason;
+    direct_ru.reason = reason;
     direct_dispose_ir();
-    direct_state = DIRECT_REJECTED;
+    direct_ru.state = DIRECT_REJECTED;
 }
 
 extern void llvm_direct_routine_begin(const char *name, int local_count,
     int embedded_flag, int stack_arguments)
 {
     (void)embedded_flag;
-    direct_state = DIRECT_INACTIVE;
-    direct_reason = NULL;
-    direct_suspended = 0;
-    direct_symstack_depth = 0;
-    direct_spilled = 0;
+    direct_ru.state = DIRECT_INACTIVE;
+    direct_ru.reason = NULL;
+    direct_ru.suspended = 0;
+    direct_ru.symstack_depth = 0;
+    direct_ru.spilled = 0;
     llvm_direct_expression_reset();
     if (!LLVM_CODEGEN)
         return;
     if (stack_arguments) {
-        direct_state = DIRECT_REJECTED;
-        direct_reason = "stack-argument routine";
+        direct_ru.state = DIRECT_REJECTED;
+        direct_ru.reason = "stack-argument routine";
         return;
     }
 
     if (!llctx)
         llctx = LLVMContextCreate();
     i32t = LLVMInt32TypeInContext(llctx);
-    direct_mod = LLVMModuleCreateWithNameInContext(name, llctx);
-    LLVMSetDataLayout(direct_mod, "e-p:32:32-i32:32-n32");
+    direct_ru.mod = LLVMModuleCreateWithNameInContext(name, llctx);
+    LLVMSetDataLayout(direct_ru.mod, "e-p:32:32-i32:32-n32");
     {   LLVMTypeRef *params = local_count
             ? malloc((size_t)local_count * sizeof(*params)) : NULL;
         LLVMTypeRef ft;
@@ -529,40 +544,40 @@ extern void llvm_direct_routine_begin(const char *name, int local_count,
         for (i = 0; i < local_count; i++)
             params[i] = i32t;
         ft = LLVMFunctionType(i32t, params, (unsigned)local_count, FALSE);
-        direct_fn = LLVMAddFunction(direct_mod, name, ft);
+        direct_ru.fn = LLVMAddFunction(direct_ru.mod, name, ft);
         free(params);
     }
-    direct_bld = LLVMCreateBuilderInContext(llctx);
-    LLVMPositionBuilderAtEnd(direct_bld,
-        LLVMAppendBasicBlockInContext(llctx, direct_fn, "entry"));
-    direct_local_count = local_count;
-    direct_locals = local_count
-        ? calloc((size_t)local_count + 1, sizeof(*direct_locals)) : NULL;
-    if (local_count && !direct_locals)
+    direct_ru.bld = LLVMCreateBuilderInContext(llctx);
+    LLVMPositionBuilderAtEnd(direct_ru.bld,
+        LLVMAppendBasicBlockInContext(llctx, direct_ru.fn, "entry"));
+    direct_ru.local_count = local_count;
+    direct_ru.locals = local_count
+        ? calloc((size_t)local_count + 1, sizeof(*direct_ru.locals)) : NULL;
+    if (local_count && !direct_ru.locals)
         fatalerror("Out of memory creating direct LLVM locals");
     {   int i;
         for (i = 1; i <= local_count; i++) {
-            direct_locals[i] = LLVMBuildAlloca(direct_bld, i32t, "local");
-            LLVMBuildStore(direct_bld,
-                LLVMGetParam(direct_fn, (unsigned)(i-1)), direct_locals[i]);
+            direct_ru.locals[i] = LLVMBuildAlloca(direct_ru.bld, i32t, "local");
+            LLVMBuildStore(direct_ru.bld,
+                LLVMGetParam(direct_ru.fn, (unsigned)(i-1)), direct_ru.locals[i]);
         }
     }
-    direct_state = DIRECT_BUILDING;
+    direct_ru.state = DIRECT_BUILDING;
 }
 
 extern void llvm_direct_routine_finish(int embedded_flag,
     int fallthrough_reachable)
 {
     LLVMBasicBlockRef bb;
-    if (direct_state != DIRECT_BUILDING)
+    if (direct_ru.state != DIRECT_BUILDING)
         return;
-    bb = LLVMGetInsertBlock(direct_bld);
+    bb = LLVMGetInsertBlock(direct_ru.bld);
     if (fallthrough_reachable) {
         if (!bb || LLVMGetBasicBlockTerminator(bb)) {
             llvm_direct_reject("invalid fallthrough block");
             return;
         }
-        LLVMBuildRet(direct_bld, LLVMConstInt(i32t,
+        LLVMBuildRet(direct_ru.bld, LLVMConstInt(i32t,
             embedded_flag ? 0 : 1, FALSE));
     }
     else if (!bb || !LLVMGetBasicBlockTerminator(bb)) {
@@ -575,21 +590,21 @@ extern void llvm_direct_routine_finish(int embedded_flag,
            empty entry block instead means the body was raw-assembled behind
            the builder's back, which every emitter must announce; reject so
            a missed announcement cannot silently drop a routine body. */
-        if (!bb || (LLVMGetEntryBasicBlock(direct_fn) == bb
+        if (!bb || (LLVMGetEntryBasicBlock(direct_ru.fn) == bb
                 && !LLVMGetNextBasicBlock(bb))) {
             llvm_direct_reject("empty direct body");
             return;
         }
-        LLVMBuildUnreachable(direct_bld);
+        LLVMBuildUnreachable(direct_ru.bld);
     }
-    LLVMDisposeBuilder(direct_bld);
-    direct_bld = NULL;
-    direct_state = DIRECT_READY;
+    LLVMDisposeBuilder(direct_ru.bld);
+    direct_ru.bld = NULL;
+    direct_ru.state = DIRECT_READY;
 }
 
 extern void llvm_direct_routine_abandon(void)
 {
-    if (LLVM_CODEGEN && direct_state != DIRECT_INACTIVE) {
+    if (LLVM_CODEGEN && direct_ru.state != DIRECT_INACTIVE) {
         no_routines_direct_fallback++;
         if (llvm_diagnostics_enabled())
             printf("LLVM-BACKEND\tname=%s\tbackend=classic-fallback"
@@ -598,16 +613,16 @@ extern void llvm_direct_routine_abandon(void)
                 llvm_current_routine_name());
     }
     direct_dispose_ir();
-    direct_state = DIRECT_INACTIVE;
-    direct_reason = NULL;
+    direct_ru.state = DIRECT_INACTIVE;
+    direct_ru.reason = NULL;
 }
 
 static int direct_can_emit(void)
 {
     LLVMBasicBlockRef bb;
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return FALSE;
-    bb = LLVMGetInsertBlock(direct_bld);
+    bb = LLVMGetInsertBlock(direct_ru.bld);
     if (!bb || LLVMGetBasicBlockTerminator(bb)) {
         if (bb && execution_never_reaches_here)
             return FALSE;
@@ -620,9 +635,9 @@ static int direct_can_emit(void)
 extern int llvm_direct_can_generate(void)
 {
     LLVMBasicBlockRef bb;
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return FALSE;
-    bb = LLVMGetInsertBlock(direct_bld);
+    bb = LLVMGetInsertBlock(direct_ru.bld);
     if (!bb)
         return FALSE;
     if (!LLVMGetBasicBlockTerminator(bb))
@@ -632,14 +647,14 @@ extern int llvm_direct_can_generate(void)
 
 extern void llvm_direct_suspend(void)
 {
-    if (direct_state == DIRECT_BUILDING)
-        direct_suspended++;
+    if (direct_ru.state == DIRECT_BUILDING)
+        direct_ru.suspended++;
 }
 
 extern void llvm_direct_resume(void)
 {
-    if (direct_state == DIRECT_BUILDING && direct_suspended > 0)
-        direct_suspended--;
+    if (direct_ru.state == DIRECT_BUILDING && direct_ru.suspended > 0)
+        direct_ru.suspended--;
 }
 
 static LLVMValueRef direct_global_var(int32 index)
@@ -647,9 +662,9 @@ static LLVMValueRef direct_global_var(int32 index)
     char name[32];
     LLVMValueRef g;
     sprintf(name, "i6.g%d", (int)index);
-    g = LLVMGetNamedGlobal(direct_mod, name);
+    g = LLVMGetNamedGlobal(direct_ru.mod, name);
     if (!g)
-        g = LLVMAddGlobal(direct_mod, i32t, name);
+        g = LLVMAddGlobal(direct_ru.mod, i32t, name);
     return g;
 }
 
@@ -665,26 +680,26 @@ extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
 
     params[0] = i32t; params[1] = i32t; params[2] = i32t;
     ft = LLVMFunctionType(i32t, params, 3, FALSE);
-    f = LLVMGetNamedFunction(direct_mod, "i6.sym");
+    f = LLVMGetNamedFunction(direct_ru.mod, "i6.sym");
     is_new = (f == NULL);
     if (!f)
-        f = LLVMAddFunction(direct_mod, "i6.sym", ft);
+        f = LLVMAddFunction(direct_ru.mod, "i6.sym", ft);
     if (is_new)
         mark_fn_as_constant(f);
     args[0] = LLVMConstInt(i32t, (unsigned)marker, FALSE);
     args[1] = LLVMConstInt(i32t, (uint32_t)value, FALSE);
     args[2] = LLVMConstInt(i32t, (uint32_t)symindex, FALSE);
-    return LLVMBuildCall2(direct_bld, ft, f, args, 3, "sym");
+    return LLVMBuildCall2(direct_ru.bld, ft, f, args, 3, "sym");
 }
 
 extern llvm_direct_value llvm_direct_load_local(int source)
 {
     if (!direct_can_emit()) return NULL;
-    if (source < 1 || source > direct_local_count) {
+    if (source < 1 || source > direct_ru.local_count) {
         llvm_direct_reject("invalid local expression");
         return NULL;
     }
-    return LLVMBuildLoad2(direct_bld, i32t, direct_locals[source], "local");
+    return LLVMBuildLoad2(direct_ru.bld, i32t, direct_ru.locals[source], "local");
 }
 
 extern llvm_direct_value llvm_direct_load_global(int source)
@@ -694,7 +709,7 @@ extern llvm_direct_value llvm_direct_load_global(int source)
         llvm_direct_reject("invalid global expression");
         return NULL;
     }
-    return LLVMBuildLoad2(direct_bld, i32t,
+    return LLVMBuildLoad2(direct_ru.bld, i32t,
         direct_global_var(source - MAX_LOCAL_VARIABLES), "global");
 }
 
@@ -704,9 +719,9 @@ extern llvm_direct_value llvm_direct_unary(int operator_number,
     if (!direct_can_emit() || !operand) return NULL;
     switch (operator_number) {
     case UNARY_MINUS_OP:
-        return LLVMBuildNeg(direct_bld, operand, "neg");
+        return LLVMBuildNeg(direct_ru.bld, operand, "neg");
     case ARTNOT_OP:
-        return LLVMBuildNot(direct_bld, operand, "not");
+        return LLVMBuildNot(direct_ru.bld, operand, "not");
     default:
         llvm_direct_reject("unsupported unary expression operator");
         return NULL;
@@ -719,15 +734,15 @@ extern llvm_direct_value llvm_direct_binary(int operator_number,
     if (!direct_can_emit() || !left || !right) return NULL;
     switch (operator_number) {
     case PLUS_OP:
-        return LLVMBuildAdd(direct_bld, left, right, "add");
+        return LLVMBuildAdd(direct_ru.bld, left, right, "add");
     case MINUS_OP:
-        return LLVMBuildSub(direct_bld, left, right, "sub");
+        return LLVMBuildSub(direct_ru.bld, left, right, "sub");
     case TIMES_OP:
-        return LLVMBuildMul(direct_bld, left, right, "mul");
+        return LLVMBuildMul(direct_ru.bld, left, right, "mul");
     case ARTAND_OP:
-        return LLVMBuildAnd(direct_bld, left, right, "and");
+        return LLVMBuildAnd(direct_ru.bld, left, right, "and");
     case ARTOR_OP:
-        return LLVMBuildOr(direct_bld, left, right, "or");
+        return LLVMBuildOr(direct_ru.bld, left, right, "or");
     default:
         llvm_direct_reject("unsupported binary expression operator");
         return NULL;
@@ -744,13 +759,13 @@ static LLVMValueRef direct_opaque_call_ex(const char *name, LLVMValueRef *args,
         params[i] = i32t;
     ft = LLVMFunctionType(void_return ? LLVMVoidTypeInContext(llctx) : i32t,
         params, (unsigned)count, FALSE);
-    f = LLVMGetNamedFunction(direct_mod, name);
+    f = LLVMGetNamedFunction(direct_ru.mod, name);
     is_new = (f == NULL);
     if (!f)
-        f = LLVMAddFunction(direct_mod, name, ft);
+        f = LLVMAddFunction(direct_ru.mod, name, ft);
     if (is_new)
         mark_opaque_fn_attrs(f, name + 3);
-    return LLVMBuildCall2(direct_bld, ft, f, args, (unsigned)count,
+    return LLVMBuildCall2(direct_ru.bld, ft, f, args, (unsigned)count,
         void_return ? "" : "opaque");
 }
 
@@ -773,32 +788,32 @@ extern llvm_direct_value llvm_direct_division(int operator_number,
     if (check_zero) {
         assembly_operand error_routine = veneer_routine(RT__Err_VR);
         LLVMBasicBlockRef error = LLVMAppendBasicBlockInContext(
-            llctx, direct_fn, "divide.zero");
+            llctx, direct_ru.fn, "divide.zero");
         LLVMBasicBlockRef valid = LLVMAppendBasicBlockInContext(
-            llctx, direct_fn, "divide.valid");
+            llctx, direct_ru.fn, "divide.valid");
         LLVMBasicBlockRef join = LLVMAppendBasicBlockInContext(
-            llctx, direct_fn, "divide.join");
+            llctx, direct_ru.fn, "divide.join");
         LLVMValueRef incoming[2];
         LLVMBasicBlockRef blocks[2];
 
-        condition = LLVMBuildICmp(direct_bld, LLVMIntEQ, right,
+        condition = LLVMBuildICmp(direct_ru.bld, LLVMIntEQ, right,
             LLVMConstInt(i32t, 0, FALSE), "divide.iszero");
-        LLVMBuildCondBr(direct_bld, condition, error, valid);
+        LLVMBuildCondBr(direct_ru.bld, condition, error, valid);
 
-        LLVMPositionBuilderAtEnd(direct_bld, error);
+        LLVMPositionBuilderAtEnd(direct_ru.bld, error);
         error_fn = llvm_direct_constant(error_routine.value,
             error_routine.marker, error_routine.symindex);
         args[0] = error_fn;
         args[1] = LLVMConstInt(i32t, 1, FALSE);
         args[2] = LLVMConstInt(i32t, DBYZERO_RTE, FALSE);
         (void)direct_opaque_call("i6.call.s", args, 3);
-        LLVMBuildBr(direct_bld, join);
+        LLVMBuildBr(direct_ru.bld, join);
 
-        LLVMPositionBuilderAtEnd(direct_bld, valid);
-        LLVMBuildBr(direct_bld, join);
+        LLVMPositionBuilderAtEnd(direct_ru.bld, valid);
+        LLVMBuildBr(direct_ru.bld, join);
 
-        LLVMPositionBuilderAtEnd(direct_bld, join);
-        divisor = LLVMBuildPhi(direct_bld, i32t, "divide.divisor");
+        LLVMPositionBuilderAtEnd(direct_ru.bld, join);
+        divisor = LLVMBuildPhi(direct_ru.bld, i32t, "divide.divisor");
         incoming[0] = LLVMConstInt(i32t, 1, FALSE);
         incoming[1] = right;
         blocks[0] = error;
@@ -808,7 +823,7 @@ extern llvm_direct_value llvm_direct_division(int operator_number,
     else if (LLVMIsAConstantInt(right)) {
         int32 value = (int32)LLVMConstIntGetSExtValue(right);
         if (value != 0 && value != -1)
-            return LLVMBuildBinOp(direct_bld,
+            return LLVMBuildBinOp(direct_ru.bld,
                 operator_number == DIVIDE_OP ? LLVMSDiv : LLVMSRem,
                 left, right, "arithmetic");
     }
@@ -833,8 +848,8 @@ extern llvm_direct_value llvm_direct_compare(int operator_number,
         llvm_direct_reject("unsupported comparison operator");
         return NULL;
     }
-    condition = LLVMBuildICmp(direct_bld, predicate, left, right, "compare");
-    return LLVMBuildZExt(direct_bld, condition, i32t, "boolean");
+    condition = LLVMBuildICmp(direct_ru.bld, predicate, left, right, "compare");
+    return LLVMBuildZExt(direct_ru.bld, condition, i32t, "boolean");
 }
 
 /* A source-level function call. Glulx has dedicated opcodes for zero to
@@ -906,19 +921,19 @@ extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
         !(flags & OPFLAG_STORE));
     /* Opcodes that never return (quit, restart...) end the block. */
     if (flags & OPFLAG_RETURNS)
-        LLVMBuildUnreachable(direct_bld);
-    return (flags & OPFLAG_STORE) ? result : (llvm_direct_value)direct_fn;
+        LLVMBuildUnreachable(direct_ru.bld);
+    return (flags & OPFLAG_STORE) ? result : (llvm_direct_value)direct_ru.fn;
 }
 
 extern llvm_direct_value llvm_direct_store_local_value(int destination,
     llvm_direct_value value)
 {
     if (!direct_can_emit() || !value) return NULL;
-    if (destination < 1 || destination > direct_local_count) {
+    if (destination < 1 || destination > direct_ru.local_count) {
         llvm_direct_reject("invalid local assignment");
         return NULL;
     }
-    LLVMBuildStore(direct_bld, value, direct_locals[destination]);
+    LLVMBuildStore(direct_ru.bld, value, direct_ru.locals[destination]);
     return value;
 }
 
@@ -930,7 +945,7 @@ extern llvm_direct_value llvm_direct_store_global_value(int destination,
         llvm_direct_reject("invalid global assignment");
         return NULL;
     }
-    LLVMBuildStore(direct_bld, value,
+    LLVMBuildStore(direct_ru.bld, value,
         direct_global_var(destination - MAX_LOCAL_VARIABLES));
     return value;
 }
@@ -939,29 +954,29 @@ extern void llvm_direct_adjust_variable(int variable, int amount)
 {
     LLVMValueRef pointer, value;
     if (!direct_can_emit()) return;
-    if (variable >= 1 && variable <= direct_local_count)
-        pointer = direct_locals[variable];
+    if (variable >= 1 && variable <= direct_ru.local_count)
+        pointer = direct_ru.locals[variable];
     else if (variable >= MAX_LOCAL_VARIABLES)
         pointer = direct_global_var(variable - MAX_LOCAL_VARIABLES);
     else {
         llvm_direct_reject("invalid adjusted variable");
         return;
     }
-    value = LLVMBuildLoad2(direct_bld, i32t, pointer, "adjust.value");
-    value = LLVMBuildAdd(direct_bld, value,
+    value = LLVMBuildLoad2(direct_ru.bld, i32t, pointer, "adjust.value");
+    value = LLVMBuildAdd(direct_ru.bld, value,
         LLVMConstInt(i32t, (uint32_t)amount, FALSE), "adjust");
-    LLVMBuildStore(direct_bld, value, pointer);
+    LLVMBuildStore(direct_ru.bld, value, pointer);
 }
 
 extern void llvm_direct_return_value(llvm_direct_value value)
 {
     if (!direct_can_emit() || !value) return;
-    LLVMBuildRet(direct_bld, value);
+    LLVMBuildRet(direct_ru.bld, value);
 }
 
 extern void llvm_direct_note_statement(int statement_code)
 {
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
     if (statement_code != RETURN_CODE && statement_code != RTRUE_CODE
         && statement_code != RFALSE_CODE && statement_code != JUMP_CODE
@@ -983,43 +998,43 @@ extern void llvm_direct_note_statement(int statement_code)
 extern void llvm_direct_store_local_constant(int destination, int32 value)
 {
     if (!direct_can_emit()) return;
-    if (destination < 1 || destination > direct_local_count) {
+    if (destination < 1 || destination > direct_ru.local_count) {
         llvm_direct_reject("invalid local assignment");
         return;
     }
-    LLVMBuildStore(direct_bld, LLVMConstInt(i32t, (uint32_t)value, FALSE),
-        direct_locals[destination]);
+    LLVMBuildStore(direct_ru.bld, LLVMConstInt(i32t, (uint32_t)value, FALSE),
+        direct_ru.locals[destination]);
 }
 
 extern void llvm_direct_store_local(int destination, int source)
 {
     LLVMValueRef value;
     if (!direct_can_emit()) return;
-    if (destination < 1 || destination > direct_local_count
-        || source < 1 || source > direct_local_count) {
+    if (destination < 1 || destination > direct_ru.local_count
+        || source < 1 || source > direct_ru.local_count) {
         llvm_direct_reject("invalid local assignment");
         return;
     }
-    value = LLVMBuildLoad2(direct_bld, i32t, direct_locals[source], "value");
-    LLVMBuildStore(direct_bld, value, direct_locals[destination]);
+    value = LLVMBuildLoad2(direct_ru.bld, i32t, direct_ru.locals[source], "value");
+    LLVMBuildStore(direct_ru.bld, value, direct_ru.locals[destination]);
 }
 
 extern void llvm_direct_return_constant(int32 value)
 {
     if (!direct_can_emit()) return;
-    LLVMBuildRet(direct_bld, LLVMConstInt(i32t, (uint32_t)value, FALSE));
+    LLVMBuildRet(direct_ru.bld, LLVMConstInt(i32t, (uint32_t)value, FALSE));
 }
 
 extern void llvm_direct_return_local(int source)
 {
     LLVMValueRef value;
     if (!direct_can_emit()) return;
-    if (source < 1 || source > direct_local_count) {
+    if (source < 1 || source > direct_ru.local_count) {
         llvm_direct_reject("invalid local return");
         return;
     }
-    value = LLVMBuildLoad2(direct_bld, i32t, direct_locals[source], "value");
-    LLVMBuildRet(direct_bld, value);
+    value = LLVMBuildLoad2(direct_ru.bld, i32t, direct_ru.locals[source], "value");
+    LLVMBuildRet(direct_ru.bld, value);
 }
 
 static LLVMBasicBlockRef direct_label_block(int label)
@@ -1029,33 +1044,33 @@ static LLVMBasicBlockRef direct_label_block(int label)
         llvm_direct_reject("invalid source label");
         return NULL;
     }
-    if (label >= direct_label_count) {
+    if (label >= direct_ru.label_count) {
         int new_count = label + 1;
-        LLVMBasicBlockRef *new_labels = realloc(direct_labels,
+        LLVMBasicBlockRef *new_labels = realloc(direct_ru.labels,
             (size_t)new_count * sizeof(*new_labels));
         if (!new_labels)
             fatalerror("Out of memory creating direct LLVM labels");
-        direct_labels = new_labels;
-        for (i = direct_label_count; i < new_count; i++)
-            direct_labels[i] = NULL;
-        direct_label_count = new_count;
+        direct_ru.labels = new_labels;
+        for (i = direct_ru.label_count; i < new_count; i++)
+            direct_ru.labels[i] = NULL;
+        direct_ru.label_count = new_count;
     }
-    if (!direct_labels[label])
-        direct_labels[label] = LLVMAppendBasicBlockInContext(
-            llctx, direct_fn, "label");
-    return direct_labels[label];
+    if (!direct_ru.labels[label])
+        direct_ru.labels[label] = LLVMAppendBasicBlockInContext(
+            llctx, direct_ru.fn, "label");
+    return direct_ru.labels[label];
 }
 
 extern llvm_direct_block llvm_direct_new_block(void)
 {
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return NULL;
-    return LLVMAppendBasicBlockInContext(llctx, direct_fn, "control");
+    return LLVMAppendBasicBlockInContext(llctx, direct_ru.fn, "control");
 }
 
 extern llvm_direct_block llvm_direct_source_block(int label)
 {
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return NULL;
     return direct_label_block(label);
 }
@@ -1063,19 +1078,19 @@ extern llvm_direct_block llvm_direct_source_block(int label)
 extern void llvm_direct_bind_block(llvm_direct_block block)
 {
     LLVMBasicBlockRef current;
-    if (direct_state != DIRECT_BUILDING || direct_suspended || !block)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended || !block)
         return;
-    current = LLVMGetInsertBlock(direct_bld);
+    current = LLVMGetInsertBlock(direct_ru.bld);
     if (current && !LLVMGetBasicBlockTerminator(current))
-        LLVMBuildBr(direct_bld, block);
-    LLVMPositionBuilderAtEnd(direct_bld, block);
+        LLVMBuildBr(direct_ru.bld, block);
+    LLVMPositionBuilderAtEnd(direct_ru.bld, block);
 }
 
 extern void llvm_direct_jump_block(llvm_direct_block block)
 {
     if (!direct_can_emit() || !block)
         return;
-    LLVMBuildBr(direct_bld, block);
+    LLVMBuildBr(direct_ru.bld, block);
 }
 
 extern void llvm_direct_branch(llvm_direct_value condition,
@@ -1084,16 +1099,16 @@ extern void llvm_direct_branch(llvm_direct_value condition,
     LLVMValueRef test;
     if (!direct_can_emit() || !condition || !true_block || !false_block)
         return;
-    test = LLVMBuildICmp(direct_bld, LLVMIntNE, condition,
+    test = LLVMBuildICmp(direct_ru.bld, LLVMIntNE, condition,
         LLVMConstInt(i32t, 0, FALSE), "condition");
-    LLVMBuildCondBr(direct_bld, test, true_block, false_block);
+    LLVMBuildCondBr(direct_ru.bld, test, true_block, false_block);
 }
 
 extern llvm_direct_block llvm_direct_current_block(void)
 {
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return NULL;
-    return LLVMGetInsertBlock(direct_bld);
+    return LLVMGetInsertBlock(direct_ru.bld);
 }
 
 extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
@@ -1105,7 +1120,7 @@ extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
     if (!direct_can_emit() || !first || !first_block || !second
         || !second_block)
         return NULL;
-    phi = LLVMBuildPhi(direct_bld, i32t, "condition.value");
+    phi = LLVMBuildPhi(direct_ru.bld, i32t, "condition.value");
     values[0] = first; values[1] = second;
     blocks[0] = first_block; blocks[1] = second_block;
     LLVMAddIncoming(phi, values, blocks, 2);
@@ -1119,7 +1134,7 @@ extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
 extern llvm_direct_value llvm_direct_phi_empty(void)
 {
     if (!direct_can_emit()) return NULL;
-    return LLVMBuildPhi(direct_bld, i32t, "loop.value");
+    return LLVMBuildPhi(direct_ru.bld, i32t, "loop.value");
 }
 
 extern void llvm_direct_phi_add(llvm_direct_value phi,
@@ -1127,7 +1142,7 @@ extern void llvm_direct_phi_add(llvm_direct_value phi,
 {
     LLVMValueRef v = value;
     LLVMBasicBlockRef b = block;
-    if (direct_state != DIRECT_BUILDING || direct_suspended
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended
         || !phi || !value || !block)
         return;
     LLVMAddIncoming(phi, &v, &b, 1);
@@ -1142,7 +1157,7 @@ extern llvm_direct_value llvm_direct_phi_list(llvm_direct_value *values,
         return NULL;
     for (i = 0; i < count; i++)
         if (!values[i] || !blocks[i]) return NULL;
-    phi = LLVMBuildPhi(direct_bld, i32t, "condition.value");
+    phi = LLVMBuildPhi(direct_ru.bld, i32t, "condition.value");
     LLVMAddIncoming(phi, (LLVMValueRef *)values,
         (LLVMBasicBlockRef *)blocks, (unsigned)count);
     return phi;
@@ -1155,28 +1170,28 @@ extern void llvm_direct_jump(int label)
     if (!direct_symstack_spill()) return;
     target = direct_label_block(label);
     if (target)
-        LLVMBuildBr(direct_bld, target);
+        LLVMBuildBr(direct_ru.bld, target);
 }
 
 extern void llvm_direct_bind_label(int label)
 {
     LLVMBasicBlockRef current, target;
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
     if (!direct_symstack_spill()) return;
     target = direct_label_block(label);
     if (!target) return;
-    current = LLVMGetInsertBlock(direct_bld);
+    current = LLVMGetInsertBlock(direct_ru.bld);
     if (current && !LLVMGetBasicBlockTerminator(current))
-        LLVMBuildBr(direct_bld, target);
-    LLVMPositionBuilderAtEnd(direct_bld, target);
+        LLVMBuildBr(direct_ru.bld, target);
+    LLVMPositionBuilderAtEnd(direct_ru.bld, target);
 }
 
 extern void llvm_direct_resolve_label(int label, int used)
 {
     LLVMBasicBlockRef target;
     LLVMBuilderRef builder;
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
     if (used) {
         llvm_direct_bind_label(label);
@@ -1216,14 +1231,14 @@ static LLVMValueRef direct_asm_operand(const assembly_operand *op)
     case LOCALVAR_OT:
         if (op->value == 0)
             return direct_sympop();
-        if (op->value < 1 || op->value > direct_local_count) {
+        if (op->value < 1 || op->value > direct_ru.local_count) {
             llvm_direct_reject("inline local out of range");
             return NULL;
         }
-        return LLVMBuildLoad2(direct_bld, i32t, direct_locals[op->value],
+        return LLVMBuildLoad2(direct_ru.bld, i32t, direct_ru.locals[op->value],
             "asm");
     case GLOBALVAR_OT:
-        return LLVMBuildLoad2(direct_bld, i32t,
+        return LLVMBuildLoad2(direct_ru.bld, i32t,
             direct_global_var(op->value - MAX_LOCAL_VARIABLES), "asm");
     case DEREFERENCE_OT:
         {   LLVMValueRef addr = llvm_direct_constant(op->value, op->marker,
@@ -1248,14 +1263,14 @@ static void direct_asm_store(const assembly_operand *op, LLVMValueRef v)
             direct_sympush(v);
             return;
         }
-        if (op->value < 1 || op->value > direct_local_count) {
+        if (op->value < 1 || op->value > direct_ru.local_count) {
             llvm_direct_reject("inline local out of range");
             return;
         }
-        LLVMBuildStore(direct_bld, v, direct_locals[op->value]);
+        LLVMBuildStore(direct_ru.bld, v, direct_ru.locals[op->value]);
         return;
     case GLOBALVAR_OT:
-        LLVMBuildStore(direct_bld, v,
+        LLVMBuildStore(direct_ru.bld, v,
             direct_global_var(op->value - MAX_LOCAL_VARIABLES));
         return;
     case DEREFERENCE_OT:
@@ -1304,7 +1319,7 @@ static void direct_asm_opaque(const assembly_instruction *ai, int flags,
     if (flags & OPFLAG_STORE)
         direct_asm_store(&ai->operand[ai->operand_count - 1], result);
     if (flags & OPFLAG_RETURNS)
-        LLVMBuildUnreachable(direct_bld);
+        LLVMBuildUnreachable(direct_ru.bld);
 }
 
 static void direct_asm_binop(const assembly_instruction *ai, LLVMOpcode opc)
@@ -1312,7 +1327,7 @@ static void direct_asm_binop(const assembly_instruction *ai, LLVMOpcode opc)
     LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
     LLVMValueRef b = direct_asm_operand(&ai->operand[1]);
     if (!a || !b) return;
-    direct_asm_store(&ai->operand[2], LLVMBuildBinOp(direct_bld, opc, a, b,
+    direct_asm_store(&ai->operand[2], LLVMBuildBinOp(direct_ru.bld, opc, a, b,
         "asm"));
 }
 
@@ -1330,10 +1345,10 @@ static void direct_asm_condbranch(const assembly_instruction *ai,
     if (!direct_symstack_spill()) return;
     then_bb = direct_label_block((int)target);
     if (!then_bb) return;
-    cond = LLVMBuildICmp(direct_bld, pred, a, b, "asm.cond");
-    else_bb = LLVMAppendBasicBlockInContext(llctx, direct_fn, "asm.next");
-    LLVMBuildCondBr(direct_bld, cond, then_bb, else_bb);
-    LLVMPositionBuilderAtEnd(direct_bld, else_bb);
+    cond = LLVMBuildICmp(direct_ru.bld, pred, a, b, "asm.cond");
+    else_bb = LLVMAppendBasicBlockInContext(llctx, direct_ru.fn, "asm.next");
+    LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
+    LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
 }
 
 /* If the operand is an unmarked integer constant, put its value in *v. */
@@ -1414,7 +1429,7 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
                 LLVMValueRef r;
                 if (!a) return;
                 if (ai->internal_number == sshiftr_gc)
-                    r = LLVMBuildAShr(direct_bld, a,
+                    r = LLVMBuildAShr(direct_ru.bld, a,
                         LLVMConstInt(i32t, 31, FALSE), "asm");
                 else
                     r = LLVMConstInt(i32t, 0, FALSE);
@@ -1427,14 +1442,14 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
         {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
             if (!a) return;
             direct_asm_store(&ai->operand[1],
-                LLVMBuildNeg(direct_bld, a, "asm"));
+                LLVMBuildNeg(direct_ru.bld, a, "asm"));
         }
         return;
     case bitnot_gc:
         {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
             if (!a) return;
             direct_asm_store(&ai->operand[1],
-                LLVMBuildNot(direct_bld, a, "asm"));
+                LLVMBuildNot(direct_ru.bld, a, "asm"));
         }
         return;
     case copy_gc:
@@ -1456,8 +1471,8 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
                 : LLVMInt8TypeInContext(llctx);
             LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
             if (!a) return;
-            a = LLVMBuildTrunc(direct_bld, a, small, "asm");
-            a = LLVMBuildSExt(direct_bld, a, i32t, "asm");
+            a = LLVMBuildTrunc(direct_ru.bld, a, small, "asm");
+            a = LLVMBuildSExt(direct_ru.bld, a, i32t, "asm");
             direct_asm_store(&ai->operand[1], a);
         }
         return;
@@ -1467,7 +1482,7 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
             if (!direct_symstack_spill()) return;
             target = direct_label_block((int)ai->operand[0].value);
             if (!target) return;
-            LLVMBuildBr(direct_bld, target);
+            LLVMBuildBr(direct_ru.bld, target);
         }
         return;
     case jz_gc:   direct_asm_condbranch(ai, LLVMIntEQ,  TRUE);  return;
@@ -1487,9 +1502,9 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
         {   LLVMValueRef a = direct_asm_operand(&ai->operand[0]);
             if (!a) return;
             /* Anything on the VM stack dies with the call frame. */
-            direct_symstack_depth = 0;
-            direct_spilled = 0;
-            LLVMBuildRet(direct_bld, a);
+            direct_ru.symstack_depth = 0;
+            direct_ru.spilled = 0;
+            LLVMBuildRet(direct_ru.bld, a);
         }
         return;
 
@@ -1507,7 +1522,7 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
                 llvm_direct_reject("call with non-constant argument count");
                 return;
             }
-            if (cnt < 0 || cnt > direct_symstack_depth) {
+            if (cnt < 0 || cnt > direct_ru.symstack_depth) {
                 llvm_direct_reject("call consumes more than the symbolic stack");
                 return;
             }
@@ -1545,7 +1560,7 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
    straddle pending symbolic stack values; see the empty-stack rule. */
 extern void llvm_direct_note_control_flow(void)
 {
-    if (direct_state != DIRECT_BUILDING || direct_suspended)
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
     (void)direct_symstack_spill();
 }
@@ -1649,8 +1664,8 @@ static void direct_fallback(const char *stage, const char *detail)
             llvm_current_routine_name(), detail ? detail : "unknown");
     }
     direct_dispose_ir();
-    direct_state = DIRECT_INACTIVE;
-    direct_reason = NULL;
+    direct_ru.state = DIRECT_INACTIVE;
+    direct_ru.reason = NULL;
 }
 
 static int process_direct_routine(void)
@@ -1659,17 +1674,17 @@ static int process_direct_routine(void)
     const char *why = NULL;
     int insts_in = 0, insts_out = 0;
 
-    if (LLVMVerifyModule(direct_mod, LLVMReturnStatusAction, &errmsg)) {
+    if (LLVMVerifyModule(direct_ru.mod, LLVMReturnStatusAction, &errmsg)) {
         direct_fallback("direct-verify", errmsg ? errmsg : "verification failed");
         LLVMDisposeMessage(errmsg);
         return FALSE;
     }
     LLVMDisposeMessage(errmsg);
-    dump_module(direct_mod, "direct-pre-opt");
+    dump_module(direct_ru.mod, "direct-pre-opt");
 
     {   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
         LLVMErrorRef err = LLVMRunPasses(
-            direct_mod, LLVM_PASS_PIPELINE, NULL, opts);
+            direct_ru.mod, LLVM_PASS_PIPELINE, NULL, opts);
         LLVMDisposePassBuilderOptions(opts);
         if (err) {
             char *msg = LLVMGetErrorMessage(err);
@@ -1679,18 +1694,18 @@ static int process_direct_routine(void)
         }
     }
 
-    unmerge_pointer_selects(direct_fn);
+    unmerge_pointer_selects(direct_ru.fn);
     errmsg = NULL;
-    if (LLVMVerifyModule(direct_mod, LLVMReturnStatusAction, &errmsg)) {
+    if (LLVMVerifyModule(direct_ru.mod, LLVMReturnStatusAction, &errmsg)) {
         direct_fallback("direct-post-verify",
             errmsg ? errmsg : "post-optimization verification failed");
         LLVMDisposeMessage(errmsg);
         return FALSE;
     }
     LLVMDisposeMessage(errmsg);
-    dump_module(direct_mod, "direct-post-opt");
+    dump_module(direct_ru.mod, "direct-post-opt");
 
-    if (!llvm_lower_routine(direct_mod, direct_fn, &why,
+    if (!llvm_lower_routine(direct_ru.mod, direct_ru.fn, &why,
             &insts_in, &insts_out)) {
         direct_fallback("direct-lower", why ? why : "lowering failed");
         return FALSE;
@@ -1701,8 +1716,8 @@ static int process_direct_routine(void)
         printf("LLVM: direct routine %s: %d instructions -> %d\n",
             llvm_current_routine_name(), insts_in, insts_out);
     direct_dispose_ir();
-    direct_state = DIRECT_INACTIVE;
-    direct_reason = NULL;
+    direct_ru.state = DIRECT_INACTIVE;
+    direct_ru.reason = NULL;
     return TRUE;
 }
 
@@ -1713,11 +1728,11 @@ static int process_direct_routine(void)
    encoder by asm.c. */
 extern int llvm_pipeline_routine(void)
 {
-    if (direct_state == DIRECT_READY)
+    if (direct_ru.state == DIRECT_READY)
         return process_direct_routine();
-    if (direct_state == DIRECT_REJECTED)
-        direct_fallback("direct-build", direct_reason);
-    else if (direct_state == DIRECT_BUILDING)
+    if (direct_ru.state == DIRECT_REJECTED)
+        direct_fallback("direct-build", direct_ru.reason);
+    else if (direct_ru.state == DIRECT_BUILDING)
         direct_fallback("direct-finish", "builder was not finalized");
     return FALSE;
 }
@@ -1725,7 +1740,7 @@ extern int llvm_pipeline_routine(void)
 extern void llvm_codegen_free(void)
 {
     direct_dispose_ir();
-    direct_state = DIRECT_INACTIVE;
+    direct_ru.state = DIRECT_INACTIVE;
     if (no_routines_direct || no_routines_classic
         || no_routines_direct_fallback) {
         printf("LLVM: backends direct=%d classic=%d fallback=%d\n",
