@@ -2786,10 +2786,27 @@ static assembly_operand resolve(LLVMValueRef v)
     if (LLVMIsUndef(v) || LLVMIsPoison(v))
         return const_op(0);
     if (is_sym_call(v)) {
-        assembly_operand o = mkop(CONSTANT_OT,
-            const_int_value(LLVMGetOperand(v, 1)));
-        o.marker = const_int_value(LLVMGetOperand(v, 0));
-        o.symindex = const_int_value(LLVMGetOperand(v, 2));
+        int32 marker   = const_int_value(LLVMGetOperand(v, 0));
+        int32 value    = const_int_value(LLVMGetOperand(v, 1));
+        int32 symindex = const_int_value(LLVMGetOperand(v, 2));
+        assembly_operand o;
+        /* An internal-routine address (IROUTINE_MV) is deferred through the
+           routine symbol's own value rather than baked here, so end-of-pass
+           address assignment can set it after this operand is emitted. Emit
+           SYMBOL_MV carrying the symbol index, exactly as the front end does
+           for replaced routines (expressp.c): final backpatch reads
+           symbols[symindex].value and applies its IROUTINE_MV marker, giving
+           the identical final address. Veneer routine refs (VROUTINE_MV)
+           already resolve from veneer_routine_address[] at end-of-pass, and
+           anything without a symbol index stays as-is. */
+        if (marker == IROUTINE_MV && symindex >= 0) {
+            o = mkop(CONSTANT_OT, symindex);
+            o.marker = SYMBOL_MV;
+        } else {
+            o = mkop(CONSTANT_OT, value);
+            o.marker = marker;
+        }
+        o.symindex = symindex;
         return o;
     }
     pi = LLVMIsAArgument(v) ? param_index(v) : -1;
