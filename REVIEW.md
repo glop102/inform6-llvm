@@ -1,1112 +1,468 @@
 # LLVM Pipeline Review
 
-This review treats dynamically dispatched Glulx instruction count as the
-primary performance metric, but not the whole cost model. Every additional VM
-instruction incurs a fetch/decode/dispatch cycle, and count has been the best
-predictor of interpreter performance observed so far. Individual opcode
-handlers, operand modes, memory behavior, Glk calls, host branch prediction,
-and accelerated routines nevertheless have different costs. Instruction count
-should therefore dominate optimization decisions without being treated as a
-perfectly weighted runtime estimate.
+This is the working document for the LLVM backend: pinned measurements,
+settled policies, open defects, and remaining work. The direct-IR
+migration history (Phases 0-6) lives in git history and the test suite's
+pinned gates; it is no longer narrated here.
 
-The pipeline already reflects this model in several important places,
-particularly stack fusion, direct global operands, phi coalescing, select-arm
-sinking, connective-tree reconstruction, recurrence folding, block layout, and
-the decision not to run `loop-rotate`. The focused regression gate protects
-representative forms.
+## Cost Model
 
-## Measured Performance Model
+Dynamically dispatched Glulx instruction count is the primary performance
+metric: every VM instruction pays a fetch/decode/dispatch cycle, and count
+has been the best predictor of interpreter performance observed so far.
+It is not a perfectly weighted runtime estimate — opcode handlers, operand
+modes, memory behavior, Glk calls, and accelerated routines have different
+costs — so count dominates optimization decisions without being treated as
+exact. Static emitted counts are less predictive (cold blocks and hot
+loops weigh equally) and are used only for focused microfixtures and
+explaining where a transformation added bytecode.
 
-The patched `glulxe-counted` interpreter increments a 64-bit counter after an
-opcode and its operands have been decoded and immediately before its handler is
-dispatched. It counts every successfully decoded Glulx instruction executed in
-called routines and across VM restarts. It does not count interpreter
-bookkeeping, work within an opcode handler as separate operations, or native C
-work performed by accelerated routines.
+The `glulxe-counted` interpreter increments a 64-bit counter after decode,
+immediately before handler dispatch. `--opcode-histogram` breaks the total
+down by opcode. Per-routine dynamic attribution (a `VM_PROFILING` glulxe
+run joined against `$!asm` routine addresses — `tests/attrib.py`) runs by
+default in the benchmarks; **rank optimization targets by measured dynamic
+attribution, never by static emitted-minus-input** (a static ranking
+misdirected an entire Phase 4.1 attempt).
 
-The Life benchmark measurement recorded after recurrence folding and block
-layout was 54,609,633 LLVM instructions (`-2.79%`); the multi-use store fold
-described under the Phase 2 findings brought the then-production lifted path
-to 54,605,529 (`-2.80%`). The current measurement, on the direct backend
-after the Phase 4.1 lowering work and Phase 5 pass tuning, is:
-
-```text
-classic: 56,177,197 instructions
-LLVM:    54,589,516 instructions (-2.83%)
-```
-
-Before the recurrence-folding improvement described below, LLVM executed
-57,579,709 instructions (`+2.50%`). After alternating execution order, one
-five-run sample of that earlier build measured medians of
-932 ms classic and 941 ms LLVM. This points in the expected direction, but the
-timing delta is not exactly proportional to instruction count and individual
-samples remain noisy. Deterministic dispatch totals are the preferred
-regression gate; repeated timing medians remain an important secondary check
-for changes in opcode mix or other costs which the unweighted counter misses.
-After recurrence folding and block layout, one alternating nine-run sample
-measured medians of 864 ms classic and 849 ms LLVM (ranges 849-910 ms and
-824-932 ms respectively).
-
-Static emitted counts are less predictive than dynamic counts because cold
-blocks and hot loops are weighted equally. They remain useful for isolated
-microfixtures and explaining where a transformation added bytecode.
-
-## Opcode Cost Investigation
-
-The initial priority was to explain the Life benchmark's additional 1,402,512
-dispatches and determine how much the opcode mix affected runtime. Total
-dynamic count showed that a regression existed, but not whether LLVM added
-copies, branches, arithmetic, address calculations, or expensive VM operations.
-
-`glulxe-counted` accepts `--opcode-histogram` and emits the total plus one
-machine-readable count for every executed opcode. `tests/lifeBenchmark.nix`
-validates that the histogram sums to the total and writes a temporary
-classic/LLVM comparison during the benchmark run. Collection remains optional
-so the simplest total-count path stays cheap and stable.
-
-The first Life comparison attributes most of the changed mix to the hot
-`Step` loop:
-
-```text
-opcode  operation  classic     LLVM        delta
-0x040   copy          75,887   3,199,994   +3,124,107
-0x020   jump       1,785,680   3,211,284   +1,425,604
-0x025   jne        2,994,076   4,493,392   +1,499,316
-0x028   jgt              501   1,565,547   +1,565,046
-0x010   add       29,405,083  27,891,973   -1,513,110
-0x011   sub        1,535,509           9   -1,535,500
-0x023   jnz        1,561,007           0   -1,561,007
-0x027   jge        1,611,844           0   -1,611,844
-```
-
-The branch changes are largely predicate and block-layout substitutions. The
-copy increase is more directly actionable: about 3,120,000 executions are
-explained by loop-carried values in `Step`, including two copies per cell from
-an increment shared by a wraparound select and the loop phi. The lowerer's
-edge-folding pass already targeted this shape, but its same-block restriction
-did not accept the post-optimization CFG used by Life.
-
-The edge-folding pass now accepts the narrow cross-block form where an `add` or
-`sub` reads the destination phi and an integer constant. On Life this removes
-3,072,000 copies, adds back 1,536,000 native additions, and moves 24,000 jumps
-onto the rare wraparound path. The net reduction is exactly 1,536,000
-dispatches, enough to put the LLVM build 133,488 instructions below classic.
-
-The remaining excess jumps came from the `Step` cell-state diamond. LLVM placed
-the live arm, dead arm, secondary `n == 2` test, and merge in that order, which
-forced the common dead arm to jump over the secondary test. The lowerer now
-recognizes this local four-block shape and emits the secondary test before the
-dead arm. This is pathwise non-worsening: the live arm retains its merge jump,
-the secondary test gains a fallthrough arm, and the dead arm falls through to
-the merge after performing its phi copies. It removes another 1,434,076 Life
-dispatches and leaves only 15,528 more LLVM `jump` executions than classic.
-
-The histogram is also the prerequisite for a weighted interpreter cost model.
-Per-opcode costs should be measured rather than guessed:
-
-1. Construct controlled Glulx loops dominated by one opcode family.
-2. Run enough iterations to separate handler cost from timer noise and fixed
-   startup/loop overhead.
-3. Measure important operand modes separately where decoding or memory access
-   differs, such as constants, locals, globals, stack operands, and RAM
-   dereferences.
-4. Repeat across the interpreters used for project benchmarks; do not assume
-   that one interpreter's opcode weights transfer to another.
-5. Fit or validate a simple weighted sum against whole-program timings before
-   using it for optimization decisions.
-
-The expected outcome is a hierarchy of metrics:
+The desired metric hierarchy, top two in place:
 
 - Dynamic total: deterministic primary regression signal.
 - Opcode histogram: identifies what kind of interpreted work changed.
-- Weighted dynamic cost: estimates runtime when opcode mixes differ.
-- Repeated wall-clock timing: validates that the model predicts real execution.
+- Weighted dynamic cost (open): measure per-opcode / per-operand-mode
+  handler costs with controlled loops, fit against whole-program timings.
+- Repeated wall-clock timing: secondary validation (medians over
+  alternating runs; individual samples are noisy).
 
-After this source-level attribution, add routine or PC-range instrumentation to
-identify where opcode differences and remaining locally excessive operations
-occur. This requires routine boundaries from the compiler or story metadata,
-but would turn whole-program differences into a ranked list of optimization
-targets. This can remain deterministic and generic; it does not require PGO.
+## Current Measurements and Pinned Baselines
 
-Benchmark output should eventually have a machine-readable JSON or TSV mode
-recording compiler revision, LLVM and interpreter versions, optimized/captured
-routine counts, static instructions, opcode histogram, weighted cost, dynamic
-total, story size, and timing samples. This will make comparisons across
-commits and LLVM upgrades reproducible.
+Direct IR is the sole production Glulx path (`$LLVM=4` default; every
+nonzero value selects it; `$LLVM=0` is the classic escape hatch). Current
+corpus points, all enforced by pinned gates in `tests/`:
 
-### Pinned Baseline Sources
-
-`flake.lock` pins the compiler and interpreter sources used by this work:
-
-- Inform 6 `d1066bc214a45ee0f600d2ae7f94ad0210606317`
-- Glulxe `56ab8743bab565de307bd892c555d8d8897ed517`
-- CheapGlk `14d8aaf6e4150669762bd4646a5368e75c1eeee6`
-
-The Inform revision is the parent of this fork's initial source-layout commit;
-the moved C sources are unchanged at that boundary. Nix packages it as
-`inform6-upstream`. Behavioral, compliance, optimization, and benchmark
-classic stories use that package. (The migration-era capture/replay test,
-which compared fork modes byte-for-byte, was deleted with the lifter.)
-
-The Glulxe dispatch loop is in `exec.c`; process setup, normal exit, and fatal
-exit handling are in `main.c`; shared declarations are in `glulxe.h`. The
-counting patch applied to these files is
-`patches/glulxe-instruction-count.patch`.
-
-After a lock-file update, resolve the new source paths instead of searching the
-store manually:
-
-```sh
-nix eval --raw .#glulxe.src
-nix eval --raw .#cheapglk.src
-nix eval --raw .#glulxe-counted.src
-nix eval --raw .#inform6-upstream.src
+```text
+cloak walk:  upstream 164,995   direct 153,588  (-6.9%)
+             coverage: 416 direct / 132 policy-classic C0 / 0 fallbacks
+Life:        upstream 56,177,197  direct 54,589,516  (-2.83%)
+glulxercise: 135 direct / 79 fallback (correctness gate; pinned
+             out-of-contract set: one jumpabs check, ten catch-token checks)
+Advent:      -4.88% (second real-game benchmark, --rngseed 1)
+focused optimization fixture: classic 422, direct ceiling 444
 ```
 
-Built package paths should not be recorded here because they vary by system and
-derivation changes; use `nix build .#glulxe-counted --print-out-paths` when a
-binary path is needed.
-
-## Optimization Tests
-
-The initial review found useful behavioral coverage but almost no
-optimization-quality regression coverage. The first test-suite work has since
-addressed the most serious harness gaps:
-
-- During migration, the now-deleted `tests/captureReplayTest.nix` proved that
-  capture/replay was byte-identical.
-- `tests/optimizationTest.nix` uses a real LLVM build and asserts that a
-  focused fixture generates and lowers directly, and enforces aggregate,
-  per-routine static, and dynamic instruction ceilings. It also compares
-  classic and LLVM behavior for an unused faulting read.
-- `tests/complianceTest.nix` compares classic and optimized interpreter transcripts.
-- `tests/directIrTest.nix` requires straight-line expressions, structural
-  conditions, short-circuit values, branches, loops, nested switches,
-  break/continue edges, terminal loops, and unreachable source to lower from
-  direct IR. It
-  compares behavior with upstream and checks exact backend diagnostics.
-- `tests/zMachineTest.nix` requires byte-identical Z5 output from pinned
-  upstream Inform and the fork for a focused shared-assembler fixture. It also
-  extracts Z and Glulx debug sequence-point locations from fork and pinned
-  upstream `-k` compiles of the same fixture and requires them to match, so
-  locations cannot move unnoticed and no golden values need maintenance.
-- `tests/lifeBenchmark.nix` alternates execution order, reports timing median/min/max,
-  and reports deterministic dynamic instruction totals.
-- Interpreter and timeout statuses are checked explicitly.
-- The `glulxercise` gate asserts the exact count of known layout-sensitive
-  failures rather than accepting an unlimited substring match.
-- `I6_LLVM_DIAGNOSTICS=1` includes per-routine input/emitted static counts and
-  `LLVM-BACKEND` TSV records identifying direct output, explicit classic
-  policy, or categorized fallback.
-- The real LLVM pipeline is not exercised by CI; the Windows build uses the
-  no-LLVM stub.
-- The Z-machine baseline is intentionally focused; it does not yet run a broad
-  Z-machine corpus or interpreter-level compliance suite.
-
-Direct IR (`$LLVM=4`) has been the production default since Phase 5. Phase 6
-removed the lifter; every nonzero `$LLVM` value now selects direct generation.
-Phase 2 directly generated all
-straight-line source arithmetic, bitwise and signed comparison operators,
-comparison-to-word conversion, comma sequencing, local/global pre/post updates,
-symbolic constants, and value-producing assignments. Ordinary operands retain
-Inform's right-to-left evaluation order; comma remains left-to-right.
-Variadic comparison lists preserve Inform's less obvious rule: positive
-predicates (`==`, `<`, `>`) combine with OR, while negated predicates (`~=`,
-`<=`, `>=`) combine with AND.
-
-Phase 3 directly represents condition context as LLVM branches. Logical `&&`,
-`||`, and parser-normalized negation retain short-circuit structure; logical
-expressions used as words join explicit zero and one arms with a phi. `if` and
-`else`, `while`, `do`/`until`, all ordinary `for` layouts, `break`, `continue`,
-source labels, and returns share the same opaque block API. Locals remain
-allocas before optimization, so LLVM promotion forms loop-carried phis rather
-than requiring the streaming parser to construct SSA.
-
-Switch selectors are evaluated once. Cases, alternatives, and ranges become an
-ordered comparison chain rather than an LLVM switch whose cases could be
-reordered, preserving source comparison order without guessing branch
-frequency from operand shape. Nested switches keep a selector stack, and a
-switch inside a loop preserves the enclosing continue target. Parser-elided
-forward exits are terminated as dead LLVM blocks without changing the current
-insertion point; this let terminal loops and all-return switches verify while
-shadow assembly was still the sole writer of parser reachability and
-label-use state (since formalized into the shared bookkeeping helpers
-described under the Phase 6 findings).
-
-The Phase 3 focused fixture matches pinned upstream behavior and guards direct
-coverage, static instruction ceilings, dynamic dispatches, and forced
-fallback. A separate manual clean build verifies the no-LLVM stub configuration.
-Direct output uses fewer dynamic dispatches than upstream for that fixture.
-Life coverage is unchanged because its remaining fallbacks require the calls,
-memory, VM effects, and inline assembly assigned to Phase 4; direct mode
-therefore remains instruction-identical to upstream on Life.
-
-Division and remainder use the lifter's safety policy: a visibly safe constant
-divisor uses native LLVM signed arithmetic, while zero, minus one, and variable
-divisors remain opaque Glulx operations. When source runtime checks are enabled,
-a potentially zero divisor first branches through the `RT__Err` veneer and
-substitutes one exactly as classic generation does. This keeps division by zero
-and `INT_MIN / -1` out of LLVM undefined behavior. Inform has no source shift or
-cast operator; comparison `i1` to word conversion is the relevant Phase 2
-conversion, while Glulx shifts enter through Phase 4 inline assembly.
-
-The Phase 2 Life benchmark has low direct coverage: only `Rnd` builds directly,
-while fourteen routines fall back. An earlier run measured direct mode at
-56,181,301 instructions against upstream's 56,177,197, a 4,104-instruction
-increase. The cause was not division: `Rnd`'s `sdiv` by `$10000` survives
-optimization intact and lowers to one native `div`. The extra dispatch per call
-was a lowerer coalescing gap for a value that is stored to a global and then
-reused: classic writes the `add` result directly into `seed` and has the
-division read the global back, while the lowerer materialized the value in a
-temporary local plus a `copy` to the global. Both backends emitted the
-identical six-instruction routine, so the lifted production path carried the
-same +4,104, masked by its wins elsewhere; the `udiv` canonicalization hazard
-documented below is real but was not implicated.
-
-The lowerer's store fold now has a multi-use variant: a def stored to an i6
-global immediately after it is computed (the single-use fold's emit-nothing
-window) may keep its remaining same-block uses if the global is unclobbered
-from the store to each read; the def then writes the global directly and the
-reads use the GLOBALVAR operand, so the temporary local and the copy
-disappear. Reads that later passes relocate are guarded by the same
-`arm_globals_stable` span check that protects direct global-load operands,
-and the focused fixture pins both the fold (`Opt_GlobalCoalesce`, 5 -> 5)
-and the mandatory decline across a clobbering call (`Opt_CoalesceClobber`).
-After the fold, direct mode matches upstream exactly on Life (56,177,197,
-+0.00%) and the lifted production path improved by the predicted 4,104
-instructions to 54,605,529 (-2.80%).
-
-Phase 4 began with source-level function calls. Direct generation emits the
-same opcode selection as classic: `i6.callf` through `i6.callfiii` for zero to
-three arguments, and `i6.call.s` for wider calls, with stack-passed arguments
-carried as explicit `.s` call operands in runtime pop order. Call declarations
-stay unmarked in the effect scheme, so every call is a full optimization
-barrier for globals and RAM. `indirect()` evaluates its first argument as the
-function; `glk()` and `metaclass()` become calls to the `Glk__Wrap` and
-`Metaclass_VR` veneer routines, matching classic. Other system functions
-(`random`, the object-tree family) still reject with an explicit reason; they
-need the Phase 4 memory operations. The parser's `push on stack` wrapper
-around wide-call arguments unwraps to the argument value itself.
-
-Adding calls exposed a latent direct-generation evaluation-order defect:
-classic emits subtree code right to left, but a leaf variable operand is read
-by the consuming instruction itself, after *all* subtree code. The direct
-backend was loading leaf globals at tree-walk time, so `f() + g` read `g`
-before `f` ran while upstream reads it after. Binary operators, variadic
-comparison lists, and call argument lists now defer leaf variable loads until
-after sibling subtree code, restoring classic read timing (the
-`Direct_CallOrder` fixture pins this with a call that mutates the global).
-
-The lowerer's stack fusion now understands `.s` calls: a contiguous deepest
-tail of a call's argument push order that is already sitting on top of the
-pending-stack simulation stays on the VM stack, and those explicit pushes are
-elided. Because direct generation evaluates arguments right to left, a wide
-call whose arguments are all fusable defs (for example five nested calls)
-lowers to classic's exact shape with zero temporaries. This benefits the
-lifted production path identically. Remaining known gap: constants interleaved
-between effectful wide-call arguments cannot ride the stack because classic
-interleaves their pushes between the argument computations while the lowerer
-pushes at the call site; `Direct_CallWideMixed` pins the resulting +2
-instructions as an accepted static ceiling until emission learns interleaved
-pushes.
-
-With calls supported, Life's `DrawCell` joined `Rnd` in direct coverage and
-direct mode remained dynamically identical to upstream (56,177,197, +0.00%).
-
-The next Phase 4 slice added memory and object operations. Byte and word
-array reads, writes, and increments become opaque `aloadb`/`aload`/
-`astoreb`/`astore` operations (reads readonly, writes full barriers, so a
-computed store cannot reorder against Inform global accesses that share the
-Glulx memory map). Strict mode mirrors classic's three checked shapes: a
-compile-time-checked plain opcode for recognized arrays with constant
-indices, an inline bounds check branching to `RT__Err` for recognized arrays
-(reads yield zero on the failed arm via a phi), and `RT__ChLDW`-family
-veneer calls for unrecognized addresses; `direct_array_bounds` mirrors the
-classic bounds table without repeating its warnings. Property operators
-(`.`, `.&`, `.#`, `.()`, their write and increment forms, `superclass`,
-`ofclass`, `provides`) become the same veneer calls classic emits, in both
-strict and unchecked modes. `has`/`hasnt` lower to `aloadbit`, `in`/`notin`
-to a parent-field `aload` comparison, and `parent`/`child`/`sibling`/
-`eldest`/`younger` to object-field loads — in unchecked or veneer mode;
-their strict forms need classic's inline metaclass-check CFG and reject
-with explicit `strict attribute check`/`strict object-tree check` reasons
-until that is generated. Single-argument `random()` follows classic's three
-shapes (constant range, constant seed, variable branch); multi-argument
-`random()` rejects because its word array is a classic-generation side
-effect. The `direct-ir-memory` fixture compiles strict and unchecked,
-matches upstream transcripts (including the strict out-of-bounds
-diagnostic), and pins per-mode coverage and dynamic ceilings; direct mode
-beats upstream in both (1,056 vs 1,076 strict; 648 vs 683 unchecked).
-`Meta__class` is the first veneer routine to compile through direct IR.
-
-With memory operations, Life direct coverage reached 8 of 15 routines and
-direct mode dropped below upstream for the first time: 54,632,155 dynamic
-dispatches (-2.75%), within 0.05% of the lifted production path's
-54,605,529 (-2.80%). The remaining fallbacks were print statements and
-inline assembly.
-
-The third Phase 4 slice added statements. Print items mirror classic's
-per-item emissions as they parse: literal strings and `(string)` become
-`streamstr`, `(char)` chooses `streamchar` or `streamunichar` by classic's
-constant test, plain items become `streamnum`, `(object)` reads the
-short-name field, and the article, `(name)`, `(number)`, `(property)`,
-`(address)`, custom-routine, and strict-mode `RT__ChPrint*` forms all
-become calls to the same routines classic calls. Stream operations stay
-unmarked in the effect scheme, so filter I/O callbacks cannot reorder.
-`print_ret` and string statements terminate with a direct `return 1`.
-`new_line`, `give` (both the `astorebit` form and the strict `RT__ChG`
-veneers), `move`, `remove`, `font`, `style`, `string`, and `quit` (an
-opaque non-returning operation) generate directly; `box`, `read`,
-`spaces`, and `objectloop` still reject — `spaces` and `objectloop` need
-loop CFGs the statement layer does not build yet, and `box` shares
-`random(...)`'s classic-side table effect. A new `llvm_direct_quantity`
-hook evaluates statement operand trees before classic generation consumes
-them.
-
-The strict-mode object guard from `check_nonzero_at_runtime_g` is now
-generated directly: zero and non-object values call `RT__Err` and either
-substitute the `Object` class-object (quantity contexts such as
-`parent()`) or force the condition false (`has`, `in`), exactly matching
-classic's error labels; variable attribute numbers additionally range
-check against `NUM_ATTR_BYTES` with the INVALIDATTR report. With that CFG
-in place, `has`/`hasnt`, `in`/`notin`, and the object-tree functions
-compile directly in strict mode too, and the strict memory fixture runs
-all 32 focused routines through direct IR in both modes (1,409 vs
-upstream's 1,420 strict, 798 vs 839 unchecked).
-
-One fixture lesson recorded for later phases: transcripts must not print
-raw object or routine addresses. RAM layout shifts across a 256-byte
-alignment boundary whenever generated code size changes, so address-valued
-results (`parent(o)`, bare `(the) o` without a library) must be compared
-against known objects instead of printed.
-
-After statements, Life direct coverage was 11 of 15 routines (adding
-`PrintGrid`, `PrintElapsed`, `WaitKey`) at 54,616,168 dynamic dispatches
-(-2.78%); the remaining fallbacks were `Main` and the inline-assembly
-routines assigned to the next slice.
-
-The fourth Phase 4 slice translates inline assembly. Parsed
-`assembly_instruction` records translate under the lifter's rules — native
-IR for arithmetic, safe divisions, constant shifts, sign extensions, and
-copies; explicit control flow for the branch family, `@jump`, and
-`@return`; typed opaque calls with graded effects for everything else,
-non-returning opcodes ending their block. Operands naming `sp` ride a
-parse-time symbolic stack of SSA values, consumed by `call`/`glk`
-constant-count argument peeling and the `@push`/`@pull`/`@dload`/`@dstore`
-macros. Because a symbolic value has no runtime stack presence, the stack
-must be empty wherever control flow diverges or joins (source labels,
-jumps, conditions, switch selectors, inline branches); violations reject.
-Custom `@"..."` opcodes, `@catch`/`@throw`, explicit stack rearrangement
-(`@stkswap` family), and raw `@ ->` code bytes reject with focused-fixture
-reasons. With this, `Main` startup code, `glk` invocations, and most
-veneer routines compile directly; the remaining fallbacks are
-stack-argument routines (`Glk__Wrap`, `CA__Pr`, `Cl__Ms`), routines
-containing directives, and the compiler-generated `Main__`/`Symb__Tab`
-stubs.
-
-Direct veneer coverage exposed a lowering cost: `simplifycfg` tail-merges
-every `return` into one ret-phi block, and the planner emitted each
-conditional edge into it as a stub plus a forced jump. Edge planning now
-classifies return edges: a constant 0/1 return uses Glulx's rfalse/rtrue
-branch encodings from either side of a conditional, any other return
-prefers the goto side as an inline `return v`, and only the leftover cases
-stub. Return blocks that lose their last reference drop their bodies, with
-planning re-run to a fixpoint since each drop can create new fallthroughs.
-`jump-threading` joined the pass pipeline: strict-mode guards join through
-a boolean phi that the consuming condition immediately re-tests, and
-threading restores classic's direct jumps to each outcome. These lowering
-changes serve the lifted path equally: the focused optimization fixture
-improved from 468 to 463 dynamic dispatches against classic's 422.
-
-The strict memory fixture initially regressed from 1,409 to 1,597 dynamic
-dispatches when its veneer routines began compiling directly; after the
-edge-planning and threading work it stands at 1,412 against upstream's
-1,420, with the unchecked mode at 811 against 839. On Life, direct mode
-covers 12 of 15 routines (adding `Main`) and reaches 54,592,173 dynamic
-dispatches (-2.82%), overtaking the lifted production path's -2.80% for
-the first time. (The memory fixture's totals moved to 1,487 vs 1,519 and
-886 vs 938 after the inline shift-boundary routines were added.)
-
-Phase 4 closed with corpus and compilation-mode gates. `tests/
-corpusTest.nix` compiles Cloak of Darkness with the full library through
-direct IR and pins its coverage exactly (277 direct, 271 fallback; the
-dominant bailout reasons are stack-argument routines, in-routine
-directives, action statements, and top-level switch tables). Measuring the
-corpus exposed a finding the transcript-only cloak test had hidden: on
-cloak the LLVM paths are dynamically *worse* than upstream — lifted
-179,729 and direct 175,651 against upstream's 164,995 (+8.9% and +6.5%).
-Direct improves on the production lifted path but the select/branch
-materialization costs documented under "Instruction-Count Findings"
-dominate library dispatch code. The corpus test holds direct's ceiling;
-closing the gap to upstream is follow-on lowering work, not a Phase 4
-regression (direct is non-worse than the current production path).
-
-Glulxercise under direct IR was pinned at this point at 124 direct / 108
-fallback with an out-of-contract set of exactly one failure: the documented
-`jumpabs` case. `@catch`/`@throw` routines reject to classic generation —
-rejection is the current documented representation for catch tokens and
-throw edges. (The Phase 6 coverage work later moved the harness routines
-around those tests to direct generation, whose lowered frames differ from
-classic; glulxercise hardcodes classic frame depths, so its ten catch-token
-sub-checks rejoined the pinned out-of-contract set. Every catch *value*
-check still passes.)
-
-Compilation modes are now product policy with focused tests: debug-file
-builds (`-k`) bypass the LLVM pipeline entirely and are byte-identical to
-classic output (sequence points don't survive reordering); an
-asterisk-traced routine compiles classically while its neighbors stay
-direct and the trace transcript matches upstream; Infix does not exist for
-Glulx (the compiler disables `-X` itself), so no direct-generation policy
-is needed. At that point the compliance suite ran every behavioral story
-in classic, lifted, and direct modes; the lifted axis was deleted with
-the lifter in Phase 6.
-
-Per-routine `LLVM-BACKEND` records and direct-mode IR dumps require
-`I6_LLVM_DIAGNOSTICS=1`; ordinary direct compiles emit only aggregate direct,
-classic-policy, and fallback totals. Debug-file generation now uses allocated Unix
-`realpath` output so long source paths do not trigger fortified-libc buffer
-checks.
-
-Phase 4.1 ranked all 277 direct Cloak routines by emitted-minus-input static
-instructions before changing the lowerer. The largest expansions were
-`GetGNAOfObject` (50 -> 132), `LanguageNumber` (114 -> 170), `ListEqual`
-(136 -> 191), and `ObjectIsUntouchable` (162 -> 216). Their post-pass IR had,
-respectively, 19/9/3/20 phis and 15/18/41/44 comparisons; only
-`GetGNAOfObject` had many selects (7). Assembly comparison showed the dominant
-shape was strict library guards becoming SSA condition values and phi edge
-copies, not missing direct coverage. For example, classic
-`GetGNAOfObject` updates its `case` and `gender` locals in place, while the
-optimized SSA form carries their alternatives through select and phi chains.
-
-Three generic lowerer changes survived the required cross-benchmark checks:
-
-- A select whose sole consumer is a global or dereference store now writes
-  each arm directly to that destination. `SetTime` guards the resulting 6 -> 7
-  shape (formerly 6 -> 8).
-- Multi-use comparisons of immutable operands are rematerialized at each
-  branch/select consumer instead of paying a copy/branch/copy boolean
-  materialization. Single-use comparisons also fuse through a no-op `freeze`.
-- When exactly one side of a conditional needs ordinary phi copies, that side
-  is emitted as the inline/goto edge and the copy-free side is the branch
-  target. This removes the forced jump on the copy-free path and is pathwise
-  non-worsening.
-
-General fusion of returned selects with non-immediate arms was tested and
-rejected: although it reduced static instructions, the focused lifted fixture
-regressed from 463 to 474 dynamic dispatches. Keeping the immediate-only rule
-preserves its branch layout.
-
-The static ranking above turned out to be a poor guide to the dynamic gap:
-those changes recovered only 208 of the 10,656 extra dispatches. Phase 4.1
-then re-measured with dynamic attribution — a `VM_PROFILING` glulxe run of
-the cloak walkthrough joined against `$!asm` routine addresses for
-per-routine self-op deltas, plus `--opcode-histogram` diffs. That showed the
-gap concentrated in a handful of hot routines with four generic causes, each
-then fixed in the shared lowerer:
-
-- `Unsigned__Compare` alone was +5,863 (2.9 ops/call upstream vs 6.1):
-  if-conversion turns the branchy veneer comparison into a nest of selects
-  feeding one return, which materialized each select through a slot. Fused
-  return selects now chain: one arm may be another qualifying select (chains
-  only, never both arms — a stack-riding condition operand of a second arm
-  could pop out of LIFO order, while an untaken chain suffix is merely
-  abandoned and discarded by the return). Conditions expand connective
-  trees at the ret, so or-chains stay branch-form (`Opt_SwitchShared`
-  improved 11 -> 9). `Unsigned__Compare` now lowers to three instructions
-  and beats upstream by 140 dispatches on the walk.
-- `RA__Pr`/`RL__Pr` were +3,263/+1,221: classic mutates the `obj`/`id`
-  parameters in place, while the phi carrying their merged values paid two
-  edge copies plus a jump on every call. `phi_param_slot()` now lets a phi
-  adopt a parameter's slot whenever no read of the parameter can execute at
-  or after any edge into the phi's block (a CFG reachability check),
-  instead of demanding the phi be the parameter's only reader. Slot-sharing
-  safety checks learned to see parameter reads, and one adopting phi per
-  parameter slot is enforced.
-- `NextWord`-style parser code was ~+1/call for `copy wn local` where
-  classic reads the global operand directly at each use.
-  `global_operand_pass()` now accepts cross-block uses via a forward
-  "written since the load" dataflow (re-entering the load's block kills the
-  taint), instead of requiring every use in the load's own block.
-- The residual was almost entirely explicit `jump`s (+5,588 on the walk)
-  from keeping LLVM's block order. `straighten_layout()` moves a block that
-  nothing can fall into and that cannot fall out of its position to sit
-  directly after a block that branches to it and currently falls into
-  nothing. Each move enables one fallthrough and can lengthen no path; no
-  branch-frequency guess is involved.
-
-Cloak now measures 164,995 upstream, 162,002 direct (-1.81%), and 163,569
-lifted (-0.86%): both LLVM paths beat classic codegen, and the direct
-ceiling is pinned at 162,002. The focused optimization fixture improved to
-444 dynamic dispatches (classic 422), the direct-IR fixture to 682
-(upstream 756), and Life to 54,590,010 direct — still ahead of 54,605,034
-lifted. Phase 4.1's exit gate is met on its primary arm; no accepted-gap
-rationale is needed. Interference-aware coalescing beyond the parameter
-case remains future work, but nothing measured still hangs on it.
-
-Phase 5 made direct generation the default Glulx mode: `$LLVM` defaulted
-to 4, while levels 1-3 (capture, lifter, lifter+dump) remained explicitly
-selected diagnostic comparisons pending Phase 6. `tests/directIrTest.nix`
-proved a plain compile (no `$LLVM`
-setting) selects the direct backend and produces bytes identical to an
-explicit `$LLVM=4` compile. Direct build failures are now counted
-separately from lowerer failures (`LLVM: direct fallbacks build=N
-lower=N`); the corpus tests pin `lower=0` for cloak and glulxercise, so
-a direct-built IR shape the shared lowerer refuses can no longer hide
-inside an unchanged fallback total.
-
-Phase 5 also re-tuned the pass pipeline on direct-IR shapes. The only
-change that measured as an improvement was removing `reassociate`, a
-holdover from lifted-shape tuning: cloak 162,002 -> 162,001, Life
-54,590,010 -> 54,589,516, lifted cloak 163,569 -> 163,559, nothing
-worse anywhere. Measured and rejected: `sccp`, `instsimplify`, and
-`adce` (no effect on any corpus point); a second `instcombine` after
-`gvn` (cloak coverage 277 -> 274 and +594 dynamic — its shapes defeat
-the lowerer); `early-cse` before `instcombine` (LLVM 21's instcombine
-fixpoint verifier hard-aborts the compiler process on library code);
-`simplifycfg<hoist-common-insts>` (cloak +25). Removing `jump-threading`
-costs cloak +1,048, confirming it earns its place. The Life benchmark's
-repeated timings stay consistent with the dynamic ordering (direct
-fastest, then lifted, then classic).
-
-Phase 6 removed the assembly-to-LLVM lifter, including its symbolic stack
-reconstruction and label-entry stack inference. All nonzero `$LLVM` values now
-select direct generation; the capture/replay test and lifted corpus,
-compliance, and benchmark axes were deleted. No-LLVM and Visual Studio stub
-builds select classic Glulx generation before routine capture; a clean
-`WITH_LLVM=0` build was verified byte-identical between its default and
-explicit `$LLVM=0` output.
-
-The first shadow-removal coverage slice made in-routine directives and action
-statements direct, added direct top-level routine switch clauses, and routes
-C0 stack-argument routines directly to an explicit classic policy without
-capturing shadow assembly. Cloak moved from the Phase 5 baseline of 162,001 to
-161,118 dynamic dispatches while preserving its normalized transcript. Its
-diagnostic split at that point was 344 direct routines, 132 policy-classic C0
-routines, and 72 genuine fallbacks (71 build, one lower).
-
-The second coverage slice eliminated all 72 remaining cloak fallbacks:
-
-- Routine finish now seals a trailing unterminated-unreachable block with
-  `unreachable` instead of rejecting. The two benign shapes ending that way
-  (a compiler label bound where both branch arms returned, and a
-  continuation only reachable through front-end-folded constant branches)
-  carry no classic code, so sealing is exact. A single empty entry block
-  still rejects, guarding against raw-assembled bodies the builder never
-  saw; the three raw emitters (the `Stub` directive, `Main__`, and the
-  non-INFIX `Symb__Tab`) now announce their bodies through direct hooks.
-- `has`/`hasnt` supports `or`-alternative lists. Without strict guards the
-  alternatives are pure `aloadbit`s combined flat (OR for `has`, AND for
-  `hasnt`, matching classic's negated-`or` transform); with guards a
-  branchy chain runs every guard per alternative, exactly reproducing
-  classic's repeated runtime errors and its error-path truth values —
-  which also fixed a latent single-attribute divergence (`hasnt` of an
-  invalid object is TRUE, and a bad attribute number in condition context
-  falls into the true branch; both previously came out false).
-- `objectloop` (all four forms, with the strict-mode OBJECTLOOP/CHILD/
-  OBJECTLOOP2/OBJECTLOOP_BROKEN guards), `spaces`, `inversion`, and the
-  `children()` system function generate directly, using new phi-append
-  and N-ary phi builder APIs for their loops.
-- Inline assembly's symbolic stack now spills to the real VM stack at
-  control-flow points (real pushes at the same source position classic
-  pushed) instead of rejecting; sp reads past the symbolic window pop the
-  real stack via `i6.stkpush`/`i6.stkpop` opaque calls. The lowerer's
-  operand-fusion pass treats those calls as barriers (pending fused values
-  unfuse to slots), a stack-fused `stkpop` result elides entirely, and a
-  `stkpop` folded into a global store honors `fold_store`. This lifted the
-  WriteListR-style save/restore-around-call idiom into direct coverage.
-- The pointer-select unmerge pass generalized into a tag-based
-  de-pointerizer: any select/phi network over `i6.g` global pointers (the
-  optimizer merges global accesses through such networks) is mirrored by
-  an i32 tag network; loads become tag-driven select chains of direct
-  loads, stores write each candidate global with either the new value or
-  its own current value. This removed the last lower-stage fallback
-  (`InformLibrary.play`).
-
-Cloak now compiles with 416 direct routines, 132 policy-classic C0
-routines, and zero fallbacks, at 153,588 dynamic dispatches (upstream
-164,995); glulxercise moved to 135 direct / 79 fallback. These are current
-migration measurements, not final architecture guarantees; exact gates
-remain owned by `tests/corpusTest.nix`.
-
-The C0 stack-argument policy is now a measured, final decision rather
-than a provisional routing. Stack-argument routines (type-`0xC0` header,
-`@copy sp _vararg_count`, arguments left on the VM stack) remain classic.
-Dynamic attribution on the cloak walkthrough put the entire 132-routine
-C0 set at 8.35% of self-ops (12,845 of 153,741), with 96% of that in
-`CA__Pr` alone — the fourth-hottest routine in the game — while the glk
-wrappers are three-op re-dispatch bodies. The realistic gain from direct
-C0 support is the improvement direct IR would achieve on that share, and
-CA__Pr's inline-assembly-heavy veneer siblings bound it: `CP__Tab`,
-`RT__ChLDB`, and `RT__ChLDW` gained exactly nothing from direct IR,
-`RA__Pr` gained 3.1%, `Z__Region` 8.4%. Applying that range to CA__Pr
-projects at most a few hundred dispatches, under half a percent of
-cloak's total; on Life the only executed C0 routine is `Glk__Wrap` at 35
-of 54.6 million ops. That does not pay for modeling varargs entry state
-(unknown stack contents at routine entry) or for the churn to
-glulxercise's pinned frame-depth failure set. The policy is enforced as
-a closed set: `tests/corpusTest.nix` and `tests/directIrTest.nix` assert
-that every `backend=classic` diagnostic record carries
-`reason=stack-argument routine`, so no new construct can silently join
-the policy bucket. Revisiting the decision requires new attribution
-evidence, not a new coverage argument.
-
-Parser bookkeeping is now formally separated from output buffering in the
-capture seam. The parse-visible side effects of suppressed emission
-(consuming `sequence_point_follows`, updating
-`execution_never_reaches_here` from the opcode's Rf flag, counting
-forward branches in `labeluse[]`) run through one
-`shadow_note_instruction` helper over the `asm_parser_*` primitives,
-whether or not the shadow event is stored; storage itself is gated by a
-separate retention flag and exists only so a rejected routine can still
-be emitted classically. The event buffer became private to `asm.c` — the
-lowerer now reports its input size from a plain instruction counter
-rather than walking the buffer — and `llvm_pipeline_routine()` reports
-whether the buffer holds lowered output or the shadow stream must be
-replayed. The diagnostic mode `I6_LLVM_SHADOW=0` disables retention to
-prove the independence: `tests/corpusTest.nix` asserts a retention-free
-cloak compile is byte-identical (all 416 direct routines carried by
-bookkeeping alone), and `tests/directIrTest.nix` asserts the same for
-the memory fixture plus a clean compile error — never a silently empty
-routine — when a fallback routine is compiled without retention.
-
-Shadow retention itself is retained as permanent architecture, closing
-the migration plan's "remove shadow emission" item with a measured
-decision in the direction the plan allowed: keep fallback as a safety
-valve. The evidence: fallback is load-bearing, not residue — glulxercise
-compiles 79 of its 214 routines through classic fallback for constructs
-direct generation deliberately rejects (catch/throw, explicit
-stack-manipulation opcodes, custom `@"..."` opcodes, unsupported
-`random` arity), and the focused phase-1 fixture pins four more; deleting
-retention would turn all of them into compile errors. Against that, the
-retention cost measured on cloak is roughly five percent of a
-half-second compile (interleaved runs: 547ms with retention, 510ms
-without) and zero bytes of output difference. The temporary lifter modes
-are already gone; the fallback counters (`LLVM: backends` and
-`LLVM: direct fallbacks`) stay deliberately, because they are the
-coverage gates that keep a routine from silently leaving the optimized
-set — the counter lines and per-fixture totals remain pinned across the
-test suite. What was removed from the migration-era design is the
-*obligation*: byte-identical capture/replay is no longer a product gate,
-parsing no longer depends on the stored stream, and `I6_LLVM_SHADOW=0`
-exists precisely to keep proving that independence.
-
-With that, the direct-IR migration is complete and its plan document
-(`DIRECT-IR.md`) is deleted. Direct IR is the sole production path from
-Glulx source to optimized LLVM IR; the lifter and its capture axes are
-gone; upstream Inform is the classic oracle; the Z-machine path is
-classic and guarded; coverage, bailout reasons, and dynamic ceilings are
-machine-readable and pinned; and every measured corpus point (cloak
-153,588 vs upstream 164,995; Life 54,589,516 vs 56,177,197) runs fewer
-dynamic instructions than classic codegen. The two deliberate departures
-from the plan's original end state are recorded above with their
-measurements: C0 stack-argument routines stay classic by policy, and
-shadow retention stays as the fallback safety valve.
-
-### Why Classic Generation Stays
-
-Asked at migration close: *is there any value in keeping the classic
-backend generation around right now? Ignoring Windows builds, having to
-stub the LLVM code seems like it is perhaps adding more indirection that
-could be hiding some additional wins.*
-
-The assessment: yes, keeping it has real value, and the stub is not where
-wins are hiding. The stub costs nothing at runtime — it is a link-time
-substitution. Classic Glulx generation is still load-bearing in five
-places: the fallback safety valve (glulxercise compiles 79 of 214
-routines through it, for catch/throw, explicit stack-manipulation
-opcodes, custom opcodes, and multi-arg `random()`; catch/throw drags in
-frame-layout semantics, exactly where glulxercise already hardcodes
-classic frame depths); the C0 policy routines (measured above at under
-half a percent to replace); debug builds, asterisk-traced routines, and
-INFIX, which are classic because sequence points and trace preambles do
-not survive reordering; `$LLVM=0` as the bisection escape hatch when a
-user suspects a miscompile in a young optimizing backend; and resilience
-against LLVM itself — this project already hit LLVM 21's instcombine
-fixpoint verifier hard-aborting the compiler on library code, and a
-compiler that cannot emit anything when its LLVM misbehaves is fragile.
-Classic *generation* must also be distinguished from the classic
-*encoder*: the encoder, branch shortening, backpatching, and the output
-buffer stay regardless, because the lowerer emits through them, so the
-deletable surface is smaller than it appears.
-
-The real indirection is not the stub but the single-writer discipline:
-direct hooks read parser state and never write it, because classic
-generation is the writer. That rule does hide specific wins — multi-arg
-`random()` and `box` are rejected precisely because classic's parse-time
-side effects (their word arrays) would be duplicated, not because direct
-IR could not represent them. But the measurement that matters is that
-cloak has zero fallbacks: on a real library game the suppressed
-constructs simply do not occur, so the hidden wins are dynamically ~0 on
-everything measured. The remaining honest cost of the dual path is the
-~5% compile time and a few hundred lines of capture machinery, now
-isolated behind the bookkeeping/storage separation and its byte-identity
-tests.
-
-Conclusion: keep it. If specific hidden wins are wanted later, the move
-is to relax the single-writer rule per construct (let direct own the
-`random()` word-array side effect), justified by attribution evidence
-first. If simplification is the motivation, the real decision is
-declaring LLVM a hard requirement for Glulx — a legitimate product
-choice whose payoff today is small and whose price is the five items
-above. Revisit only if the glulxercise fallback set ever reaches zero,
-at which point the safety valve is provably vestigial.
-
-The focused fixture currently requires 15 of 15 routines to build and lower
-directly, with zero policy-classic routines and zero fallbacks. Eleven named
-routines pin exact input counts and maximum emitted counts, and the dynamic
-gate requires exactly 422 classic dispatches with a direct ceiling of 444.
-The named static checks cover store fusion, comparison and select returns,
-boolean trees, loop phis, recurrence folding, four-block layout, switch
-order, shared-target switch cases, and global coalescing with its mandatory
-clobber decline. The broader fixtures pin coverage too: corpus, compliance,
-memory, and phase-1 tests all assert exact backend totals, so a routine
-cannot silently stop optimizing anywhere in the suite.
-
-The machine-readable diagnostics mode called for during early review now
-exists: `I6_LLVM_DIAGNOSTICS=1` emits one `LLVM-BACKEND` TSV record per
-routine (backend, stage, input/emitted counts, bailout reason), which is
-what the corpus-scale tests parse.
-
-The aggregate counters include only successfully lowered routines. If a
-routine which previously optimized starts falling back, both its input and
-output instructions disappear from the total. Aggregate counts can therefore
-appear to improve while optimization coverage regresses. Count assertions must
-always be paired with backend coverage assertions.
-
-### Open Focused Coverage
-
-`stories/optimization-regressions.inf` already covers store fusion, comparison
-and non-immediate select returns, boolean trees, loop phis, recurrence folding
-and loop-rotation sensitivity, four-block layout, and switch ordering. The most
-useful remaining focused fixtures are:
-
-- Phi and slot coalescing: loop induction values, phi chains, and parallel-copy
-  cycles.
-- VM-stack fusion: LIFO consumption, calls with stack arguments, and cases
-  which must deliberately unfuse.
-- Conditional phi edges: ensure a natural fallthrough does not gain an
-  unnecessary jump because the opposite edge needs a stub.
-- Division: source patterns which InstCombine converts from `sdiv` to `udiv`.
-- LICM: zero-trip loops and conditionally executed invariant operations.
-- Global and RAM aliasing: loads around direct global stores, opaque calls,
-  possible RAM aliases, readonly operations, and stream operations under
-  filter I/O which call back into arbitrary VM code.
-- Dereference motion: repeated reads without a write should merge, reads
-  around a possible write must not merge, and a faulting read on an untaken
-  path must not be hoisted or deleted.
-- RNG ordering: deterministic sequences with intervening RAM operations and
-  repeated `setrandom` calls must preserve RNG ordering without unnecessarily
-  blocking RAM optimization.
-- Unsigned division and remainder boundaries: dividends around `0x7fffffff`
-  and `0x80000000`, and divisors `1`, small even and odd values,
-  `0x7fffffff`, `0x80000000`, and `0xffffffff`.
-- Funnel shifts and rotates: `llvm.fshl` and `llvm.fshr` patterns with counts
-  0, 1, 31, and values requiring masking by 31.
-- Select-of-pointer repair: nested conditional global reads, including trees
-  deeper than the current repair depth.
-- Tail calls with stack arguments: verify pop order, an empty symbolic stack,
-  and successful lowering rather than fallback.
-- Cross-block comparison fusion: record the current excess count and guard a
-  future implementation which extends operand liveness across blocks.
-
-Static emitted count is useful for focused fixtures and per-change deltas, but
-it is not a sufficient global profitability rule. The lowerer intentionally
-accepts some static expansion to remove instructions from frequently executed
-paths. Loop structure, pathwise-safe rules, target instruction costs, or
-interpreter-level instrumentation is needed to estimate dynamic cost without
-requiring application profiles.
-
-The Life benchmark runs each version multiple times, compares medians, and
-reports rather than gates its dynamic count.
-
-## Correctness Findings
-
-### `jumpabs` And Computed Code Addresses: Documented Policy
-
-`jumpabs` carries the non-returning (`Rf`) flag in the Glulx opcode table in
-`src/asm.c`, and direct generation represents it as an opaque call whose
-block ends in `unreachable`. Glulx allows it to jump into the interior of a
-routine, but LLVM may remove or reorder that routine's instructions and
-change its local-frame layout.
-
-DM4 §41 says that Inform branch labels are routine-local, but this restriction
-does not define `jumpabs`: its operand is an ordinary computed value rather
-than an Inform branch-label operand. The Glulx specification (§2.2 "Branches")
-explicitly permits branching into another function and notes that a function
-has no well-defined end. It defines `jumpabs` as an unconditional branch to an
-absolute address.
-
-What Inform does not guarantee is the generated instruction layout needed to
-derive an interior address from a routine symbol. Glulxercise relies on that
-layout with `pos = test_jumpabs_2+5`; optimization and compiler-version changes
-may both invalidate the offset.
-
-Policy: programs that compute code addresses are unsupported under LLVM
-optimization, in the same way they are unsupported across upstream compiler
-versions. Handling `jumpabs` routine-locally as an opaque non-returning
-operation is sufficient; no story-wide preflight, whole-story buffering, or
-layout-preserving mode is planned. `tests/complianceTest.nix` pins the known
-out-of-contract glulxercise failures (one `jumpabs` check, ten catch-token
-checks) exactly, so any change in the accepted failure set is still detected.
-The compiler warns whenever LLVM optimization encounters `jumpabs`, because it
-cannot prove whether the address depends on generated layout.
-
-### Poison, Undef, and Freeze Semantics Need Proof
-
-The lowerer resolves LLVM `undef` and `poison` values as zero and treats
-`freeze` as a no-op. This is safe only if the direct builder and pass
-pipeline never allow LLVM undefined behavior or poison to represent behavior
-which Glulx defines. Division and shift generation already contain explicit
-guards because the two semantic models differ, but there is no focused test
-or documented invariant covering all other ways poison can arise.
-
-Tests should exercise shift boundaries, signed overflow-sensitive
-transformations, narrowed values, and selects whose unchosen arm could become
-poison. If the invariant cannot be proven for arbitrary optimized IR, lowering
-should reject poison-dependent values instead of silently choosing zero.
-
-### Opcode Effect Classification Is Correctness-Critical
-
-The pure, readonly, and inaccessible-memory opcode lists
-(`pure_opcodes`/`readonly_opcodes` in `src/llvm_codegen.c`) control GVN,
-LICM, DCE, sinking, and the lowerer's global-clobber analysis. A mistaken entry can reorder operations across a VM
-callback or observable state change. Stream opcodes are correctly excluded
-because filter I/O can invoke arbitrary code, but the classification needs
-focused alias, callback, fault, and RNG-order tests rather than relying on
-broad transcript coverage.
-
-## Instruction-Count Findings
-
-### Signed Division Can Expand Into Unsigned Emulation
-
-`llvm_direct_division()` generates native LLVM signed arithmetic only for
-visibly safe constant divisors. InstCombine can prove that a dividend is
-nonnegative and rewrite `sdiv` as `udiv`. Glulx has a native signed division
-instruction but no native unsigned division instruction.
-
-The resulting `udiv` is expanded into shifts, signed division, multiplication,
-subtraction, comparison, and correction in `emit_udiv_urem()` in
-`src/llvm_lower.c`.
-Patterns such as `(x & $7fffffff) / 3` can therefore replace one native
-division dispatch with several dispatches. `Direct_NonnegativeDivide` now
-guards this shape with a nine-instruction static ceiling; prevention of the
-canonicalization or cost-aware recovery of signed division remains desirable.
-
-### LICM Can Add Work to Zero-Trip or Conditional Paths
-
-LICM runs unconditionally in the pass pipeline (`LLVM_PASS_PIPELINE` in
-`src/llvm_codegen.c`), and pure opaque
-operations are marked `speculatable` there. This can
-hoist an invariant operation out of a conditional or zero-trip loop, causing it
-to execute once when it previously executed zero times.
-
-LICM may be a large win when an operation would otherwise execute on every
-iteration, but it is not always the "pure dynamic win" described in the
-comment. Tests should cover both profitable and unprofitable loop shapes.
-
-### Phi Stubs Defeat Natural Fallthrough
-
-During emission planning, a conditional target requiring a phi-copy stub causes
-`plan_terminator()` (`src/llvm_lower.c`) to force a jump on the opposite
-edge. That edge is planned as
-`EDGE_DIRECT` rather than `EDGE_FALLTHROUGH`, and `emit_terminator()` emits its
-explicit jump before flushing the stub.
-
-Conditional planning now avoids this cost when exactly one ordinary edge has
-phi copies: the copy edge becomes the inline/goto side and the copy-free edge
-the direct branch target. Cases where both edges require copies still need
-stubs and remain candidates for interference-aware coalescing.
-
-### Returned Selects Materialize Ordinary Values
-
-`ret_select_pass()` accepts selects whose arms are immediate values or (as a
-chain, one arm per level) further qualifying selects; `emit_ret_select()`
-expands the chain as conditional returns, with connective-tree conditions
-re-expanded at the ret. This restores the branch form of if-converted
-boolean routines such as `Unsigned__Compare`.
-
-Fusing arbitrary ordinary arms was tested in Phase 4.1, but it increased the
-focused fixture from 463 to 474 dynamic dispatches despite reducing static
-output, so arms beyond immediates and select chains still materialize.
-
-### Select Ordering Assumes Immediates Are Rare
-
-`select_swapped()` in `src/llvm_lower.c` assumes that an immediate
-true arm is a rare sentinel and orders emission to favor the computed false
-arm. The choice affects `emit_select()`.
-
-For the common idiom `ok ? 0 : error`, this can add one dispatch to the common
-success path. Operand representation is not branch-frequency evidence. The
-heuristic should use structural evidence, source ordering, or a neutral rule
-which does not claim one arm is more likely.
-
-### Select-to-Store Is Not Folded
-
-`store_fold_pass()` now recognizes a select whose sole effective consumer is a
-global or dereference store and emits each arm directly to that destination.
-It uses the existing empty-window check and branches before either destination
-write, so condition and arm reads cannot observe an early clobber. Cloak's
-`SetTime` statically guards the fold.
-
-### Fixed Limits Can Hide Coverage Regressions
-
-The direct builder and lowerer use fixed limits for the symbolic stack,
-pending fused values, connective-tree depth, edge stubs, reads, and local
-slots. Exceeding most of these limits safely falls back to classic output.
-The suite now pins exact backend totals everywhere, so a coverage loss is
-visible — but as a changed aggregate number, not as a named limit.
-
-Tests should still include fixtures near each practical limit and assert
-either successful lowering or the exact expected bailout reason, so an LLVM
-upgrade that pushes a shape over a limit is attributed to that limit rather
-than surfacing as an unexplained total change.
+`flake.lock` pins Inform 6 `d1066bc2…`, Glulxe `56ab8743…`, CheapGlk
+`14d8aaf6…`. After a lock update resolve sources with
+`nix eval --raw .#glulxe.src` (etc.); don't record built store paths here.
+The counting patch is `patches/glulxe-instruction-count.patch`.
+
+Two standing measurement caveats:
+
+- The aggregate instruction counters include only successfully lowered
+  routines, so a routine falling back *removes* its counts and can make
+  aggregates look better while coverage regresses. Count assertions must
+  always be paired with backend coverage assertions (the suite does this;
+  keep it true for new tests).
+- Fixture transcripts must never print raw object/routine/dictionary
+  addresses: RAM layout shifts across 256-byte alignment whenever code
+  size changes. Compare against known objects instead.
+- Capture performance baselines only from a clean build (`make clean` or a
+  fresh worktree of the baseline commit); a stale incremental binary
+  produced phantom regressions once already.
+
+## Settled Policies
+
+Recorded so they are not relitigated without new evidence.
+
+- **Computed code addresses (`jumpabs` across routines) are unsupported
+  under optimization**, as they are unsupported across upstream compiler
+  versions. The Glulx spec permits interior jumps, but Inform never
+  guaranteed the generated layout needed to derive an interior address
+  from a routine symbol (glulxercise's `test_jumpabs_2+5` relies on it).
+  `jumpabs` lowers routine-locally as an opaque non-returning operation
+  and the compiler warns when optimization encounters it. No story-wide
+  preflight or layout-preserving mode is planned.
+  `tests/complianceTest.nix` pins the accepted glulxercise failure set
+  exactly.
+- **C0 stack-argument routines stay classic by measured policy.** The
+  entire 132-routine cloak set is 8.35% of self-ops, 96% of it `CA__Pr`,
+  and the measured direct-IR gain on its inline-assembly-heavy veneer
+  siblings (0-8.4%) projects the recoverable win under half a percent —
+  which does not pay for modeling varargs entry state. Enforced as a
+  closed set: every `backend=classic` diagnostic record must carry
+  `reason=stack-argument routine`. Revisiting requires new attribution
+  evidence, not a coverage argument.
+- **Shadow retention is permanent architecture, not migration residue.**
+  Fallback is load-bearing (glulxercise: 79/214 routines) for constructs
+  direct generation deliberately rejects (catch/throw, explicit stack
+  manipulation, custom opcodes, multi-arg `random()`); the cost is ~5% of
+  a half-second compile and zero output bytes. Parse-visible bookkeeping
+  (`shadow_note_instruction`) is separated from storage;
+  `I6_LLVM_SHADOW=0` disables retention to prove parsing never depends on
+  the stored stream (byte-identical cloak, clean error — never a silently
+  empty routine — where a fallback would be needed).
+- **Classic generation stays.** It backs the fallback valve, the C0
+  policy, debug/trace/INFIX builds (sequence points and trace preambles
+  do not survive reordering), `$LLVM=0` bisection, and resilience against
+  LLVM itself (LLVM 21's instcombine fixpoint verifier has hard-aborted
+  on library code). The single-writer rule — direct hooks read parser
+  state, classic generation is the sole writer — hides only wins that are
+  dynamically ~0 on everything measured (multi-arg `random()`, `box`).
+  If a specific win is wanted later, relax the rule per construct with
+  attribution evidence first.
+- **Debug-file (`-k`) builds bypass the LLVM pipeline entirely** and are
+  byte-identical to classic output; asterisk-traced routines compile
+  classically among direct neighbors; Glulx has no INFIX.
+
+Diagnostics: `I6_LLVM_DIAGNOSTICS=1` emits per-routine `LLVM-BACKEND` TSV
+records (backend, stage, counts, bailout reason) plus IR dumps to
+`inform6-llvm-dump.ll`; ordinary compiles print only the aggregate
+`LLVM: backends` / `LLVM: direct fallbacks` counter lines, which the
+corpus tests pin.
+
+## Branch `inlining-deferred-lowering`: Review Findings
+
+The branch (commits d63c4f0..9cf10c1) implements deferred lowering —
+no routine is lowered/encoded/addressed during parse; all are retained
+and emitted in one end-of-pass pass after `parse_program` +
+`compile_veneer` — and, on top of it, selective procedure inlining behind
+`I6_LLVM_INLINE` (clone the callee module, link into the caller, rewrite
+the opaque `i6.callf*` as a real call marked alwaysinline, run the
+always-inline pass). A full skeptical audit (2026-07-21, all findings
+independently reproduced) follows. **Verdict: not landable until the
+blocking defects are fixed.**
+
+### Verified claims (adversarially checked, hold)
+
+- Byte-identical output with inlining off, master vs branch, across the
+  full story corpus in both `$LLVM=0` and `$LLVM=4`, from a clean
+  worktree baseline. All nine test gates pass.
+- Cloak with inlining on: 153,588 → 143,916 dispatches (−6.30%),
+  transcript identical. Microbenchmark (helper called 1,000× in a loop):
+  −28.5%.
+- The revert-on-fallback guard is implemented and works: inlining runs on
+  a throwaway clone and the un-inlined module lowers instead if the
+  inlined form fails to optimize or lower. Measured essential: without
+  it, `Parser__parse` bloats past the local-slot limit, falls back to
+  classic, and erases most of the program-wide gain (−1.39% vs −6.30%).
+  Under the guard no routine changes backend.
+- The SYMBOL_MV address-decoupling argument is sound end-to-end: marked
+  operands are forced to 4-byte `CONSTANT_OT` (width invariant), and
+  `bpatch.c`'s ROUTINE_T `SYMBOL_MV` case applies the identical
+  stripped-address + `code_offset` computation as `IROUTINE_MV`. Veneer
+  overrides, GV2-only grammar, and Z-code isolation all check out.
+- The deferred event-stream deep copy is genuine (POD operands, `ai.text`
+  nulled at capture, memlist-registered buffer); the failed-inline retry
+  cannot leave partial output (every lowering failure exit precedes
+  emission and the buffer resets at emission start); effect-attribute
+  loss across module linking is impossible in the unsafe direction
+  (missing attributes default to full-barrier); no double-frees in the
+  retained-module lifetime.
+
+### Blocking defects (all reproduced, all silent miscompiles or breaks)
+
+1. **An asterisked routine hijacks program startup.** `[ Foo * ...; ]`
+   routines emit eagerly (uncapturable), and under deferral nothing else
+   has been emitted during parse — so the eager routine lands at
+   code-area offset 0, where the Glulx header's start-function field is
+   hardcoded to point (`src/files.c:723` bakes the code-area start, not
+   the `Main__` symbol). The story boots into the traced routine and
+   never runs Main. Also falsifies the commit's "reproduces the eager
+   layout exactly" claim. Fix: defer-or-refuse asterisked routines, or
+   emit `Main__` eagerly first, or resolve the header start function
+   through the symbol.
+2. **`Replace X Y` resolves the preserved original to `Main__`.**
+   `src/syntax.c:222` copies X's value into Y at parse time, when every
+   deferred routine's value is the placeholder 0; Y is never a stashed
+   `routine_symbol`, so it backpatches to `0 + code_offset` = Main.
+   Calling the preserved original recurses into Main (reproduced to a
+   stack fault). This is the standard library-customization idiom. Fix:
+   re-resolve `rep_symbol` at end of pass.
+3. **The deferral gate is a live predicate, not a latched decision.**
+   `deferred_lowering_active()` re-reads `trace_fns_setting` at every
+   call site; a mid-source `Switches g;` flips it after `Main__` is
+   stashed — later routines emit eagerly from pc 0 and the stash
+   (including Main) is silently never emitted. Fix: latch the decision
+   once at `begin_pass` and make `Switches` error if it would change a
+   gate input after the first stash.
+4. **`make WITH_LLVM=0` no longer links** — `llvm_stub.c` is missing
+   stubs for `llvm_retain_direct_routine` / `llvm_lower_retained_routine`
+   (unconditional call sites in `asm.c`).
+
+The root cause of 1-3 is systematic: the commit enumerated the *table*
+consumers of parse-time addresses (action table, veneer table, GV2
+grammar tokens — all correctly refreshed) but missed the *scalar*
+consumers (`Replace`'s value copy, the header's implicit "Main is first"
+invariant) and treated a mutable predicate as a constant. All three sit
+in gaps the corpus never exercises, which is why "byte-identical across
+the corpus" held anyway. Any further emission-order work should hunt for
+the same class: reads of `symbols[].value` or pc-derived values between
+parse and end-of-pass.
+
+### Design gaps in the inlining prototype
+
+- **The profitability gate is not implemented — only the lower-failure
+  revert exists.** The inlined form is used unconditionally whenever it
+  lowers (`process_direct_routine`); nothing compares it against the
+  un-inlined lowering, and there is no heat ranking. Measured
+  consequences: on cloak 264 routines get strictly larger static output
+  (+8,718 instructions; 11 shrink), stories grow +32-42%
+  (cloak 152,576 → 201,216 bytes), and **Life regresses** by +1,634
+  dispatches because cold sites inline as eagerly as hot ones. The
+  needed gate, unchanged from the original design: rank candidate sites
+  by measured `calls × per-call overhead` from dynamic attribution,
+  estimate post-inline cost from CFG/loop structure, and keep the
+  pre-inline form when the estimate regresses. Default-on is
+  unjustifiable before this exists.
+- **Retained callee modules are optimized in place by their own
+  lowering**, so what a caller inlines depends on emission order (a
+  caller emitted before its callee clones pre-optimization IR; after,
+  post-optimization IR that has also been through
+  `unmerge_pointer_selects`). Not unsound — both forms are verified
+  equivalents — but order-dependent output under a flag violates the
+  design's own snapshot invariant and will confound tuning. Snapshot or
+  clone before the callee's own lowering mutates it.
+- **All retained modules persist to end of compile even with inlining
+  off**: +21% peak compiler RSS on glulxercise (49.9 → 60.6 MB). Dispose
+  each module after its routine lowers when inlining is disabled (or
+  after its last inline use when enabled). The
+  "should have been consumed" comment in `llvm_codegen_free` is stale.
+- **The same callee is cloned + linked once per call site**
+  (`i6.inl.<caller>.<i>`), not once per caller; compile time with
+  inlining on is ~4× (glulxercise 0.13 s → 0.55 s). Cache one clone per
+  (caller, callee).
+- Minor: the >16-param eligibility check runs after the clone is already
+  linked (harmless — the unused internal function is deleted — but the
+  check should precede linking); the 128-call-site collection cap is
+  silent; the eligibility doc's "inline stack by symindex" recursion
+  guard is not implemented (moot today only because inlining is strictly
+  single-level — revisit if transitive inlining is added).
+
+### Secondary defects
+
+- **AUTOGEN embedded-routine symbols are name-keyed with no collision
+  guard.** The mangled `<object>.<prop>` names include
+  `nameless_obj__N`, a legal user identifier; `assign_symbol` silently
+  overwrites on name match, so a collision aliases two embedded routines
+  to one address (latent silent wrong-code). Detect a non-UNKNOWN
+  existing symbol at the mint sites (`objects.c`) and uniquify.
+- **The promised AUTOGEN post-backpatch cleanup pass was never written**;
+  the comment at `objects.c:1582` claims it exists. Either implement the
+  discard (DISCARDED/UNHASHED machinery) or fix the comment. Until then
+  AUTOGEN symbols persist in the table (and keep the collision surface).
+- **`find_the_actions()` runs twice under deferral**
+  (`inform.c:1040`, `:1053` — the first for USED_SFLAG before unused
+  warnings, the second to refresh addresses); its error paths are not
+  idempotent, so a missing `...Sub` reports twice and doubles the error
+  count. Make the second pass silent.
+- The deferred branch in `properties_segment_z` (`objects.c`) is
+  unreachable (deferral requires Glulx) and sets Glulx `CONSTANT_OT`
+  inside the Z path — wrong if ever enabled. Copy-paste residue; delete
+  or fix.
+- `verbs.c` registers ATTRIBUTE_T grammar tokens in the routine-address
+  fixup list; currently a harmless no-op rewrite, but semantically wrong
+  and a trap if either mechanism is extended. Limit to the routine token
+  cases.
+- Errors raised inside `emit_deferred_routines` are attributed to the
+  end-of-file lexer position, not the routine's source line (diagnostic
+  modes only).
+- `llvm_replay_routine`'s save/restore of `labels[].symbol` preserves
+  stale cross-routine leftovers during batched replay; nothing reads it
+  after replay today except an internal-error path that would print a
+  wrong label name. Undocumented cross-routine state dependency.
+- `expressp.c`'s SYSTEM_SFLAG marker-clearing now bakes a symbol index
+  (previously a raw address — equally garbage); unreachable today
+  (`Main__`/`Symb__Tab` are never referenced by name through expressp)
+  but deserves an assert.
+- Glulxercise under inlining: the catch-token diffs are the documented
+  layout-sensitive checks (value-only; they already fail against
+  upstream expectations on master's direct path). The jumpabs check does
+  not merely fail — execution escapes the test without returning
+  (layout UB per the settled policy; compile-time warning already
+  covers it). Acceptable while inlining is opt-in; keep the pinned
+  failure set honest if it ever defaults on.
+
+### Correctness invariants for the remaining branch work
+
+- Single-writer/shadow rule untouched: deferral moves consumption of the
+  shadow stream, never its production; every routine's shadow is retained
+  until that routine lowers so a late fallback stays byte-exact.
+- Byte-identical output with inlining off is the standing gate for all
+  deferral fixes.
+- Effect attributes must survive cloning/linking (currently guaranteed
+  conservatively); default-return convention per `embedded_flag`;
+  address-assignment order must match emission order; an inlined body
+  must not create dependence on a routine's generated address.
+- `I6_LLVM_SHADOW=0` now means "do not retain shadows" — any routine
+  needing a fallback becomes a compile error, evaluated at end of pass.
+
+### Remaining inlining work (beyond the fixes above)
+
+- Tune `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS` (currently 16/70 on
+  pre-optimization IR — a crude proxy) *after* the profitability gate
+  exists; decide default-on only on cross-corpus evidence (cloak −6.30%,
+  Life must not regress, size growth bounded).
+- Phase 3 landing: inline `Z__Region` and hot siblings by default, pin
+  the new cloak baseline in `tests/corpusTest.nix`.
+- Focused fixtures: a hot-loop helper that must inline (assert the
+  call/return dispatch pair disappears), a forward-defined helper
+  (proving deferral bought the forward case), a recursive callee that
+  must not inline, an indirect call that must not, a varargs callee
+  excluded, and an ordering fixture whose opaque stream op's barrier
+  must survive inlining.
+- Diagnostics: per-routine inlined-callee counts in
+  `I6_LLVM_DIAGNOSTICS=1`; `I6_LLVM_INLINE=0` already works for
+  bisection.
+- Track the deferred-model costs as first-class benchmark outputs: peak
+  compiler RSS and compile time (current data: glulxercise RSS
+  49.9 → 60.6 MB inline-off, ×4 compile time inline-on) on the largest
+  corpus game.
+- Open design questions: snapshot point for the inline source (decide
+  pre- vs post-optimize deliberately — currently accidental, see design
+  gaps); transitive inlining (flatten at snapshot vs caller time, depth
+  budget vs recursion guard).
+
+### Recommended fix order for the branch
+
+1. Latch the deferral gate at `begin_pass`; error on later `Switches`
+   changes.
+2. Make eager emission impossible before `Main__` (defer asterisked
+   routines or refuse deferral when one exists), or resolve the header
+   start function through the `Main__` symbol.
+3. Re-resolve `Replace` preserved-original symbols at end of pass.
+4. Add the two `llvm_stub.c` stubs; add a `WITH_LLVM=0` link to the test
+   checklist.
+5. Snapshot callee modules before their own lowering; dispose retained
+   modules when inlining is off (fixes the RSS regression together).
+6. Fix the secondary defects (AUTOGEN collision guard + comment, silent
+   second `find_the_actions`, dead Z branch, attribute fixup).
+7. Then, and only then, build the profitability gate and re-tune.
+
+Regression fixtures for 1-3 belong in the suite (asterisked routine,
+two-symbol `Replace`, mid-source `Switches`) — they are exactly the gaps
+the corpus never covers.
+
+## Open Correctness Work
+
+- **Poison/undef/freeze needs proof.** The lowerer resolves `undef`/
+  `poison` as zero and treats `freeze` as a no-op — safe only if the
+  builder and pass pipeline never let LLVM UB/poison represent behavior
+  Glulx defines. Division and shifts have explicit guards; nothing else
+  does. Exercise shift boundaries, signed-overflow-sensitive transforms,
+  narrowed values, and selects whose unchosen arm could become poison;
+  if the invariant can't be proven for arbitrary optimized IR, reject
+  poison-dependent values instead of silently choosing zero.
+- **Opcode effect classification is correctness-critical.** The
+  pure/readonly/inaccessible-memory lists in `src/llvm_codegen.c` drive
+  GVN, LICM, DCE, sinking, and global-clobber analysis; a mistaken entry
+  reorders across a VM callback or observable state change. Needs focused
+  alias, callback, fault, and RNG-order tests rather than broad
+  transcript coverage.
+
+## Open Instruction-Count Work
+
+- **Unsigned-division canonicalization**: InstCombine can rewrite `sdiv`
+  as `udiv` for provably nonnegative dividends; Glulx has no native
+  unsigned divide, so `emit_udiv_urem` expands it into several
+  dispatches. `Direct_NonnegativeDivide` pins the shape at a
+  nine-instruction ceiling; preventing the canonicalization or
+  cost-aware recovery of signed division remains desirable.
+- **LICM on zero-trip/conditional paths**: pure opaque ops are
+  `speculatable`, so an invariant op can be hoisted from a loop that
+  would have executed it zero times. Fixtures for profitable and
+  unprofitable shapes remain open.
+- **Select ordering heuristic**: `select_swapped()` assumes an immediate
+  true arm is a rare sentinel; for `ok ? 0 : error` that taxes the
+  common path. Operand representation is not branch-frequency evidence —
+  replace with structural/source-order evidence or a neutral rule.
+- **Both-edges phi copies still stub**: the one-copy-edge case is solved
+  (copy edge inlines, copy-free edge branches), but conditionals where
+  both edges need copies still pay stubs; interference-aware coalescing
+  beyond the phi-to-parameter case is the known follow-on. (Ordinary-arm
+  return-select fusion was measured and rejected: static win, dynamic
+  loss.)
+- **Fixed limits can hide coverage regressions**: symbolic stack, pending
+  fusions, connective-tree depth, edge stubs, reads, local slots all
+  fall back safely, but a limit hit surfaces as an unexplained total
+  change. Add fixtures near each practical limit asserting either
+  successful lowering or the exact bailout reason.
 
 ## Profitability Model
 
-Successfully lowered routines replace the shadow stream unconditionally:
-`llvm_lower_routine()` (`src/llvm_lower.c`) resets and rewrites the output
-buffer, and `asm.c` replays it. The
-current aggregate statistic
-records static counts but does not influence acceptance.
-
-A blanket rule rejecting output whenever its static count exceeds the classic
-count would be incorrect: additional cold-path instructions can remove work
-from a hot loop. A useful generic per-routine model should instead estimate
-cost from CFG loop structure, pathwise-safe transformations, and measured
-target instruction costs. This does not require PGO. The original captured
-stream is already available as a fallback and can be retained when the
-estimated cost increases.
-
-Until such a model exists, focused instruction-count tests are the most
-important protection. They make each intended tradeoff explicit and prevent
-LLVM version changes or lowerer refactoring from silently spending IR-level
-gains on additional VM dispatches.
+Successfully lowered routines replace the shadow stream unconditionally,
+and (on the branch) successfully lowered *inlined* forms replace the
+un-inlined form unconditionally. A blanket static-count rule would be
+wrong — cold static growth can buy hot dynamic wins — so the needed model
+estimates cost from CFG loop structure, pathwise-safe rules, and measured
+target instruction costs (no PGO). The retained shadow (and the retained
+un-inlined module) are the ready-made fallbacks when an estimate
+regresses. Until the model exists, focused instruction-count tests are
+the protection that keeps LLVM upgrades and lowerer refactors from
+silently spending IR-level gains on VM dispatches.
 
 ## Remaining Test Matrix
 
-### Harness Integrity
+Focused fixtures worth adding, beyond what
+`stories/optimization-regressions.inf` already covers (store fusion,
+comparison/select returns, boolean trees, loop phis, recurrence folding,
+four-block layout, switch ordering, global coalescing + clobber decline):
 
-- Run the real LLVM build and strict Nix test suite in Linux CI.
-- Keep one Z-machine baseline test to protect assembler changes shared with
-  the Glulx capture seam.
+- Representation/fusion: phi and slot coalescing (induction values, phi
+  chains, parallel-copy cycles needing scratch); stack fusion in valid
+  LIFO order, invalid pop order, around stack-argument calls, at the
+  pending-value limit; slot reuse liveness positive and negative cases;
+  loop edge-folding with and without a rematerialization use.
+- Control flow: return shapes (lone blocks, phis, multi-predecessor);
+  nested short-circuit with side effects proving unexecuted arms;
+  branch-tree movement across pure ops and rejection across writes;
+  cross-block single-use comparisons (record current excess, guard a
+  future implementation).
+- VM/LLVM semantics: division/modulo fault cases and constant ranges;
+  shifts 0/31/32/negative and rotate idioms (`llvm.fshl`/`fshr` with
+  counts 0, 1, 31, mask-required values); unsigned boundaries around
+  `0x7fffffff`/`0x80000000`; repeated and conditional dereferences;
+  global/RAM aliasing around stores and opaque calls; filter-I/O
+  callbacks mutating globals; faulting reads on untaken paths neither
+  hoisted nor deleted; RNG ordering with intervening RAM ops and repeated
+  `setrandom`; nested pointer selects beyond current repair depth; tail
+  calls with stack arguments (pop order, empty symbolic stack).
+- Harness: run the real LLVM build and strict Nix suite in Linux CI;
+  keep the Z-machine baseline protecting the shared assembler; an
+  LLVM-version smoke test that expected post-pass shapes still lower.
 
-### Representation and Fusion
+## Maintenance Notes
 
-- Direct global operands with and without intervening clobbers.
-- Store fusion to globals and dereferences, including self-updates.
-- Select-to-store fusion and cases where an intervening emission must prevent
-  it.
-- Stack fusion in valid LIFO order, invalid pop order, around stack-argument
-  calls, and at the pending-value limit.
-- Slot reuse where the previous tenant dies before the new definition, and a
-  negative case where it remains live.
-- Phi-to-parameter and phi-to-phi coalescing.
-- Parallel-copy cycles which require scratch slots.
-- Loop edge-folding with and without a select rematerialization use.
-
-### Control Flow
-
-- Comparison returns and select returns with constant, parameter, local, and
-  global arms.
-- Lone return blocks, return phis, and return blocks with multiple
-  predecessors.
-- Nested short-circuit `&&`, `||`, and negation, including side effects which
-  prove an unused arm is not executed.
-- Branch-tree movement across pure operations and rejection across writes.
-- Phi stubs on either branch while the other branch is the physical
-  fallthrough.
-- Cross-block single-use comparisons.
-
-### VM and LLVM Semantics
-
-- Signed division and modulo fault cases, unsigned canonicalization, and all
-  constant-lowering ranges.
-- Shift counts 0, 31, 32, negative values interpreted as unsigned, and rotate
-  idioms.
-- Repeated and conditionally executed dereferences, including invalid
-  addresses where inline assembly permits them.
-- Global/RAM aliasing around stores and opaque calls.
-- Filter-I/O callbacks which mutate globals.
-- Readonly search operations over valid and malformed structures.
-- RNG state ordering independent of RAM motion.
-- Poison-producing or poison-sensitive LLVM transformations.
-- Tail calls, ordinary calls, and Glk calls with stack arguments.
-- Nested pointer selects around global loads.
-- `jumpabs`, catch tokens, and other layout-sensitive behavior as explicit
-  expected incompatibilities rather than substring-filtered failures, per the
-  computed-code-address policy above.
-
-### Limits and Version Stability
-
-- Symbolic stack boundaries, including the spill window.
-- Maximum pending fused values and readset size.
-- Connective-tree depth.
-- Edge-stub and local-slot pressure.
-- An LLVM-version smoke test which verifies the expected post-pass shapes still
-  lower successfully.
-- Corpus-level tracking of direct, build-bailed, and lower-bailed routines is
-  in place (`LLVM: backends`, `LLVM: direct fallbacks`); keep the totals
-  pinned.
-
-## Documentation and Maintenance Notes
-
-- Corpus-scale dual compilation, behavioral comparison, and
-  dynamic-instruction reporting are in place (corpus test and default
-  benchmark attribution); code-size measurement remains open.
-- Compile-time `lookup()` scans remain quadratic in routine size. This does not
-  affect interpreted instruction count, but should be measured if larger
-  corpus testing exposes compiler-time problems.
-
-### Backend State Containers
-
-The per-routine backend state was historically kept in scattered file
-statics. Gathering it into containers is low-risk (pure regrouping is
-byte-identical) and is a prerequisite for end-of-pass deferral and
-selective inlining (see the inlining plan). Status:
-
-- **Done — IR build state (`llvm_codegen.c`).** The 13 loose statics
-  (`direct_mod`/`direct_fn`/`direct_bld`, locals, labels, symbolic stack,
-  state, reason) are now one `routine_unit` struct with a single live
-  instance (`direct_ru`). This removes the "one live LLVM module at a
-  time" assumption so a finished routine's `{mod, fn}` can be retained as
-  a single value.
-- **Done — per-routine emission record (`asm.c`).** The direct-IR
-  capture/emission state is now one `routine_emission` struct with a
-  single live instance (`cur_emit`): the lowered stream
-  (`events`/`event_count`/`events_memlist`), the capture/replay flags
-  (`capturing`, `replaying`, `shadow_store`, `direct_started`,
-  `direct_errors`, `direct_compiler_errors`), and header bookkeeping
-  (`header_ha_start`/`_end`/`_stackargs`). Bundling these is the vehicle
-  end-of-pass deferral needs to capture and replay a routine out of parse
-  order (a copy of one record rather than ten globals). **Caveat honored:**
-  the record holds only the retainable product; the parse-visible
-  single-writer flags (`execution_never_reaches_here`,
-  `sequence_point_follows`, `labeluse[]`) stay loose globals because the
-  parser reads and writes them while generating the rest of the routine.
-  Two items were deliberately left out: `llvm_shadow_instruction_count`
-  (a cross-module reported metric, extern in `header.h` / read by
-  `llvm_lower.c`), and the general assembler identity
-  (`routine_symbol`, `current_routine_name`, `routine_start_pc`), which
-  the classic and debug paths also write; Phase 1 can reference those
-  without owning them.
-- **Already factored — the lowerer (`llvm_lower.c`).** `valinfo`,
-  `blockinfo`, `readset`, `treebuf`, `edgeplan`, `emitblock`, and
-  `emitplan` already carry their state; no regrouping is warranted there.
+- Machine-readable benchmark output (JSON/TSV: compiler revision,
+  LLVM/interpreter versions, coverage counts, histogram, dynamic total,
+  story size, timings) remains open; it would make cross-commit and
+  cross-LLVM-upgrade comparisons reproducible.
+- Compile-time `lookup()` scans remain quadratic in routine size; measure
+  if larger corpora expose compile-time problems.
+- Code-size measurement across the corpus remains open (newly relevant:
+  inlining trades size for dispatches).
+- Pre-existing upstream bug (present on master and this fork): a long
+  *output-file* path aborts the compiler with a fortified-libc buffer
+  overflow (the debug-file path was already fixed to use allocated
+  `realpath`; the output-filename path was not).
+- Glulxercise's `random` self-check flakes at ~1 in 59 runs (1.70%) by
+  design of the test, not the RNG: its `lobit`/`hibit` `[100..140]`
+  window is only ±2.6σ for a Binomial(240, ½) counter. On glulxe builds
+  that clock-seed (`@setrandom 0` → `time(NULL)`), failure is a pure
+  function of the epoch second, so specific seconds reproduce it
+  deterministically. Full analysis and an exact simulator:
+  `glulxercise-random-flake-report.md` / `glulxercise-random-sim.c`.
+  Re-run before suspecting a compiler regression; CI that runs
+  glulxercise should tolerate or pin-seed this test.
 
 ## Recommended Order of Work
 
-1. Resolved as policy: computed code addresses (including cross-routine
-   `jumpabs` targets) are documented as unsupported under optimization; see
-   the correctness finding above. No story-wide mechanism is planned.
-2. Resolved during Phase 4/4.1: phi-stub fallthrough is avoided when one
-   edge is copy-free, unsigned-division canonicalization is ceiling-guarded
-   by `Direct_NonnegativeDivide`, and ordinary-arm return fusion was
-   measured and rejected. Zero-trip/conditional LICM fixtures remain open.
+1. Fix the branch's blocking defects and secondary defects (order above)
+   with regression fixtures; land deferred lowering byte-identical.
+2. Build the inlining profitability gate; only then tune caps, land
+   `Z__Region`-class inlining, and pin new baselines.
 3. Put the real LLVM build and strict optimization suite in Linux CI.
-4. Measure per-opcode and important operand-mode costs, then validate a
-   weighted model against repeated whole-program timings.
-5. Per-routine dynamic attribution now runs by default in the benchmarks;
-   use it to rank any future opcode-mix differences before changing the
-   lowerer.
-6. Develop a generic CFG profitability estimate based on loop structure and
-   measured target costs before making routine replacement conditional on cost.
+4. Measure per-opcode/operand-mode costs; validate a weighted dynamic
+   cost model against repeated timings.
+5. Develop the generic CFG profitability estimate and make both routine
+   replacement and inline acceptance conditional on it.
+6. Work the open correctness items (poison proof, effect-classification
+   tests) and the remaining test matrix opportunistically alongside.
