@@ -1395,6 +1395,9 @@ typedef struct operator_s
                                     by the user */
 #define STAR_SFLAG    16384  /* function defined with "*" or property named
                                 "foo_to" */
+#define AUTOGEN_SFLAG 32768  /* compiler-synthesized symbol, e.g. one minted
+                                for an anonymous embedded routine so its
+                                address can be deferred through SYMBOL_MV */
 
 /* ------------------------------------------------------------------------- */
 /*   Symbol type definitions                                                 */
