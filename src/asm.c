@@ -2619,18 +2619,11 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         }
     }
 
-    /* Stack-argument (type C0) routines are classic by policy, not by
-       gap. Dynamic attribution on the cloak walkthrough put the whole C0
-       set at 8.35% of self-ops, 96% of it in CA__Pr alone, whose
-       inline-assembly-heavy veneer siblings gained between nothing
-       (CP__Tab, RT__ChLDB) and 8% (Z__Region) from direct IR: a
-       projected saving under half a percent of total dispatches, and
-       zero on Life. That does not pay for modeling varargs entry state
-       (arguments left on the VM stack, _vararg_count popped by the
-       header). Revisit only with new attribution evidence; the tests
-       pin "stack-argument routine" as the only permitted classic-policy
-       reason. Captured (deferred) stack-argument routines were noted
-       above; this covers the eager uncaptured case. */
+    /* Stack-argument (type C0) routines are classic by policy: direct
+       generation does not model varargs entry state (arguments left on
+       the VM stack, _vararg_count popped by the header). Captured
+       (deferred) stack-argument routines were noted above; this covers
+       the eager uncaptured case. */
     if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
         && !deferred_lowering_active()
         && !debugfile_switch && !routine_asterisked && !define_INFIX_switch

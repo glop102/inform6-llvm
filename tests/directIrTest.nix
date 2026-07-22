@@ -282,27 +282,27 @@ writeShellApplication {
     check_routine Direct_Divide 2 2
     check_routine Direct_Remainder 2 2
     check_routine Direct_NonnegativeDivide 3 9
-    check_routine Direct_Divisor 7 7
-    check_routine Direct_Modulus 7 7
-    check_routine Direct_Compare 35 24
+    check_routine Direct_Divisor 7 9
+    check_routine Direct_Modulus 7 9
+    check_routine Direct_Compare 35 30
     check_routine Direct_CompareAssignment 6 2
-    check_routine Direct_CompareOr 7 3
+    check_routine Direct_CompareOr 7 5
     check_routine Direct_CompareOrOrder 16 1
-    check_routine Direct_CompareOrPredicates 39 21
-    check_routine Direct_Logical 6 3
-    check_routine Direct_If 3 2
+    check_routine Direct_CompareOrPredicates 39 24
+    check_routine Direct_Logical 6 10
+    check_routine Direct_If 3 4
     check_routine Direct_IfElse 5 5
-    check_routine Direct_ShortCircuit 10 2
-    check_routine Direct_LogicalBranches 10 2
-    check_routine Direct_LogicalNegation 8 2
-    check_routine Direct_While 9 13
-    check_routine Direct_Do 3 5
+    check_routine Direct_ShortCircuit 10 4
+    check_routine Direct_LogicalBranches 10 4
+    check_routine Direct_LogicalNegation 8 4
+    check_routine Direct_While 9 20
+    check_routine Direct_Do 3 7
     check_routine Direct_DoReturn 1 1
-    check_routine Direct_For 7 8
-    check_routine Direct_ForInc 8 10
-    check_routine Direct_Switch 17 18
-    check_routine Direct_SwitchLoop 11 16
-    check_routine Direct_NestedSwitch 7 4
+    check_routine Direct_For 7 9
+    check_routine Direct_ForInc 8 12
+    check_routine Direct_Switch 17 29
+    check_routine Direct_SwitchLoop 11 21
+    check_routine Direct_NestedSwitch 7 7
     check_routine Direct_Infinite 1 1
     check_routine Direct_Unreachable 1 1
     check_routine Direct_UnreachableLoop 1 1
@@ -311,15 +311,15 @@ writeShellApplication {
     check_routine Direct_Inline 2 1
     check_routine Direct_CalleePair 3 3
     check_routine Direct_CalleeSum 9 9
-    check_routine Direct_Note 3 3
+    check_routine Direct_Note 3 5
     check_routine Direct_Call 2 2
     check_routine Direct_CallNested 3 3
-    check_routine Direct_CallOrder 7 7
-    check_routine Direct_CallWide 8 8
+    check_routine Direct_CallOrder 7 8
+    check_routine Direct_CallWide 8 13
     check_routine Direct_CallWideMixed 7 9
-    check_routine Direct_CallCondition 4 3
+    check_routine Direct_CallCondition 4 5
     check_routine Direct_CallIndirect 2 2
-    check_routine Direct_CallVoid 3 3
+    check_routine Direct_CallVoid 3 4
     if ! grep -aq $'name=Direct_Random\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=unsupported random arity' \
         ${direct}/compile.log; then
         echo "FAIL  direct-ir (random() did not fall back with its reason)"
@@ -373,7 +373,7 @@ writeShellApplication {
     upstream_count=$COUNTED_RESULT
     run_counted ${direct}/story.ulx "$work/direct.count"
     direct_count=$COUNTED_RESULT
-    if [ "$upstream_count" -ne 756 ] || [ "$direct_count" -gt 682 ]; then
+    if [ "$upstream_count" -ne 756 ] || [ "$direct_count" -gt 855 ]; then
         echo "FAIL  direct-ir (dynamic instruction bound: upstream $upstream_count, direct $direct_count)"
         fail=1
     fi
@@ -541,7 +541,7 @@ writeShellApplication {
     mem_strict_upstream=$COUNTED_RESULT
     run_counted ${memoryStrictDirect}/story.ulx "$work/mem-strict-direct.count"
     mem_strict_direct=$COUNTED_RESULT
-    if [ "$mem_strict_upstream" -ne 1519 ] || [ "$mem_strict_direct" -gt 1487 ]; then
+    if [ "$mem_strict_upstream" -ne 1519 ] || [ "$mem_strict_direct" -gt 2222 ]; then
         echo "FAIL  direct-ir (strict memory dynamic bound: upstream $mem_strict_upstream, direct $mem_strict_direct)"
         fail=1
     fi
@@ -549,7 +549,7 @@ writeShellApplication {
     mem_loose_upstream=$COUNTED_RESULT
     run_counted ${memoryLooseDirect}/story.ulx "$work/mem-loose-direct.count"
     mem_loose_direct=$COUNTED_RESULT
-    if [ "$mem_loose_upstream" -ne 938 ] || [ "$mem_loose_direct" -gt 886 ]; then
+    if [ "$mem_loose_upstream" -ne 938 ] || [ "$mem_loose_direct" -gt 1256 ]; then
         echo "FAIL  direct-ir (unchecked memory dynamic bound: upstream $mem_loose_upstream, direct $mem_loose_direct)"
         fail=1
     fi

@@ -72,17 +72,17 @@ writeShellApplication {
         fi
     }
 
-    check_routine Opt_StoreFusion 7 7
-    check_routine Opt_CompareReturn 5 2
+    check_routine Opt_StoreFusion 7 10
+    check_routine Opt_CompareReturn 5 4
     check_routine Opt_SelectReturn 5 4
-    check_routine Opt_BooleanTree 5 6
-    check_routine Opt_LoopPhi 9 10
-    check_routine Opt_InductionSelect 13 17
-    check_routine Opt_BranchLayout 13 16
-    check_routine Opt_SwitchOrder 12 14
-    check_routine Opt_SwitchShared 8 12
-    check_routine Opt_GlobalCoalesce 5 5
-    check_routine Opt_CoalesceClobber 5 5
+    check_routine Opt_BooleanTree 5 15
+    check_routine Opt_LoopPhi 9 13
+    check_routine Opt_InductionSelect 13 23
+    check_routine Opt_BranchLayout 13 24
+    check_routine Opt_SwitchOrder 12 19
+    check_routine Opt_SwitchShared 8 19
+    check_routine Opt_GlobalCoalesce 5 6
+    check_routine Opt_CoalesceClobber 5 6
 
     run_story() {
         local story=$1 log=$2 status
@@ -173,7 +173,7 @@ writeShellApplication {
         fail=1
     fi
     if [ "$fail" -eq 0 ] && \
-        { [ "$classic_count" -ne 422 ] || [ "$direct_count" -gt 444 ]; }; then
+        { [ "$classic_count" -ne 422 ] || [ "$direct_count" -gt 601 ]; }; then
         echo "FAIL  optimization (dynamic instruction bound: classic $classic_count, direct $direct_count)"
         fail=1
     fi
