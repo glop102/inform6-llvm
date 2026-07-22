@@ -23,7 +23,7 @@ writeShellApplication {
     work=$(mktemp -d "''${TMPDIR:-/tmp}/inform6-life.XXXXXX")
     trap 'rm -rf "$work"' EXIT HUP INT TERM
 
-    coverage_re='^LLVM: backends direct=([0-9]+) classic=([0-9]+) fallback=([0-9]+)$'
+    coverage_re='^LLVM: backends direct=([0-9]+) fallback=([0-9]+)$'
     coverage_line=$(grep -aE "$coverage_re" ${directBuild}/compile.log || true)
     if [ "$(grep -acE "$coverage_re" ${directBuild}/compile.log)" -ne 1 ] || \
        [[ ! $coverage_line =~ $coverage_re ]]; then
@@ -31,8 +31,7 @@ writeShellApplication {
         exit 1
     fi
     direct_routines=''${BASH_REMATCH[1]}
-    classic_routines=''${BASH_REMATCH[2]}
-    fallback_routines=''${BASH_REMATCH[3]}
+    fallback_routines=''${BASH_REMATCH[2]}
     direct_names=$(awk -F '\t' '
         $3 == "backend=direct" {
             sub(/^name=/, "", $2)
@@ -111,7 +110,7 @@ writeShellApplication {
     echo "ok    life"
     echo "      classic: $(timing_summary classic_times)"
     echo "      direct:  $(timing_summary direct_times)"
-    echo "      coverage: direct $direct_routines, classic $classic_routines, fallback $fallback_routines"
+    echo "      coverage: direct $direct_routines, fallback $fallback_routines"
     echo "      direct routines: ''${direct_names:--}"
 
     histogram=0

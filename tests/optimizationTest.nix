@@ -48,7 +48,7 @@ writeShellApplication {
         echo "FAIL  optimization (backend-origin records do not cover direct routines)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=15 classic=0 fallback=0$' \
+    if [ "$(grep -ac '^LLVM: backends direct=15 fallback=0$' \
         ${compileLog})" -ne 1 ]; then
         echo "FAIL  optimization (aggregate backend totals are incorrect)"
         fail=1

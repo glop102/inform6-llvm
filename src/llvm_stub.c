@@ -16,7 +16,6 @@
 static int any_routine_captured;
 
 extern int llvm_codegen_available(void) { return FALSE; }
-extern void llvm_note_classic_routine(const char *reason) { (void)reason; }
 
 extern void llvm_direct_routine_begin(const char *name, int local_count,
     int embedded_flag, int stack_arguments)

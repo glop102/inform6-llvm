@@ -62,18 +62,21 @@ Measurement caveats that remain true:
   It lowers routine-locally as an opaque non-returning operation and
   the compiler warns. `tests/complianceTest.nix` pins the accepted
   glulxercise failure set exactly.
-- **C0 stack-argument routines stay classic**: direct generation does
-  not model varargs entry state. Enforced as a closed set: every
-  `backend=classic` record must carry `reason=stack-argument routine`.
+- **Classic-by-policy no longer exists**: every Glulx routine builds
+  direct IR. C0 stack-argument routines run in real-stack mode (every
+  `sp` operand is an ordered opaque `i6.stkpush`/`i6.stkpop`, explicit
+  stack opcodes and computed-count calls emit verbatim), and the
+  asterisk-trace preamble feeds the IR builder alongside the classic
+  stream. The tests assert zero `backend=classic` records.
 - **Shadow retention is permanent architecture.** The parser is
   streaming — a routine cannot be re-parsed — so the classic stream
   captured at parse time is the only way to emit a routine the
-  pipeline rejects (catch/throw, explicit stack manipulation, custom
-  opcodes, multi-arg `random()`).
-- **Classic generation stays.** It backs the fallback, the C0 policy,
-  debug/trace/INFIX builds, and `$LLVM=0` bisection. The single-writer
-  rule: direct hooks read parser state, classic generation is the sole
-  writer (see EXPLAIN.md).
+  pipeline rejects (catch/throw, stack manipulation against the
+  symbolic stack, custom opcodes, multi-arg `random()`).
+- **Classic generation stays.** It backs the fallback, debug/INFIX
+  builds, and `$LLVM=0` bisection. The single-writer rule: direct
+  hooks read parser state, classic generation is the sole writer (see
+  EXPLAIN.md).
 - **Debug-file (`-k`) builds bypass the LLVM pipeline entirely**;
   Z-code is untouched by all of this.
 - Deferred emission means every parse-time consumer of a routine

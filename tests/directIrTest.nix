@@ -227,7 +227,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (quiet direct mode emitted per-routine diagnostics)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=70 classic=0 fallback=4$' \
+    if [ "$(grep -ac '^LLVM: backends direct=70 fallback=4$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (aggregate backend totals are incorrect)"
         fail=1
@@ -240,7 +240,7 @@ writeShellApplication {
 
     # Phase 5: a plain compile (no $LLVM setting) selects the direct
     # backend and produces the same bytes as an explicit $LLVM=4 compile.
-    if [ "$(grep -ac '^LLVM: backends direct=70 classic=0 fallback=4$' \
+    if [ "$(grep -ac '^LLVM: backends direct=70 fallback=4$' \
         ${defaultMode}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (default mode did not select the direct backend)"
         fail=1
@@ -255,7 +255,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (no-shadow output differs from shadowed direct build)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=67 classic=3 fallback=0$' \
+    if [ "$(grep -ac '^LLVM: backends direct=70 fallback=0$' \
         ${noShadow}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (no-shadow backend totals are incorrect)"
         fail=1
@@ -489,7 +489,7 @@ writeShellApplication {
         echo "FAIL  direct-ir (strict memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=67 classic=3 fallback=0$' \
+    if [ "$(grep -ac '^LLVM: backends direct=70 fallback=0$' \
         ${memoryStrictDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (strict memory backend totals are incorrect)"
         fail=1
@@ -498,17 +498,16 @@ writeShellApplication {
         echo "FAIL  direct-ir (strict memory fallback stage totals are incorrect)"
         fail=1
     fi
-    # Classic-by-policy is a closed set: stack-argument routines only.
-    if grep -a $'backend=classic\t' ${memoryStrictDirect}/compile.log \
-        | grep -aqv 'reason=stack-argument routine$'; then
-        echo "FAIL  direct-ir (strict memory policy-classic set gained a new reason)"
+    # Classic-by-policy no longer exists: every routine builds direct IR.
+    if grep -aq $'backend=classic\t' ${memoryStrictDirect}/compile.log; then
+        echo "FAIL  direct-ir (strict memory has a classic-by-policy routine)"
         fail=1
     fi
     if [ "$(grep -acE "$mem_re" ${memoryLooseDirect}/compile.log)" -ne 34 ]; then
         echo "FAIL  direct-ir (unchecked memory routines did not all use direct IR)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=57 classic=3 fallback=0$' \
+    if [ "$(grep -ac '^LLVM: backends direct=60 fallback=0$' \
         ${memoryLooseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (unchecked memory backend totals are incorrect)"
         fail=1
@@ -541,7 +540,7 @@ writeShellApplication {
     mem_strict_upstream=$COUNTED_RESULT
     run_counted ${memoryStrictDirect}/story.ulx "$work/mem-strict-direct.count"
     mem_strict_direct=$COUNTED_RESULT
-    if [ "$mem_strict_upstream" -ne 1519 ] || [ "$mem_strict_direct" -gt 2222 ]; then
+    if [ "$mem_strict_upstream" -ne 1519 ] || [ "$mem_strict_direct" -gt 2231 ]; then
         echo "FAIL  direct-ir (strict memory dynamic bound: upstream $mem_strict_upstream, direct $mem_strict_direct)"
         fail=1
     fi
@@ -549,7 +548,7 @@ writeShellApplication {
     mem_loose_upstream=$COUNTED_RESULT
     run_counted ${memoryLooseDirect}/story.ulx "$work/mem-loose-direct.count"
     mem_loose_direct=$COUNTED_RESULT
-    if [ "$mem_loose_upstream" -ne 938 ] || [ "$mem_loose_direct" -gt 1256 ]; then
+    if [ "$mem_loose_upstream" -ne 938 ] || [ "$mem_loose_direct" -gt 1265 ]; then
         echo "FAIL  direct-ir (unchecked memory dynamic bound: upstream $mem_loose_upstream, direct $mem_loose_direct)"
         fail=1
     fi

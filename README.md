@@ -59,9 +59,9 @@ classic generation; any nonzero value selects direct IR. Set
 `I6_LLVM_DIAGNOSTICS=1` for per-routine backend records and IR dumps.
 `I6_LLVM_SHADOW=0` disables retention of the classic fallback stream (a
 diagnostic that proves parsing is independent of it; a routine that then
-falls back is a compile error). Debug-file builds, asterisk-traced
-routines, Infix builds, and Glulx C0 stack-argument routines compile
-classically.
+falls back is a compile error). Debug-file builds and Infix builds
+compile classically; every other Glulx routine — including
+asterisk-traced and C0 stack-argument routines — builds direct IR.
 
 ## Architecture
 

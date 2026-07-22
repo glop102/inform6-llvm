@@ -35,7 +35,6 @@ static LLVMModuleRef  llmod;        /* the one module holding every routine  */
 static FILE *dump_file;             /* diagnostics dump, opened lazily       */
 
 static int no_routines_direct;
-static int no_routines_classic;
 static int no_routines_direct_fallback;
 static int no_routines_direct_build_failed;  /* rejected before lowering     */
 static int no_routines_direct_lower_failed;  /* built IR the lowerer refused */
@@ -65,7 +64,15 @@ enum direct_state_e {
    wherever control flow diverges or joins the pending values are
    spilled to the real VM stack (real pushes at the same source point
    classic pushed); sp reads past the symbolic window then pop the real
-   stack, exactly as classic's would. */
+   stack, exactly as classic's would.
+
+   Stack-argument (Glulx C0) routines instead run in real-stack mode:
+   their VM stack holds a dynamic number of caller arguments at entry,
+   which no compile-time model can count, so every sp operand becomes a
+   real, ordered i6.stkpush/i6.stkpop and the explicit stack opcodes
+   (@stkcopy and friends, calls with computed argument counts) emit
+   verbatim. The opaque stack operations carry full side effects, so
+   optimization preserves their order exactly as classic executed it. */
 #define DIRECT_SYMSTACK_MAX 64
 
 /* All per-routine IR-build state, gathered into one container. Exactly
@@ -85,6 +92,7 @@ typedef struct routine_unit_s {
     LLVMValueRef   symstack[DIRECT_SYMSTACK_MAX];
     int            symstack_depth;
     int            spilled;      /* values our code left on the real stack */
+    int            stack_entry;  /* C0 routine: sp operands are real ops    */
     int            routine_symbol;
 } routine_unit;
 
@@ -96,6 +104,8 @@ static LLVMValueRef direct_opaque_call_ex(const char *name,
 
 static LLVMValueRef direct_sympop(void)
 {
+    if (direct_ru.stack_entry)
+        return direct_opaque_call_ex("i6.stkpop", NULL, 0, FALSE);
     if (direct_ru.symstack_depth > 0)
         return direct_ru.symstack[--direct_ru.symstack_depth];
     if (direct_ru.spilled > 0) {
@@ -108,6 +118,10 @@ static LLVMValueRef direct_sympop(void)
 
 static void direct_sympush(LLVMValueRef v)
 {
+    if (direct_ru.stack_entry) {
+        (void)direct_opaque_call_ex("i6.stkpush", &v, 1, TRUE);
+        return;
+    }
     if (direct_ru.symstack_depth >= DIRECT_SYMSTACK_MAX) {
         llvm_direct_reject("symbolic stack overflow");
         return;
@@ -440,20 +454,6 @@ extern int llvm_codegen_available(void)
     return TRUE;
 }
 
-extern void llvm_note_classic_routine(const char *reason)
-{
-    const char *p = reason ? reason : "policy";
-    no_routines_classic++;
-    if (!llvm_diagnostics_enabled())
-        return;
-    printf("LLVM-BACKEND\tname=%s\tbackend=classic\tstage=policy"
-           "\tinput=-1\temitted=-1\treason=",
-        llvm_current_routine_name());
-    for (; *p; p++)
-        putchar((*p == '\t' || *p == '\n' || *p == '\r') ? ' ' : *p);
-    putchar('\n');
-}
-
 /* Discard the routine being built (or just lowered): its function is
    deleted from the shared module. Routines never reference each other's
    functions directly (calls are opaque i6.callf* operations), so a
@@ -494,14 +494,14 @@ extern void llvm_direct_routine_begin(const char *name, int local_count,
     direct_ru.suspended = 0;
     direct_ru.symstack_depth = 0;
     direct_ru.spilled = 0;
+    /* Stack-argument (C0) routines: the header pops the caller's count
+       into _vararg_count (local 1, so param 0 models it like any other
+       initial local value) and the arguments stay on the VM stack, so
+       sp operands run in real-stack mode; see the symbolic-stack note. */
+    direct_ru.stack_entry = stack_arguments;
     llvm_direct_expression_reset();
     if (!LLVM_CODEGEN)
         return;
-    if (stack_arguments) {
-        direct_ru.state = DIRECT_REJECTED;
-        direct_ru.reason = "stack-argument routine";
-        return;
-    }
 
     if (!llctx) {
         llctx = LLVMContextCreate();
@@ -1495,11 +1495,18 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
     case tailcall_gc:
         {   /* (addr, count[, store]): count operands are popped from
                the stack at runtime; peel them off the symbolic stack
-               and pass them explicitly. */
+               and pass them explicitly. In real-stack mode the
+               arguments already sit on the real stack (sp pushes were
+               real), so any count -- constant or computed -- emits
+               verbatim and the opcode consumes them at runtime. */
             LLVMValueRef extra[DIRECT_SYMSTACK_MAX];
             const assembly_operand *cntop = &ai->operand[1];
             int32 cnt;
             int i;
+            if (direct_ru.stack_entry) {
+                direct_asm_opaque(ai, flags, NULL, 0);
+                return;
+            }
             if (!direct_asm_constant(cntop, &cnt)) {
                 llvm_direct_reject("call with non-constant argument count");
                 return;
@@ -1520,6 +1527,13 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
     case stkswap_gc:
     case stkroll_gc:
     case stkcopy_gc:
+        /* Meaningful only against the real stack; in real-stack mode
+           that is exactly the current state, so they emit verbatim.
+           Against the symbolic stack their effects are untrackable. */
+        if (direct_ru.stack_entry) {
+            direct_asm_opaque(ai, flags, NULL, 0);
+            return;
+        }
         llvm_direct_reject("explicit stack-manipulation opcode");
         return;
 
@@ -1792,11 +1806,9 @@ extern void llvm_codegen_free(void)
     free(retained_units);
     retained_units = NULL;
     retained_unit_count = retained_unit_cap = 0;
-    if (no_routines_direct || no_routines_classic
-        || no_routines_direct_fallback) {
-        printf("LLVM: backends direct=%d classic=%d fallback=%d\n",
-            no_routines_direct, no_routines_classic,
-            no_routines_direct_fallback);
+    if (no_routines_direct || no_routines_direct_fallback) {
+        printf("LLVM: backends direct=%d fallback=%d\n",
+            no_routines_direct, no_routines_direct_fallback);
     }
     if (no_routines_direct_build_failed || no_routines_direct_lower_failed) {
         printf("LLVM: direct fallbacks build=%d lower=%d\n",
@@ -1804,7 +1816,6 @@ extern void llvm_codegen_free(void)
             no_routines_direct_lower_failed);
     }
     no_routines_direct = 0;
-    no_routines_classic = 0;
     no_routines_direct_fallback = 0;
     no_routines_direct_build_failed = 0;
     no_routines_direct_lower_failed = 0;

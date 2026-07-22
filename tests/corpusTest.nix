@@ -3,8 +3,8 @@
 
 # Phase 4 corpus and compilation-mode gates: full-library and compliance
 # stories compile through direct IR at exactly asserted coverage, and the
-# modes that bypass LLVM capture (debug files, asterisk-traced routines)
-# stay classical with focused proof.
+# one mode that bypasses LLVM capture (debug files) stays classical with
+# focused proof.
 
 let
   cloakArgs = "+include_path=${inform6lib} +language_name=english";
@@ -69,7 +69,7 @@ writeShellApplication {
 
     # Full library game: coverage is asserted exactly so a routine that
     # silently stops (or starts) building directly is visible.
-    if [ "$(grep -ac '^LLVM: backends direct=416 classic=132 fallback=0$' \
+    if [ "$(grep -ac '^LLVM: backends direct=548 fallback=0$' \
         ${cloakDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  corpus (cloak direct coverage changed)"
         grep -a '^LLVM: backends' ${cloakDirect}/compile.log || true
@@ -80,11 +80,10 @@ writeShellApplication {
         grep -a '^LLVM: direct fallbacks' ${cloakDirect}/compile.log || true
         fail=1
     fi
-    # The classic bucket is a closed policy set: stack-argument routines
-    # only. Any other reason here is a new construct silently opting out.
-    if grep -a $'backend=classic\t' ${cloakDirect}/compile.log \
-        | grep -aqv 'reason=stack-argument routine$'; then
-        echo "FAIL  corpus (cloak policy-classic set gained a new reason)"
+    # Classic-by-policy no longer exists: any classic record here is a
+    # construct silently opting out of direct IR.
+    if grep -aq $'backend=classic\t' ${cloakDirect}/compile.log; then
+        echo "FAIL  corpus (cloak has a classic-by-policy routine)"
         fail=1
     fi
     if ! cmp -s ${cloakNoShadow} ${cloakDirect}/story.ulx; then
@@ -123,7 +122,7 @@ writeShellApplication {
     cloak_up=$COUNTED_RESULT
     run_counted ${cloakDirect}/story.ulx ${./cloak.walk} "$work/cloak-d.count"
     cloak_d=$COUNTED_RESULT
-    if [ "$cloak_up" -ne 164995 ] || [ "$cloak_d" -gt 250874 ]; then
+    if [ "$cloak_up" -ne 164995 ] || [ "$cloak_d" -gt 256197 ]; then
         echo "FAIL  corpus (cloak dynamic bound: upstream $cloak_up, direct $cloak_d)"
         fail=1
     fi
@@ -132,7 +131,7 @@ writeShellApplication {
     # documented jumpabs case plus the catch-token sub-checks, which
     # hardcode classic frame sizes (see complianceTest.nix). Pin the
     # coverage and the failure set exactly.
-    if [ "$(grep -ac '^LLVM: backends direct=135 classic=18 fallback=79$' \
+    if [ "$(grep -ac '^LLVM: backends direct=153 fallback=79$' \
         ${glulxerciseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  corpus (glulxercise direct coverage changed)"
         grep -a '^LLVM: backends' ${glulxerciseDirect}/compile.log || true
@@ -144,9 +143,8 @@ writeShellApplication {
         grep -a '^LLVM: direct fallbacks' ${glulxerciseDirect}/compile.log || true
         fail=1
     fi
-    if grep -a $'backend=classic\t' ${glulxerciseDirect}/compile.log \
-        | grep -aqv 'reason=stack-argument routine$'; then
-        echo "FAIL  corpus (glulxercise policy-classic set gained a new reason)"
+    if grep -aq $'backend=classic\t' ${glulxerciseDirect}/compile.log; then
+        echo "FAIL  corpus (glulxercise has a classic-by-policy routine)"
         fail=1
     fi
     timeout 60 glulxe ${glulxerciseDirect}/story.ulx < ${./glulxercise.walk} \
@@ -181,10 +179,11 @@ writeShellApplication {
         fail=1
     fi
 
-    # Asterisk-traced routines compile classically while their neighbors
-    # stay direct; the trace output matches upstream.
-    if grep -aq $'name=Traced\t' ${tracedDirect}/compile.log; then
-        echo "FAIL  corpus (asterisked routine entered the LLVM pipeline)"
+    # Asterisk-traced routines build direct IR like their neighbors (the
+    # trace preamble feeds the builder); the trace output matches upstream.
+    if ! grep -aq $'name=Traced\tbackend=direct\tstage=lower' \
+        ${tracedDirect}/compile.log; then
+        echo "FAIL  corpus (asterisked routine did not build direct IR)"
         fail=1
     fi
     if ! grep -aq $'name=Plain\tbackend=direct\tstage=lower' \

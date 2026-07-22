@@ -2359,6 +2359,35 @@ extern void emit_deferred_routines(void)
     first_label = -1; last_label = -1; labeluse_size = 0;
 }
 
+/* Assemble one asterisk-trace preamble instruction through both code
+   generators, exactly as parsed inline assembly does: the direct IR
+   builder must see every instruction of the routine or it would emit a
+   routine missing its preamble. Branch targets arrive as the label
+   number in a BRANCH_MV constant operand, matching the parse path. */
+static void assembleg_traced(int internal_number, int count,
+    assembly_operand a1, assembly_operand a2, assembly_operand a3)
+{
+    assembly_instruction AI;
+    AI.internal_number = internal_number;
+    AI.operand_count = count;
+    AI.operand[0] = a1;
+    AI.operand[1] = a2;
+    AI.operand[2] = a3;
+    AI.text = NULL;
+    llvm_direct_glulx_assembly(&AI);
+    assembleg_instruction(&AI);
+}
+
+static assembly_operand branch_operand(int label)
+{
+    assembly_operand AO;
+    INITAO(&AO);
+    AO.type = CONSTANT_OT;
+    AO.value = label;
+    AO.marker = BRANCH_MV;
+    return AO;
+}
+
 /* The local variables must already be set up; no_locals indicates
    how many exist. */
 extern int32 assemble_routine_header(int routine_asterisked, char *name,
@@ -2504,24 +2533,20 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
         labeluse_size = 0;
 
         /* Begin capturing this routine's code for the LLVM pipeline.
-           This sits above the asterisk-trace preamble so that under
-           deferred lowering the preamble -- ordinary runtime code -- is
-           part of the captured stream: a traced routine then defers like
-           any other classic-captured routine (it just builds no direct
-           IR). In eager mode traced routines stay uncaptured classic, as
-           do stack-argument routines. Debug builds are excluded:
-           sequence points don't survive reordering. */
+           This sits above the asterisk-trace preamble so that the
+           preamble -- ordinary runtime code -- is part of the captured
+           stream and of the direct IR (the preamble emitter feeds both).
+           Stack-argument routines build direct IR in real-stack mode.
+           Debug builds are excluded: sequence points don't survive
+           reordering. */
         if (LLVM_CODEGEN && llvm_codegen_available()
-            && !debugfile_switch && !define_INFIX_switch
-            && (deferred_lowering_active()
-                || (!routine_asterisked && !stackargs))) {
+            && !debugfile_switch && !define_INFIX_switch) {
             cur_emit.capturing = TRUE;
             cur_emit.shadow_store = llvm_shadow_enabled();
             cur_emit.event_count = 0;
             llvm_shadow_instruction_count = 0;
             cur_emit.header_ha_end = zcode_ha_size;
-            if (!stackargs && !routine_asterisked
-                && no_errors == 0 && no_compiler_errors == 0) {
+            if (no_errors == 0 && no_compiler_errors == 0) {
                 llvm_direct_routine_begin(current_routine_name.data,
                     no_locals, embedded_flag, stackargs);
                 cur_emit.direct_started = TRUE;
@@ -2529,15 +2554,12 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
                 cur_emit.direct_compiler_errors = no_compiler_errors;
             }
             else {
-                /* No direct IR will be built (a stack-argument or
-                   asterisk-traced classic-policy routine): under deferred
-                   lowering the captured stream is this routine's only
+                /* No direct IR will be built (the source already has
+                   errors): the captured stream is this routine's only
                    output -- not a fallback -- so it must be retained even
                    when the fallback shadow is disabled (I6_LLVM_SHADOW=0). */
                 cur_emit.shadow_store = TRUE;
             }
-            if (stackargs && !routine_asterisked)
-                llvm_note_classic_routine("stack-argument routine");
         }
 
         if ((routine_asterisked) || (define_INFIX_switch)) {
@@ -2560,7 +2582,7 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
             AO.marker = STRING_MV;
             AO.type   = CONSTANT_OT;
             AO.value  = compile_string(fnt, STRCTX_INFIX);
-            assembleg_1(streamstr_gc, AO);
+            assembleg_traced(streamstr_gc, 1, AO, AO, AO);
 
             if (!stackargs) {
                 for (ix=1; ix<=no_locals; ix++) {
@@ -2568,11 +2590,11 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
                     AO.marker = STRING_MV;
                     AO.type   = CONSTANT_OT;
                     AO.value  = compile_string(fnt, STRCTX_INFIX);
-                    assembleg_1(streamstr_gc, AO);
+                    assembleg_traced(streamstr_gc, 1, AO, AO, AO);
                     AO.marker = 0;
                     AO.type = LOCALVAR_OT;
                     AO.value = ix;
-                    assembleg_1(streamnum_gc, AO);
+                    assembleg_traced(streamnum_gc, 1, AO, AO, AO);
                 }
             }
             else {
@@ -2581,15 +2603,15 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
                 AO.marker = STRING_MV;
                 AO.type   = CONSTANT_OT;
                 AO.value  = compile_string(fnt, STRCTX_INFIX);
-                assembleg_1(streamstr_gc, AO);
+                assembleg_traced(streamstr_gc, 1, AO, AO, AO);
                 AO.marker = 0;
                 AO.type = LOCALVAR_OT;
                 AO.value = 1;
-                assembleg_1(streamnum_gc, AO);
+                assembleg_traced(streamnum_gc, 1, AO, AO, AO);
                 AO2.type = BYTECONSTANT_OT;
                 AO2.marker = 0;
                 AO2.value = ':';
-                assembleg_1(streamchar_gc, AO2);
+                assembleg_traced(streamchar_gc, 1, AO2, AO2, AO2);
                 AO2.type = BYTECONSTANT_OT;
                 AO2.marker = 0;
                 AO2.value = ' ';
@@ -2599,36 +2621,34 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
                    @stream_num sp;
                    }
                 */
-                assembleg_store(temp_var4, zero_operand);
+                assembleg_traced(copy_gc, 2, zero_operand, temp_var4,
+                    temp_var4);
                 lntop = alloc_label();
                 lnbottom = alloc_label();
                 assemble_label_no(lntop);
-                assembleg_2_branch(jge_gc, temp_var4, AO, lnbottom); /* AO is _vararg_count */
-                assembleg_1(streamchar_gc, AO2); /* AO2 is space */
-                assembleg_2(stkpeek_gc, temp_var4, stack_pointer);
-                assembleg_1(streamnum_gc, stack_pointer);
-                assembleg_3(add_gc, temp_var4, one_operand, temp_var4);
-                assembleg_0_branch(jump_gc, lntop);
+                llvm_direct_bind_label(lntop);
+                /* AO is _vararg_count */
+                assembleg_traced(jge_gc, 3, temp_var4, AO,
+                    branch_operand(lnbottom));
+                assembleg_traced(streamchar_gc, 1, AO2, AO2, AO2);
+                assembleg_traced(stkpeek_gc, 2, temp_var4, stack_pointer,
+                    stack_pointer);
+                assembleg_traced(streamnum_gc, 1, stack_pointer,
+                    stack_pointer, stack_pointer);
+                assembleg_traced(add_gc, 3, temp_var4, one_operand,
+                    temp_var4);
+                assembleg_traced(jump_gc, 1, branch_operand(lntop),
+                    temp_var4, temp_var4);
                 assemble_label_no(lnbottom);
+                llvm_direct_bind_label(lnbottom);
             }
 
             AO.marker = STRING_MV;
             AO.type   = CONSTANT_OT;
             AO.value  = compile_string(") ]^", STRCTX_INFIX);
-            assembleg_1(streamstr_gc, AO);
+            assembleg_traced(streamstr_gc, 1, AO, AO, AO);
         }
     }
-
-    /* Stack-argument (type C0) routines are classic by policy: direct
-       generation does not model varargs entry state (arguments left on
-       the VM stack, _vararg_count popped by the header). Captured
-       (deferred) stack-argument routines were noted above; this covers
-       the eager uncaptured case. */
-    if (LLVM_CODEGEN && llvm_codegen_available() && glulx_mode
-        && !deferred_lowering_active()
-        && !debugfile_switch && !routine_asterisked && !define_INFIX_switch
-        && stackargs)
-        llvm_note_classic_routine("stack-argument routine");
 
     return rv;
 }

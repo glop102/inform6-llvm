@@ -2256,7 +2256,6 @@ extern int   glulx_opcode_flags(int32 internal_number);
 extern int   glulx_opcode_operand_count(int32 internal_number);
 extern char *llvm_current_routine_name(void);
 extern int   llvm_codegen_available(void);
-extern void  llvm_note_classic_routine(const char *reason);
 extern int   llvm_pipeline_routine(void);
 /* Deferred lowering: at routine end the finished direct IR is retained
    (returning a handle >= 0, or -1 if there is no direct IR to retain);
