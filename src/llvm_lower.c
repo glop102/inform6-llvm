@@ -216,6 +216,56 @@ static int32 const_int_value(LLVMValueRef v)
 /*   Phase A, pass 1: classify every instruction                             */
 /* ------------------------------------------------------------------------- */
 
+/* Parse a verbatim-form call name: "i6.custom.<code>.<flags>.<forms>"
+   or "i6.raw.<name>.<forms>", optionally suffixed ".br". Returns FALSE
+   if the name is not a verbatim call; lfails and returns TRUE with
+   *opnum == -2 on a malformed one. For customs *opnum is -1 and the
+   code and flags outputs carry the descriptor; for raw known opcodes
+   *opnum is the internal number and they come from the table. */
+static int parse_verbatim_name(const char *name, int32 *opnum, int32 *code,
+    int *flags, char *forms, int *is_branch)
+{
+    char work[96], *part, *save;
+    size_t len;
+    int is_custom;
+
+    *opnum = -2;
+    if (name_has_prefix(name, "i6.custom."))
+        is_custom = TRUE;
+    else if (name_has_prefix(name, "i6.raw."))
+        is_custom = FALSE;
+    else
+        return FALSE;
+    len = strlen(name);
+    if (len >= sizeof(work)) { lfail("verbatim name too long"); return TRUE; }
+    strcpy(work, name + (is_custom ? 10 : 7));
+    len = strlen(work);
+    *is_branch = FALSE;
+    if (len > 3 && strcmp(work + len - 3, ".br") == 0) {
+        *is_branch = TRUE;
+        work[len - 3] = 0;
+    }
+    part = strtok_r(work, ".", &save);
+    if (!part) { lfail("malformed verbatim call"); return TRUE; }
+    if (is_custom) {
+        *code = atoi(part);
+        part = strtok_r(NULL, ".", &save);
+        if (!part) { lfail("malformed verbatim call"); return TRUE; }
+        *flags = atoi(part);
+        *opnum = -1;
+    }
+    else {
+        *opnum = glulx_opcode_by_name(part);
+        if (*opnum < 0) { lfail("unknown verbatim opcode"); return TRUE; }
+        *code = glulx_opcode_code(*opnum);
+        *flags = glulx_opcode_flags(*opnum);
+    }
+    part = strtok_r(NULL, ".", &save);
+    if (part && strlen(part) > 8) { lfail("malformed verbatim call"); return TRUE; }
+    strcpy(forms, part ? part : "");
+    return TRUE;
+}
+
 static void classify(LLVMValueRef in, valinfo *vi)
 {
     LLVMOpcode opc = LLVMGetInstructionOpcode(in);
@@ -434,17 +484,60 @@ static void classify(LLVMValueRef in, valinfo *vi)
                     vi->kind = VK_SLOT;
                 return;
             }
+            if (strcmp(name, "i6.catchtok") == 0) {
+                /* Emitted by its paired i6.catchflag as the catch's
+                   store operand; a throw rewrites the slot in place. */
+                if (LLVMGetNumArgOperands(in) != 0)
+                    lfail("catchtok arg count");
+                if (LLVMGetFirstUse(in))
+                    vi->kind = VK_SLOT;
+                return;
+            }
+            if (strcmp(name, "i6.catchflag") == 0) {
+                if (LLVMGetNumArgOperands(in) != 1)
+                    lfail("catchflag arg count");
+                if (LLVMGetFirstUse(in))
+                    vi->kind = VK_SLOT;
+                return;
+            }
+            {   int32 vopnum, vcode;
+                int vflags, vbr;
+                char vforms[10];
+                if (parse_verbatim_name(name, &vopnum, &vcode, &vflags,
+                    vforms, &vbr)) {
+                    int expect = 0, j;
+                    if (vopnum == -2) return;  /* lfailed */
+                    for (j = 0; vforms[j]; j++)
+                        if (vforms[j] == 'v' || vforms[j] == 'g')
+                            expect++;
+                    if ((int)LLVMGetNumArgOperands(in) != expect) {
+                        lfail("verbatim call arg count mismatch");
+                        return;
+                    }
+                    if (LLVMGetFirstUse(in))
+                        vi->kind = VK_SLOT;
+                    return;
+                }
+            }
             if (name_has_prefix(name, "i6.")) {
                 /* An opaque Glulx opcode. Validate the name and shape. */
                 char base[64];
                 size_t blen = strlen(name + 3);
-                int has_stack = FALSE;
+                int has_stack = FALSE, is_branch = FALSE, is_ss2 = FALSE;
                 int32 opnum;
                 int flags, opct, n_src, nargs;
 
                 if (blen >= sizeof(base)) { lfail("opcode name too long"); return; }
                 strcpy(base, name + 3);
-                if (blen > 2 && strcmp(base + blen - 2, ".s") == 0) {
+                if (blen > 4 && strcmp(base + blen - 4, ".ss2") == 0) {
+                    is_ss2 = TRUE;
+                    base[blen - 4] = 0;
+                }
+                else if (blen > 3 && strcmp(base + blen - 3, ".br") == 0) {
+                    is_branch = TRUE;
+                    base[blen - 3] = 0;
+                }
+                else if (blen > 2 && strcmp(base + blen - 2, ".s") == 0) {
                     has_stack = TRUE;
                     base[blen - 2] = 0;
                 }
@@ -452,15 +545,26 @@ static void classify(LLVMValueRef in, valinfo *vi)
                 if (opnum < 0) { lfail("unknown opcode call"); return; }
                 flags = glulx_opcode_flags(opnum);
                 opct  = glulx_opcode_operand_count(opnum);
-                if (flags & OPFLAG_STORE2) { lfail("two-store opcode"); return; }
-                if (flags & OPFLAG_BRANCH) { lfail("branch opcode call"); return; }
-                n_src = opct - ((flags & OPFLAG_STORE) ? 1 : 0);
+                if (!is_ss2 != !(flags & OPFLAG_STORE2)) {
+                    lfail("two-store opcode");
+                    return;
+                }
+                if (!is_branch != !(flags & OPFLAG_BRANCH)) {
+                    lfail("branch opcode call");
+                    return;
+                }
+                n_src = opct - ((flags & OPFLAG_BRANCH) ? 1 : 0);
+                if (is_ss2)
+                    n_src -= 2;
+                else if (flags & OPFLAG_STORE)
+                    n_src -= 1;
                 nargs = (int)LLVMGetNumArgOperands(in);
                 if (has_stack ? (nargs < n_src) : (nargs != n_src)) {
                     lfail("opcode call arg count mismatch");
                     return;
                 }
-                if ((flags & OPFLAG_STORE) && LLVMGetFirstUse(in))
+                if (!is_ss2 && (flags & (OPFLAG_STORE | OPFLAG_BRANCH))
+                    && LLVMGetFirstUse(in))
                     vi->kind = VK_SLOT;
                 return;  /* VK_SKIP if result unused or void */
             }
@@ -490,6 +594,12 @@ static int operand_ok(LLVMValueRef v)
     if (LLVMIsAConstantInt(v)) return int_width(v) <= 32;
     if (LLVMIsUndef(v) || LLVMIsPoison(v)) return TRUE;
     if (is_sym_call(v)) return TRUE;
+    if (LLVMIsAGlobalVariable(v)) {
+        /* A verbatim-form call passing an i6 global by reference. */
+        size_t len;
+        const char *name = LLVMGetValueName2(v, &len);
+        return name && name_has_prefix(name, "i6.g");
+    }
     if (LLVMIsAArgument(v)) return param_index(v) >= 0;
     if (!LLVMIsAInstruction(v)) return FALSE;
     vi = underlying(v);
@@ -841,6 +951,8 @@ static assembly_operand resolve(LLVMValueRef v)
     }
     if (LLVMIsUndef(v) || LLVMIsPoison(v))
         return const_op(0);
+    if (LLVMIsAGlobalVariable(v))
+        return global_op(v);
     if (is_sym_call(v)) {
         int32 marker   = const_int_value(LLVMGetOperand(v, 0));
         int32 value    = const_int_value(LLVMGetOperand(v, 1));
@@ -1185,26 +1297,40 @@ static void emit_abs(LLVMValueRef in, valinfo *vi)
     gen_label(done);
 }
 
-/* Reconstruct an opaque i6.<opcode>[.s] call as the original Glulx
-   instruction, pushing any stack-passed arguments first. */
+/* Reconstruct an opaque i6.<opcode>[.s|.br] call as the original Glulx
+   instruction, pushing any stack-passed arguments first. A ".br" call
+   is a branch opcode materialized as its taken/not-taken 0/1 answer:
+   the opcode branches over the value construction. */
 static void emit_opaque_call(LLVMValueRef in, valinfo *vi, const char *name)
 {
     char base[64];
     size_t blen = strlen(name + 3);
-    int has_stack = FALSE;
+    int has_stack = FALSE, is_branch = FALSE, is_ss2 = FALSE;
     int32 opnum;
     int flags, opct, n_src, nargs, i;
     assembly_operand ops[8];
 
     strcpy(base, name + 3);
-    if (blen > 2 && strcmp(base + blen - 2, ".s") == 0) {
+    if (blen > 4 && strcmp(base + blen - 4, ".ss2") == 0) {
+        is_ss2 = TRUE;
+        base[blen - 4] = 0;
+    }
+    else if (blen > 3 && strcmp(base + blen - 3, ".br") == 0) {
+        is_branch = TRUE;
+        base[blen - 3] = 0;
+    }
+    else if (blen > 2 && strcmp(base + blen - 2, ".s") == 0) {
         has_stack = TRUE;
         base[blen - 2] = 0;
     }
     opnum = glulx_opcode_by_name(base);
     flags = glulx_opcode_flags(opnum);
     opct  = glulx_opcode_operand_count(opnum);
-    n_src = opct - ((flags & OPFLAG_STORE) ? 1 : 0);
+    n_src = opct - ((flags & OPFLAG_BRANCH) ? 1 : 0);
+    if (is_ss2)
+        n_src -= 2;
+    else if (flags & OPFLAG_STORE)
+        n_src -= 1;
     nargs = (int)LLVMGetNumArgOperands(in);
 
     /* Stack args: listed in runtime pop order (arg n_src is the top of
@@ -1215,6 +1341,29 @@ static void emit_opaque_call(LLVMValueRef in, valinfo *vi, const char *name)
 
     for (i = 0; i < n_src; i++)
         ops[i] = resolve(LLVMGetOperand(in, i));
+    if (is_ss2) {
+        /* Both stores push: first store below, second on top. */
+        ops[n_src] = stack_op();
+        ops[n_src + 1] = stack_op();
+        genop(opnum, opct, ops);
+        return;
+    }
+    if (is_branch) {
+        int taken = alloc_label();
+        ops[n_src] = branch_op(taken);
+        genop(opnum, opct, ops);
+        if (vi->kind == VK_SLOT) {
+            int done = alloc_label();
+            gen_copy(const_op(0), slot_op(vi->slot));
+            gen_jump(done);
+            gen_label(taken);
+            gen_copy(const_op(1), slot_op(vi->slot));
+            gen_label(done);
+        }
+        else
+            gen_label(taken);   /* both outcomes converge at once */
+        return;
+    }
     if (flags & OPFLAG_STORE)
         ops[n_src] = (vi->kind == VK_SLOT)
             ? slot_op(vi->slot)
@@ -1336,6 +1485,82 @@ static void emit_instruction(LLVMValueRef in)
             if (strcmp(name, "i6.stkpop") == 0) {
                 gen_copy(stack_op(), (vi->kind == VK_SLOT)
                     ? slot_op(vi->slot) : zero_operand);
+                return;
+            }
+            {   int32 vopnum, vcode;
+                int vflags, vbr;
+                char vforms[10];
+                if (parse_verbatim_name(name, &vopnum, &vcode, &vflags,
+                    vforms, &vbr)) {
+                    assembly_operand ops[9];
+                    int count, argi = 0, j;
+                    count = (int)strlen(vforms) + (vbr ? 1 : 0);
+                    for (j = 0; vforms[j]; j++) {
+                        switch (vforms[j]) {
+                        case 'v':
+                            ops[j] = resolve(LLVMGetOperand(in, argi++));
+                            break;
+                        case 'g':
+                            ops[j] = global_op(LLVMGetOperand(in, argi++));
+                            break;
+                        case 'p':
+                            ops[j] = stack_op();
+                            break;
+                        case 'r':
+                            ops[j] = (vi->kind == VK_SLOT)
+                                ? slot_op(vi->slot)
+                                : mkop(ZEROCONSTANT_OT, 0);
+                            break;
+                        }
+                    }
+                    if (vopnum == -1)
+                        glulx_set_custom_opcode(vcode, vflags, count);
+                    if (vbr) {
+                        int taken = alloc_label();
+                        ops[count - 1] = branch_op(taken);
+                        genop(vopnum, count, ops);
+                        if (vi->kind == VK_SLOT) {
+                            int done = alloc_label();
+                            gen_copy(const_op(0), slot_op(vi->slot));
+                            gen_jump(done);
+                            gen_label(taken);
+                            gen_copy(const_op(1), slot_op(vi->slot));
+                            gen_label(done);
+                        }
+                        else
+                            gen_label(taken);
+                    }
+                    else
+                        genop(vopnum, count, ops);
+                    return;
+                }
+            }
+            if (strcmp(name, "i6.catchtok") == 0)
+                return;  /* the paired i6.catchflag emits the catch */
+            if (strcmp(name, "i6.catchflag") == 0) {
+                /* catch <token slot> ?taken, then build the 0/1 taken
+                   flag; the throw-resume path falls through the catch
+                   with the token slot rewritten to the thrown value. */
+                assembly_operand ops[2];
+                valinfo *tok = underlying(LLVMGetOperand(in, 0));
+                int taken = alloc_label();
+                if (!tok || tok->kind != VK_SLOT) {
+                    lfail("catchflag without token slot");
+                    return;
+                }
+                ops[0] = slot_op(tok->slot);
+                ops[1] = branch_op(taken);
+                genop(catch_gc, 2, ops);
+                if (vi->kind == VK_SLOT) {
+                    int done = alloc_label();
+                    gen_copy(const_op(0), slot_op(vi->slot));
+                    gen_jump(done);
+                    gen_label(taken);
+                    gen_copy(const_op(1), slot_op(vi->slot));
+                    gen_label(done);
+                }
+                else
+                    gen_label(taken);
                 return;
             }
             emit_opaque_call(in, vi, name);

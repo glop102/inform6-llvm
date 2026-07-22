@@ -68,11 +68,33 @@ Measurement caveats that remain true:
   stack opcodes and computed-count calls emit verbatim), and the
   asterisk-trace preamble feeds the IR builder alongside the classic
   stream. The tests assert zero `backend=classic` records.
+- **The whole corpus builds with zero fallbacks**, including
+  glulxercise's torture tests. The opaque-call contracts that carry
+  the hard shapes through IR and back out of the lowerer:
+  `i6.<op>.br` (a branch opcode as its taken/not-taken answer, re-emitted
+  as the real branch into a 0/1 slot), `i6.<op>.ss2` (a two-store opcode
+  with both stores redirected to sp, popped into the real destinations),
+  `i6.catchtok`/`i6.catchflag` (one real `catch S ?L` whose store operand
+  is catchtok's slot, so a throw rewrites exactly the value the IR
+  reads), and `i6.custom.<code>.<flags>.<forms>` / `i6.raw.<name>.<forms>`
+  (verbatim emission with per-operand forms: value, global-by-pointer,
+  sp passthrough, result slot — for custom `@"..."` opcodes and the
+  sub-word copies). Any routine escalates to real-stack mode mid-build
+  at its first untrackable stack construct: after spilling, the real
+  stack provably matches classic's, since elided push/pop pairs were
+  net zero. Verbatim instructions spill first so no generated copy
+  lands between consecutive raw instructions (the custom jump forms
+  branch by byte offsets over exactly those instructions). Multi-arg
+  `random()` builds its constants table in the direct generator and
+  hands the address to classic generation of the same tree, so exactly
+  one table exists.
 - **Shadow retention is permanent architecture.** The parser is
   streaming — a routine cannot be re-parsed — so the classic stream
   captured at parse time is the only way to emit a routine the
-  pipeline rejects (catch/throw, stack manipulation against the
-  symbolic stack, custom opcodes, multi-arg `random()`).
+  pipeline rejects. With the corpus at zero fallbacks the remaining
+  rejects are genuinely untranslatable or unmodeled shapes (raw code
+  byte arrays, unsupported statements), and the safety valve stays for
+  whatever user code does next.
 - **Classic generation stays.** It backs the fallback, debug/INFIX
   builds, and `$LLVM=0` bisection. The single-writer rule: direct
   hooks read parser state, classic generation is the sole writer (see

@@ -38,6 +38,8 @@ extern void llvm_direct_routine_abandon(void)
 }
 
 extern void llvm_direct_reject(const char *reason) { (void)reason; }
+extern void llvm_direct_random_array_set(int32 addr) { (void)addr; }
+extern int32 llvm_direct_random_array_take(void) { return -1; }
 extern int llvm_direct_can_generate(void) { return FALSE; }
 extern void llvm_direct_suspend(void) { }
 extern void llvm_direct_resume(void) { }

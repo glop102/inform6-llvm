@@ -127,18 +127,18 @@ writeShellApplication {
         fail=1
     fi
 
-    # Glulxercise under direct IR: the out-of-contract set is the
-    # documented jumpabs case plus the catch-token sub-checks, which
-    # hardcode classic frame sizes (see complianceTest.nix). Pin the
-    # coverage and the failure set exactly.
-    if [ "$(grep -ac '^LLVM: backends direct=153 fallback=79$' \
+    # Glulxercise under direct IR: every routine, including the raw
+    # custom-opcode and catch/throw torture tests, builds direct IR.
+    # The out-of-contract set is the documented jumpabs case plus the
+    # catch-token sub-checks, which hardcode classic frame sizes (see
+    # complianceTest.nix). Pin the coverage and the failure set exactly.
+    if [ "$(grep -ac '^LLVM: backends direct=232 fallback=0$' \
         ${glulxerciseDirect}/compile.log)" -ne 1 ]; then
         echo "FAIL  corpus (glulxercise direct coverage changed)"
         grep -a '^LLVM: backends' ${glulxerciseDirect}/compile.log || true
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: direct fallbacks build=79 lower=0$' \
-        ${glulxerciseDirect}/compile.log)" -ne 1 ]; then
+    if grep -aq '^LLVM: direct fallbacks' ${glulxerciseDirect}/compile.log; then
         echo "FAIL  corpus (glulxercise fallback stage totals changed)"
         grep -a '^LLVM: direct fallbacks' ${glulxerciseDirect}/compile.log || true
         fail=1

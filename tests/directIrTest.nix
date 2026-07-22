@@ -199,11 +199,20 @@ let
   # A story whose routines genuinely fall back cannot be emitted without
   # the retained shadow stream: the compile must fail cleanly, with the
   # retention error and no output file, never a silent empty routine.
+  # Raw code bytes are the one construct that always rejects direct IR
+  # (they have no instruction-level meaning to translate).
+  noShadowFallbackSource = writeText "direct-ir-no-shadow-fallback.inf" ''
+    [ RawBytes;
+        @ -> 0;    ! a nop, emitted as a raw code byte
+        return 7;
+    ];
+    [ Main; @setiosys 2 0; print RawBytes(), "^"; ];
+  '';
   noShadowFallback = runCommand "direct-ir-no-shadow-fallback.compile.log" { } ''
     work=$(mktemp -d)
     set +e
     I6_LLVM_SHADOW=0 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/direct-ir-phase1.inf} "$work/story.ulx" >"$out" 2>&1
+      ${noShadowFallbackSource} "$work/story.ulx" >"$out" 2>&1
     status=$?
     set -e
     test "$status" -ne 0
@@ -218,8 +227,8 @@ writeShellApplication {
     trap 'rm -rf "$work"' EXIT HUP INT TERM
     fail=0
 
-    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|Logical|If|IfElse|ShortCircuit|LogicalBranches|LogicalNegation|While|Do|DoReturn|For|ForInc|Switch|SwitchLoop|NestedSwitch|Infinite|Unreachable|UnreachableLoop|SharedReturn|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap|Inline|CalleePair|CalleeSum|Note|Call|CallNested|CallOrder|CallWide|CallWideMixed|CallCondition|CallIndirect|CallVoid)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
-    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 59 ]; then
+    direct_re=$'^LLVM-BACKEND\tname=Direct_(Constant|Parameter|Assignment|Branch|Arithmetic|Bitwise|GlobalRead|GlobalWrite|Chain|AssignmentValue|Symbol|Divide|Remainder|NonnegativeDivide|Divisor|Modulus|Compare|CompareAssignment|CompareOr|CompareOrOrder|CompareOrPredicates|Logical|If|IfElse|ShortCircuit|LogicalBranches|LogicalNegation|While|Do|DoReturn|For|ForInc|Switch|SwitchLoop|NestedSwitch|Infinite|Unreachable|UnreachableLoop|SharedReturn|PreInc|PostInc|PreDec|PostDec|GlobalInc|EvalOrder|Comma|Wrap|Inline|CalleePair|CalleeSum|Note|Call|CallNested|CallOrder|CallWide|CallWideMixed|CallCondition|CallIndirect|CallVoid|Random|Catch|StackAsm|CustomAsm)\tbackend=direct\tstage=lower\tinput=[0-9]+\temitted=[0-9]+\treason=-$'
+    if [ "$(grep -acE "$direct_re" ${direct}/compile.log)" -ne 63 ]; then
         echo "FAIL  direct-ir (supported routines did not all use direct IR)"
         fail=1
     fi
@@ -227,20 +236,19 @@ writeShellApplication {
         echo "FAIL  direct-ir (quiet direct mode emitted per-routine diagnostics)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: backends direct=70 fallback=4$' \
+    if [ "$(grep -ac '^LLVM: backends direct=74 fallback=0$' \
         ${direct}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (aggregate backend totals are incorrect)"
         fail=1
     fi
-    if [ "$(grep -ac '^LLVM: direct fallbacks build=4 lower=0$' \
-        ${direct}/compile.log)" -ne 1 ]; then
-        echo "FAIL  direct-ir (direct fallback stage totals are incorrect)"
+    if grep -aq '^LLVM: direct fallbacks' ${direct}/compile.log; then
+        echo "FAIL  direct-ir (fallback stage totals appeared on a zero-fallback story)"
         fail=1
     fi
 
     # Phase 5: a plain compile (no $LLVM setting) selects the direct
     # backend and produces the same bytes as an explicit $LLVM=4 compile.
-    if [ "$(grep -ac '^LLVM: backends direct=70 fallback=4$' \
+    if [ "$(grep -ac '^LLVM: backends direct=74 fallback=0$' \
         ${defaultMode}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (default mode did not select the direct backend)"
         fail=1
@@ -320,29 +328,9 @@ writeShellApplication {
     check_routine Direct_CallCondition 4 5
     check_routine Direct_CallIndirect 2 2
     check_routine Direct_CallVoid 3 4
-    if ! grep -aq $'name=Direct_Random\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=unsupported random arity' \
-        ${direct}/compile.log; then
-        echo "FAIL  direct-ir (random() did not fall back with its reason)"
-        fail=1
-    fi
     if ! grep -aq $'name=Main\tbackend=direct\tstage=lower' \
         ${direct}/compile.log; then
         echo "FAIL  direct-ir (Main with inline assembly did not use direct IR)"
-        fail=1
-    fi
-    if ! grep -aq $'name=Direct_Catch\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=catch/throw' \
-        ${direct}/compile.log; then
-        echo "FAIL  direct-ir (catch/throw did not reject with its reason)"
-        fail=1
-    fi
-    if ! grep -aq $'name=Direct_StackAsm\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=explicit stack-manipulation opcode' \
-        ${direct}/compile.log; then
-        echo "FAIL  direct-ir (stack manipulation did not reject with its reason)"
-        fail=1
-    fi
-    if ! grep -aq $'name=Direct_CustomAsm\tbackend=classic-fallback\tstage=direct-build\tinput=-1\temitted=-1\treason=custom opcode' \
-        ${direct}/compile.log; then
-        echo "FAIL  direct-ir (custom opcode did not reject with its reason)"
         fail=1
     fi
     timeout 30 glulxe ${upstream} </dev/null >"$work/upstream.log" 2>&1 || fail=1

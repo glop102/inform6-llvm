@@ -102,6 +102,22 @@ static routine_unit direct_ru;
 static LLVMValueRef direct_opaque_call_ex(const char *name,
     LLVMValueRef *args, int count, int void_return);
 
+static int direct_symstack_spill(void);
+
+/* Escalate the routine to real-stack mode mid-build: once every
+   pending symbolic value is spilled, the real VM stack holds exactly
+   what classic's would (elided push/pop pairs were net zero), so sp
+   operands and the explicit stack opcodes can run verbatim from here
+   on, exactly as they do in a stack-argument routine. FALSE only when
+   the pending values cannot be spilled (terminated block). */
+static int direct_stack_escalate(void)
+{
+    if (direct_ru.stack_entry) return TRUE;
+    if (!direct_symstack_spill()) return FALSE;
+    direct_ru.stack_entry = TRUE;
+    return TRUE;
+}
+
 static LLVMValueRef direct_sympop(void)
 {
     if (direct_ru.stack_entry)
@@ -112,8 +128,14 @@ static LLVMValueRef direct_sympop(void)
         direct_ru.spilled--;
         return direct_opaque_call_ex("i6.stkpop", NULL, 0, FALSE);
     }
-    llvm_direct_reject("sp read with empty symbolic stack");
-    return NULL;
+    /* Popping past everything this routine pushed: classic emits the
+       pop and lets the runtime stack answer, so run the rest of the
+       routine against the real stack too. */
+    if (!direct_stack_escalate()) {
+        llvm_direct_reject("sp read with empty symbolic stack");
+        return NULL;
+    }
+    return direct_opaque_call_ex("i6.stkpop", NULL, 0, FALSE);
 }
 
 static void direct_sympush(LLVMValueRef v)
@@ -734,11 +756,17 @@ extern llvm_direct_value llvm_direct_binary(int operator_number,
 static LLVMValueRef direct_opaque_call_ex(const char *name, LLVMValueRef *args,
     int count, int void_return)
 {
-    LLVMTypeRef params[16], ft;
+    LLVMTypeRef params[40], ft;
     LLVMValueRef f;
     int i, is_new;
+    if (count > 40) {
+        llvm_direct_reject("too many opaque call operands");
+        return NULL;
+    }
+    /* Almost always i32 values; verbatim-form calls also carry global
+       POINTERS so the instruction can access the global's memory. */
     for (i = 0; i < count; i++)
-        params[i] = i32t;
+        params[i] = LLVMTypeOf(args[i]);
     ft = LLVMFunctionType(void_return ? LLVMVoidTypeInContext(llctx) : i32t,
         params, (unsigned)count, FALSE);
     f = LLVMGetNamedFunction(llmod, name);
@@ -844,10 +872,10 @@ extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
 {
     static const char *const direct_call_names[4] =
         { "i6.callf", "i6.callfi", "i6.callfii", "i6.callfiii" };
-    LLVMValueRef args[16];
+    LLVMValueRef args[34];
     int i;
     if (!direct_can_emit() || !function) return NULL;
-    if (count < 0 || count > 12) {
+    if (count < 0 || count > 32) {
         llvm_direct_reject("unsupported call arity");
         return NULL;
     }
@@ -950,9 +978,45 @@ extern void llvm_direct_adjust_variable(int variable, int amount)
     LLVMBuildStore(direct_ru.bld, value, pointer);
 }
 
+/* Word arrays built by the direct generator for multi-argument
+   random(), queued for classic generation of the same expression tree
+   to reuse instead of building duplicates. Direct build strictly
+   precedes classic generation per statement, and an aborted direct
+   build stops before pushing, so consumption stays aligned. */
+#define DIRECT_RANDOM_ARRAY_MAX 16
+static int32 direct_random_arrays[DIRECT_RANDOM_ARRAY_MAX];
+static int direct_random_array_count;
+
+extern void llvm_direct_random_array_set(int32 addr)
+{
+    if (direct_random_array_count < DIRECT_RANDOM_ARRAY_MAX)
+        direct_random_arrays[direct_random_array_count++] = addr;
+}
+
+extern int32 llvm_direct_random_array_take(void)
+{
+    int i;
+    int32 addr;
+    if (direct_random_array_count == 0) return -1;
+    addr = direct_random_arrays[0];
+    for (i = 1; i < direct_random_array_count; i++)
+        direct_random_arrays[i - 1] = direct_random_arrays[i];
+    direct_random_array_count--;
+    return addr;
+}
+
+/* Anything still pending on the symbolic stack dies with the call
+   frame, exactly as classic's physically pushed values would. */
+static void direct_discard_symstack(void)
+{
+    direct_ru.symstack_depth = 0;
+    direct_ru.spilled = 0;
+}
+
 extern void llvm_direct_return_value(llvm_direct_value value)
 {
     if (!direct_can_emit() || !value) return;
+    direct_discard_symstack();
     LLVMBuildRet(direct_ru.bld, value);
 }
 
@@ -1004,6 +1068,7 @@ extern void llvm_direct_store_local(int destination, int source)
 extern void llvm_direct_return_constant(int32 value)
 {
     if (!direct_can_emit()) return;
+    direct_discard_symstack();
     LLVMBuildRet(direct_ru.bld, LLVMConstInt(i32t, (uint32_t)value, FALSE));
 }
 
@@ -1016,6 +1081,7 @@ extern void llvm_direct_return_local(int source)
         return;
     }
     value = LLVMBuildLoad2(direct_ru.bld, i32t, direct_ru.locals[source], "value");
+    direct_discard_symstack();
     LLVMBuildRet(direct_ru.bld, value);
 }
 
@@ -1271,7 +1337,12 @@ static void direct_asm_store(const assembly_operand *op, LLVMValueRef v)
 }
 
 /* Opaque form: sources become arguments, a store operand receives the
-   result, stack-passed extras follow the sources. */
+   result, stack-passed extras follow the sources.
+
+   A two-store opcode (double arithmetic, @fmod...) is emitted with both
+   stores redirected to sp ("i6.<op>.ss2"): the instruction pushes its
+   first store then its second, so popping yields them in reverse, and
+   the popped values route to the written destinations. */
 static void direct_asm_opaque(const assembly_instruction *ai, int flags,
     LLVMValueRef *extra, int n_extra)
 {
@@ -1280,8 +1351,30 @@ static void direct_asm_opaque(const assembly_instruction *ai, int flags,
     int n_src = ai->operand_count - ((flags & OPFLAG_STORE) ? 1 : 0);
     int i, n_args = 0;
 
+    /* A noreturn opcode ends the block; pending symbolic pushes are on
+       classic's real stack by this point, so materialize them now. */
+    if ((flags & OPFLAG_RETURNS) && !direct_symstack_spill()) {
+        llvm_direct_reject("VM stack value carried across control flow");
+        return;
+    }
     if (flags & OPFLAG_STORE2) {
-        llvm_direct_reject("inline opcode with two stores");
+        LLVMValueRef first, second;
+        n_src = ai->operand_count - 2;
+        if (n_extra != 0 || n_src > 16) {
+            llvm_direct_reject("inline opcode with two stores");
+            return;
+        }
+        for (i = 0; i < n_src; i++) {
+            args[i] = direct_asm_operand(&ai->operand[i]);
+            if (!args[i]) return;
+        }
+        sprintf(name, "i6.%.32s.ss2",
+            glulx_opcode_name(ai->internal_number));
+        (void)direct_opaque_call_ex(name, args, n_src, TRUE);
+        second = direct_opaque_call_ex("i6.stkpop", NULL, 0, FALSE);
+        first = direct_opaque_call_ex("i6.stkpop", NULL, 0, FALSE);
+        direct_asm_store(&ai->operand[n_src], first);
+        direct_asm_store(&ai->operand[n_src + 1], second);
         return;
     }
     if (n_src + n_extra > 16) {
@@ -1333,6 +1426,142 @@ static void direct_asm_condbranch(const assembly_instruction *ai,
     LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
 }
 
+/* A branch opcode with no native compare form (jfeq, jdlt, jisnan...):
+   an opaque "i6.<op>.br" call takes the source operands and answers
+   nonzero when the branch is taken; the lowerer re-materializes it as
+   the original opcode branching into a 0/1 result, which the condbr
+   here then tests. */
+static void direct_asm_branch_opaque(const assembly_instruction *ai)
+{
+    char name[64];
+    LLVMValueRef args[8], taken, cond;
+    LLVMBasicBlockRef then_bb, else_bb;
+    int n_src = ai->operand_count - 1;
+    int32 target = ai->operand[n_src].value;
+    int i;
+
+    for (i = 0; i < n_src; i++) {
+        args[i] = direct_asm_operand(&ai->operand[i]);
+        if (!args[i]) return;
+    }
+    if (!direct_symstack_spill()) return;
+    then_bb = direct_label_block((int)target);
+    if (!then_bb) return;
+    sprintf(name, "i6.%.32s.br", glulx_opcode_name(ai->internal_number));
+    taken = direct_opaque_call_ex(name, args, n_src, FALSE);
+    if (!taken) return;
+    cond = LLVMBuildICmp(direct_ru.bld, LLVMIntNE, taken,
+        LLVMConstInt(i32t, 0, FALSE), "asm.cond");
+    else_bb = LLVMAppendBasicBlockInContext(llctx, direct_ru.fn, "asm.next");
+    LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
+    LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
+}
+
+/* Verbatim emission for instructions whose operands must keep their
+   original addressing forms: custom @"..." opcodes (whose operand roles
+   the compiler cannot know) and the sub-word copies (whose memory
+   operands are accessed at narrow widths). The form of each non-branch
+   operand is encoded in the call name -- 'v' a value argument, 'g' a
+   global passed as its pointer (the instruction touches the global's
+   memory directly), 'p' an sp operand kept as a real stack access
+   (escalating to real-stack mode), 'r' a declared store received as
+   the call result. Custom opcodes emit as
+   "i6.custom.<code>.<flags>.<forms>", known opcodes as
+   "i6.raw.<name>.<forms>"; a trailing ".br" marks a branch-label
+   final operand, handled by the taken-flag condbr scheme. */
+static void direct_asm_verbatim(const assembly_instruction *ai)
+{
+    char name[96], forms[10];
+    LLVMValueRef args[8], result, cond;
+    int flags = glulx_opcode_flags(ai->internal_number);
+    int opct = glulx_opcode_operand_count(ai->internal_number);
+    int is_branch = (flags & OPFLAG_BRANCH) != 0;
+    int n_forms = ai->operand_count - (is_branch ? 1 : 0);
+    int n_args = 0, store_local = FALSE, i;
+
+    if (ai->operand_count != opct || n_forms < 0 || n_forms > 8) {
+        llvm_direct_reject("inline operand count mismatch");
+        return;
+    }
+    if ((flags & OPFLAG_STORE2) || (is_branch && (flags & OPFLAG_STORE))) {
+        llvm_direct_reject("unsupported verbatim opcode shape");
+        return;
+    }
+    /* A verbatim instruction may branch by raw offsets computed against
+       the emitted layout (that is what the custom jump forms are for),
+       so no spill of ours may land between consecutive verbatim
+       instructions: materialize pending pushes here, where classic's
+       own pushes sat. */
+    if (!direct_symstack_spill()) {
+        llvm_direct_reject("verbatim opcode across pending stack");
+        return;
+    }
+    /* sp operands touch the real stack mid-instruction, which the
+       symbolic model cannot carry. */
+    for (i = 0; i < n_forms; i++)
+        if (ai->operand[i].type == LOCALVAR_OT
+            && ai->operand[i].value == 0) {
+            if (!direct_stack_escalate()) {
+                llvm_direct_reject("verbatim sp operand");
+                return;
+            }
+            break;
+        }
+    for (i = 0; i < n_forms; i++) {
+        const assembly_operand *op = &ai->operand[i];
+        int is_store = (flags & OPFLAG_STORE) && i == n_forms - 1;
+        if (op->type == LOCALVAR_OT && op->value == 0)
+            forms[i] = 'p';
+        else if (op->type == GLOBALVAR_OT) {
+            forms[i] = 'g';
+            args[n_args++] =
+                direct_global_var(op->value - MAX_LOCAL_VARIABLES);
+        }
+        else if (is_store) {
+            forms[i] = 'r';
+            store_local = TRUE;
+        }
+        else {
+            forms[i] = 'v';
+            args[n_args] = direct_asm_operand(op);
+            if (!args[n_args++]) return;
+        }
+    }
+    forms[n_forms] = 0;
+    if (ai->internal_number == -1)
+        sprintf(name, "i6.custom.%ld.%d.%s%s",
+            (long)glulx_opcode_code(-1), flags, forms,
+            is_branch ? ".br" : "");
+    else
+        sprintf(name, "i6.raw.%.24s.%s%s",
+            glulx_opcode_name(ai->internal_number), forms,
+            is_branch ? ".br" : "");
+
+    if (is_branch) {
+        LLVMBasicBlockRef then_bb, else_bb;
+        int32 target = ai->operand[n_forms].value;
+        if (!direct_symstack_spill()) return;
+        then_bb = direct_label_block((int)target);
+        if (!then_bb) return;
+        result = direct_opaque_call_ex(name, args, n_args, FALSE);
+        if (!result) return;
+        cond = LLVMBuildICmp(direct_ru.bld, LLVMIntNE, result,
+            LLVMConstInt(i32t, 0, FALSE), "asm.cond");
+        else_bb = LLVMAppendBasicBlockInContext(llctx, direct_ru.fn,
+            "asm.next");
+        LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
+        LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
+        return;
+    }
+    result = direct_opaque_call_ex(name, args, n_args, !store_local);
+    if (store_local) {
+        if (!result) return;
+        direct_asm_store(&ai->operand[n_forms - 1], result);
+    }
+    if (flags & OPFLAG_RETURNS)
+        LLVMBuildUnreachable(direct_ru.bld);
+}
+
 /* If the operand is an unmarked integer constant, put its value in *v. */
 static int direct_asm_constant(const assembly_operand *op, int32 *v)
 {
@@ -1354,7 +1583,7 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
 
     if (!direct_can_emit()) return;
     if (ai->internal_number == -1) {
-        llvm_direct_reject("custom opcode");
+        direct_asm_verbatim(ai);
         return;
     }
     flags = glulx_opcode_flags(ai->internal_number);
@@ -1442,9 +1671,9 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
         return;
     case copys_gc:
     case copyb_gc:
-        /* Sub-word copies read and write their operands at narrow
-           widths; the word-based operand model would misread them. */
-        llvm_direct_reject("byte/short copy opcode");
+        /* Sub-word copies access memory operands at narrow widths, so
+           their operands must keep their original forms. */
+        direct_asm_verbatim(ai);
         return;
     case sexs_gc:
     case sexb_gc:
@@ -1499,26 +1728,46 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
                arguments already sit on the real stack (sp pushes were
                real), so any count -- constant or computed -- emits
                verbatim and the opcode consumes them at runtime. */
-            LLVMValueRef extra[DIRECT_SYMSTACK_MAX];
+            LLVMValueRef args[2 + DIRECT_SYMSTACK_MAX], result;
             const assembly_operand *cntop = &ai->operand[1];
+            char name[64];
             int32 cnt;
             int i;
             if (direct_ru.stack_entry) {
                 direct_asm_opaque(ai, flags, NULL, 0);
                 return;
             }
-            if (!direct_asm_constant(cntop, &cnt)) {
-                llvm_direct_reject("call with non-constant argument count");
+            if (!direct_asm_constant(cntop, &cnt)
+                || cnt < 0 || cnt > direct_ru.symstack_depth) {
+                /* A computed count, or one consuming values this routine
+                   never pushed: run against the real stack. */
+                if (!direct_stack_escalate()) {
+                    llvm_direct_reject("untrackable computed call");
+                    return;
+                }
+                direct_asm_opaque(ai, flags, NULL, 0);
                 return;
             }
-            if (cnt < 0 || cnt > direct_ru.symstack_depth) {
-                llvm_direct_reject("call consumes more than the symbolic stack");
-                return;
+            /* Both sources decode before the arguments pop, so evaluate
+               them first (the address itself may be an sp read), then
+               peel the arguments in runtime pop order (the first
+               argument was pushed last). */
+            args[0] = direct_asm_operand(&ai->operand[0]);
+            args[1] = direct_asm_operand(&ai->operand[1]);
+            if (!args[0] || !args[1]) return;
+            for (i = 0; i < cnt; i++) {
+                args[2 + i] = direct_sympop();
+                if (!args[2 + i]) return;
             }
-            /* Runtime pop order: the first argument was pushed last. */
-            for (i = 0; i < cnt; i++)
-                extra[i] = direct_sympop();
-            direct_asm_opaque(ai, flags, extra, cnt);
+            sprintf(name, "i6.%.32s%s",
+                glulx_opcode_name(ai->internal_number), cnt ? ".s" : "");
+            result = direct_opaque_call_ex(name, args, 2 + cnt,
+                !(flags & OPFLAG_STORE));
+            if (flags & OPFLAG_STORE)
+                direct_asm_store(&ai->operand[ai->operand_count - 1],
+                    result);
+            if (flags & OPFLAG_RETURNS)
+                LLVMBuildUnreachable(direct_ru.bld);
         }
         return;
 
@@ -1527,24 +1776,53 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
     case stkswap_gc:
     case stkroll_gc:
     case stkcopy_gc:
-        /* Meaningful only against the real stack; in real-stack mode
-           that is exactly the current state, so they emit verbatim.
-           Against the symbolic stack their effects are untrackable. */
-        if (direct_ru.stack_entry) {
-            direct_asm_opaque(ai, flags, NULL, 0);
+        /* Meaningful only against the real stack: spill and switch the
+           routine to real-stack mode, where the current state is
+           exactly classic's, and emit verbatim. */
+        if (!direct_stack_escalate()) {
+            llvm_direct_reject("explicit stack-manipulation opcode");
             return;
         }
-        llvm_direct_reject("explicit stack-manipulation opcode");
+        direct_asm_opaque(ai, flags, NULL, 0);
         return;
 
     case catch_gc:
+        /* catch stores a token and branches; the throw path resumes at
+           the fallthrough with the VM rewriting the token slot to the
+           thrown value. Two paired opaque calls carry that shape: the
+           lowerer emits one real catch instruction whose store operand
+           is i6.catchtok's slot (so a throw rewrites exactly the value
+           the IR reads), and i6.catchflag answers 1 on the branch path
+           and 0 on the throw-resume path. */
+        {   LLVMValueRef tok, flag, cond;
+            LLVMBasicBlockRef then_bb, else_bb;
+            int32 target = ai->operand[1].value;
+            if (!direct_symstack_spill()) return;
+            then_bb = direct_label_block((int)target);
+            if (!then_bb) return;
+            tok = direct_opaque_call_ex("i6.catchtok", NULL, 0, FALSE);
+            flag = direct_opaque_call_ex("i6.catchflag", &tok, 1, FALSE);
+            if (!tok || !flag) return;
+            direct_asm_store(&ai->operand[0], tok);
+            if (!direct_symstack_spill()) return;
+            cond = LLVMBuildICmp(direct_ru.bld, LLVMIntNE, flag,
+                LLVMConstInt(i32t, 0, FALSE), "asm.cond");
+            else_bb = LLVMAppendBasicBlockInContext(llctx, direct_ru.fn,
+                "asm.next");
+            LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
+            LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
+        }
+        return;
+
     case throw_gc:
-        llvm_direct_reject("catch/throw");
+        /* Never returns here (control resumes at the matching catch);
+           the opaque path's Rf handling ends the block. */
+        direct_asm_opaque(ai, flags, NULL, 0);
         return;
 
     default:
         if (flags & OPFLAG_BRANCH) {
-            llvm_direct_reject("unhandled inline branch opcode");
+            direct_asm_branch_opaque(ai);
             return;
         }
         direct_asm_opaque(ai, flags, NULL, 0);

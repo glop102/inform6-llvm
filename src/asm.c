@@ -1162,6 +1162,18 @@ extern int glulx_opcode_flags(int32 internal_number)
 extern int glulx_opcode_operand_count(int32 internal_number)
 {   return internal_number_to_opcode_g(internal_number).no;
 }
+extern int32 glulx_opcode_code(int32 internal_number)
+{   return internal_number_to_opcode_g(internal_number).code;
+}
+/* Restore the custom @"..." descriptor before a lowered custom opcode
+   (internal_number -1) is buffered: capture snapshots these fields. */
+extern void glulx_set_custom_opcode(int32 code, int flags, int no)
+{   custom_opcode_g.name = (uchar *) "@custom";
+    custom_opcode_g.code = code;
+    custom_opcode_g.flags = flags;
+    custom_opcode_g.op_rules = 0;
+    custom_opcode_g.no = no;
+}
 extern char *llvm_current_routine_name(void)
 {   return current_routine_name.data;
 }

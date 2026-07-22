@@ -2866,23 +2866,32 @@ static void generate_code_from(int n, int void_flag)
                      {
                          case RANDOM_SYSF:
                              if (j>1)
-                             {  assembly_operand AO, AO2; 
+                             {  assembly_operand AO, AO2;
                                 int arg_c, arg_et;
+                                int32 direct_array;
                                 INITAO(&AO);
-                                AO.value = j; 
+                                AO.value = j;
                                 set_constant_ot(&AO);
-                                INITAOTV(&AO2, CONSTANT_OT, begin_word_array());
+                                /* The direct generator may have built
+                                   this call's table already; reuse it
+                                   rather than emitting a duplicate. */
+                                direct_array = llvm_direct_random_array_take();
+                                INITAOTV(&AO2, CONSTANT_OT,
+                                    direct_array >= 0 ? direct_array
+                                        : begin_word_array());
                                 AO2.marker = ARRAY_MV;
-    
+
                                 for (arg_c=0, arg_et = ET[below].right;arg_c<j;
                                      arg_c++, arg_et = ET[arg_et].right)
                                 {   if (ET[arg_et].value.type == LOCALVAR_OT
                                         || ET[arg_et].value.type == GLOBALVAR_OT)
                   error("Only constants can be used as possible 'random' results");
-                                    array_entry(arg_c, FALSE, ET[arg_et].value);
+                                    if (direct_array < 0)
+                                        array_entry(arg_c, FALSE, ET[arg_et].value);
                                 }
-                                finish_array(arg_c, FALSE);
-    
+                                if (direct_array < 0)
+                                    finish_array(arg_c, FALSE);
+
                                 assembleg_2(random_gc, AO, stack_pointer);
                                 assembleg_3(aload_gc, AO2, stack_pointer, Result);
                              }
@@ -3290,7 +3299,7 @@ static int direct_attribute_needs_branches(int node);
 static llvm_direct_value direct_attribute_test(int node,
     llvm_direct_block true_block, llvm_direct_block false_block);
 
-#define DIRECT_CALL_CHILDREN 14
+#define DIRECT_CALL_CHILDREN 34
 
 /* Collect an operator node's children, or -1 if there are too many. */
 static int direct_collect_children(int first, int *nodes, int max)
@@ -3440,11 +3449,36 @@ static llvm_direct_value direct_function_call(int node)
         break;
     case RANDOM_SYSF:
         if (count != 1) {
-            /* Multi-argument random() builds a word array during classic
-               generation; direct generation must not repeat that table
-               side effect. */
-            llvm_direct_reject("unsupported random arity");
-            return NULL;
+            /* Multi-argument random: a word array of the constant
+               alternatives, indexed by @random count. Build the table
+               here and hand its address to classic generation (which
+               walks the same tree right after us), so exactly one
+               table exists whichever backend's stream is kept. */
+            llvm_direct_value args[2], index;
+            int32 addr;
+            int arg_c;
+            if (count < 1) {
+                llvm_direct_reject("unsupported random arity");
+                return NULL;
+            }
+            for (arg_c = 0; arg_c < count; arg_c++)
+                if (ET[nodes[arg_c]].down != -1
+                    || ET[nodes[arg_c]].value.type == LOCALVAR_OT
+                    || ET[nodes[arg_c]].value.type == GLOBALVAR_OT) {
+                    llvm_direct_reject("non-constant random alternative");
+                    return NULL;
+                }
+            addr = begin_word_array();
+            for (arg_c = 0; arg_c < count; arg_c++)
+                array_entry(arg_c, FALSE, ET[nodes[arg_c]].value);
+            finish_array(count, FALSE);
+            llvm_direct_random_array_set(addr);
+            args[0] = llvm_direct_constant(count, 0, 0);
+            index = llvm_direct_glulx_op("random", args, 1);
+            if (!index) return NULL;
+            args[0] = llvm_direct_constant(addr, ARRAY_MV, -1);
+            args[1] = index;
+            return llvm_direct_glulx_op("aload", args, 2);
         }
         if (!direct_evaluate_children(nodes, values, 1)) return NULL;
         return direct_random_call(nodes[0], values[0]);
@@ -4278,17 +4312,22 @@ static llvm_direct_value direct_expression_value(int node)
 
     case IN_OP:
     case NOTIN_OP:
-        {   int nodes[2];
-            llvm_direct_value values[2], parent, args[2], result;
+        {   int nodes[DIRECT_CALL_CHILDREN];
+            llvm_direct_value values[DIRECT_CALL_CHILDREN];
+            llvm_direct_value parent, args[2], result, r;
+            int is_notin = ET[node].operator_number == NOTIN_OP;
             int strict = runtime_error_checking_switch && !veneer_mode;
             llvm_direct_block false_block, join, result_from;
-            int need_check;
+            int need_check, count, i;
 
-            if (direct_collect_children(first, nodes, 2) != 2) {
+            count = direct_collect_children(first, nodes,
+                DIRECT_CALL_CHILDREN);
+            if (count < 2) {
                 llvm_direct_reject("invalid containment test");
                 return NULL;
             }
-            if (!direct_evaluate_children(nodes, values, 2)) return NULL;
+            if (!direct_evaluate_children(nodes, values, count))
+                return NULL;
             need_check = strict && direct_object_check_needed(
                 ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL);
             if (need_check) {
@@ -4301,10 +4340,18 @@ static llvm_direct_value direct_expression_value(int node)
             args[0] = values[0];
             args[1] = llvm_direct_constant(GOBJFIELD_PARENT(), 0, 0);
             parent = llvm_direct_glulx_op("aload", args, 2);
-            result = llvm_direct_compare(
-                ET[node].operator_number == IN_OP
-                    ? CONDEQUALS_OP : NOTEQUAL_OP,
-                parent, values[1]);
+            /* An or-list matches any alternative for "in" and none of
+               them for "notin", combined flat like the comparison
+               or-lists: the parent read is pure, so one load serves
+               every alternative. */
+            result = NULL;
+            for (i = 1; i < count; i++) {
+                r = llvm_direct_compare(
+                    is_notin ? NOTEQUAL_OP : CONDEQUALS_OP,
+                    parent, values[i]);
+                result = result == NULL ? r : llvm_direct_binary(
+                    is_notin ? ARTAND_OP : ARTOR_OP, result, r);
+            }
             if (!need_check) return result;
             result_from = llvm_direct_current_block();
             llvm_direct_jump_block(join);
