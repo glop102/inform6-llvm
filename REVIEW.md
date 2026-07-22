@@ -139,12 +139,12 @@ follows is the still-open work.
 - Byte-identical output with inlining off, master vs branch, across the
   full story corpus in both `$LLVM=0` and `$LLVM=4`, from a clean
   worktree baseline. All nine test gates pass.
-- Cloak with inlining on (gated): 153,588 → 144,636 dispatches (−5.83%),
-  transcript identical, no routine changes backend; Life is exactly its
-  inline-off count (the pre-gate +1,634 regression is gone). The
-  ungated form measured −6.02% on cloak, so the gate costs 0.2pp there
-  while eliminating the regression class. Microbenchmark (helper called
-  1,000× in a loop): −28.5%.
+- Cloak with inlining on (gated): 153,588 → 146,886 dispatches (−4.36%),
+  transcript identical, no routine changes backend; Life inline-on is
+  54,589,510 — 6 dispatches better than inline-off (ungated it regressed
+  +1,634). Ungated cloak measured −6.02%; the gap is the gate declining
+  what its estimator cannot verify (see the profitability gate section).
+  Microbenchmark (helper called 1,000× in a loop): −28.5%.
 - The revert-on-fallback guard is implemented and works: inlining runs on
   a throwaway clone and the un-inlined module lowers instead if the
   inlined form fails to optimize or lower. Measured essential: without
@@ -176,24 +176,45 @@ corpus" held anyway. Any further emission-order work should hunt for the
 same class: reads of `symbols[].value` or pc-derived values between
 parse and end-of-pass.
 
-### The profitability gate (implemented)
+### The profitability gate (implemented, greedy per site group)
 
-Every inline decision now compares two real lowerings on throwaway
-clones: the un-inlined baseline and the inlined form. Each lowered
-stream gets a loop-weighted cost (instructions weighted 8^depth, depth
-capped at 3, inferred from backward branches); the inlined form is kept
-only if it scores below the baseline *plus* what the rewritten calls
-would have cost anyway (each callee's standalone lowered cost — measured
-once and cached per retained unit — weighted by the site's loop depth in
-the caller's IR CFG). Rejection restores the baseline stream and
-re-patches the header; the lower-failure revert guard is subsumed.
-`I6_LLVM_DIAGNOSTICS=1` prints one `LLVM: inline gate` line per
-candidate caller with both scores and the decision (on Life it keeps
-`DrawFull`/`DrawDiff`/`Main` and reverts the hot `Stir`, which is the
-routine that caused the pre-gate regression). Costs: gated compile time
-on glulxercise is ~0.8 s inline-on (three lowerings per candidate
-caller); cloak story size is +27% gated vs +31% ungated — size growth
-is bounded only by the estimate today and remains a tuning knob.
+Inline decisions are made greedily per (callee, depth) site group.
+Candidates are discovered on the pristine caller module; the un-inlined
+baseline is lowered first (its loop-weighted cost — instructions
+weighted 8^depth, cap 3, depth inferred from backward branches — is the
+starting best form); then groups are tried hottest-first, each trial a
+real lowering of a fresh clone with the accepted set plus the group
+spliced in. A group is kept only if the trial's residual — its weighted
+cost minus a charge for every inlined site — beats the best form by a
+noise margin (baseline/128). Sites of one callee at one depth decide
+together (they are symmetric, and each trial is a full caller lowering);
+a failing group is dropped individually, so one bad site neither rejects
+a caller's good sites nor hides behind them. Rejection leaves the prior
+best; the lower-failure revert guard is subsumed.
+
+Two model boundaries were measured in, not assumed:
+
+- **Charges use the same capped depth model that scores the inlined
+  form** (the callee's lowered instructions binned by internal depth,
+  each bin weighted at site depth + bin depth, same cap). A flat
+  weight×cost product over-credited loopy callees at deep sites by the
+  cap asymmetry and manufactured phantom wins.
+- **Only callees whose lowered body is loop-free are tried.** A loopy
+  body's true cost is dominated by iteration counts the estimator
+  guesses at (8 per level); on Life the guess accepted an inlined
+  `PrintGrid` (2,048 cells per call) as a win that measured +1,987
+  dispatches. Loop-free bodies cost what they count — and they are the
+  Z__Region-class leaf helpers the design targeted all along.
+
+`I6_LLVM_DIAGNOSTICS=1` prints one `LLVM: inline site` line per trial
+and an `LLVM: inline gate` summary per caller. Measured: Life inline-on
+is 54,589,510 — six dispatches *better* than inline-off (ungated it
+regressed +1,634); cloak keeps −4.36% (146,886) with story size +10.4%
+(the earlier whole-routine gate reached −5.83% but +27% size by
+accepting loopy-callee inlines the model cannot actually verify — that
+1.5pp is the price of trusting only what the estimator can measure).
+Compile time inline-on: glulxercise ~1.1 s, cloak ~12 s (one caller
+lowering per tried group; the dominant tuning target).
 
 ### Design gaps in the inlining prototype
 
@@ -261,13 +282,15 @@ is bounded only by the estimate today and remains a tuning knob.
 
 - Tune the gate and caps: `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS`
   (currently 16/70 on pre-optimization IR — a crude proxy), the loop
-  weight/depth cap, and a size-growth term (the gate bounds dynamic
-  regressions but story size is still +27% on cloak). Per-site
-  selection is a known refinement: the gate is all-or-nothing per
-  caller, so one pessimizing site rejects a caller's good sites (a
-  warm-sites-only retry is the natural next step). Decide default-on
-  only on cross-corpus evidence (cloak −5.83%, Life exactly neutral,
-  Advent unmeasured, size growth bounded).
+  weight/depth cap, and the noise margin. Compile time is the dominant
+  cost (one caller lowering per tried group; cloak ~12 s inline-on) —
+  candidates: prune groups whose maximum possible win is below the
+  margin, or make trial evaluation incremental. Recovering the
+  loopy-callee wins the loop-free restriction gave up (~1.5pp on cloak)
+  needs real iteration-count evidence — the weighted dynamic cost model
+  in the metric hierarchy, not a bigger guess. Decide default-on only on
+  cross-corpus evidence (cloak −4.36%, Life −6 dispatches, Advent
+  unmeasured, size +10.4%).
 - Phase 3 landing: inline `Z__Region` and hot siblings by default, pin
   the new cloak baseline in `tests/corpusTest.nix`.
 - Focused fixtures: a hot-loop helper that must inline (assert the
@@ -281,8 +304,9 @@ is bounded only by the estimate today and remains a tuning knob.
   bisection.
 - Track the deferred-model costs as first-class benchmark outputs: peak
   compiler RSS and compile time (current data on glulxercise: RSS
-  49.9 eager / 53.1 inline-off / 62 MB inline-on; compile time ~0.2 s
-  inline-off, ~0.8 s inline-on gated) on the largest corpus game.
+  49.9 eager / 53.1 inline-off / 61 MB inline-on; compile time ~0.2 s
+  inline-off, ~1.1 s inline-on; cloak ~12 s inline-on) on the largest
+  corpus game.
 - Open design question: transitive inlining (flatten at snapshot vs
   caller time, depth budget vs recursion guard).
 

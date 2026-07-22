@@ -108,8 +108,13 @@ typedef struct routine_unit_s {
     int            spilled;      /* values our code left on the real stack */
     int32          assigned_pc;  /* reserved: Phase 1 end-of-pass address  */
     int            routine_symbol; /* which routine this is (for inlining)  */
-    int32          body_cost;    /* cached standalone lowered weighted cost
-                                    (inline gate); <=0 means uncached      */
+    int            body_hist_valid; /* inline gate: body_hist is cached    */
+    int            body_loopfree;   /* lowered body has no loops: the only
+                                       case whose static cost the gate's
+                                       estimator can be trusted on        */
+    int32          body_hist[LLVM_STREAM_DEPTH_CAP + 1];
+                                 /* standalone lowered instructions binned
+                                    by internal loop depth                 */
 } routine_unit;
 
 /* The one routine currently being built. */
@@ -1691,8 +1696,6 @@ static void direct_fallback(const char *stage, const char *detail)
 #define INLINE_MAX_BLOCKS 16
 #define INLINE_MAX_INSTS  70
 #define INLINE_MAX_SITES  128
-#define INLINE_LOOP_WEIGHT 8
-#define INLINE_DEPTH_CAP   3
 
 static const char *const inline_call_names[4] =
     { "i6.callf", "i6.callfi", "i6.callfii", "i6.callfiii" };
@@ -1706,8 +1709,8 @@ typedef struct inline_site_s {
 
 static int inline_site_weight(int depth)
 {   int w = 1;
-    if (depth > INLINE_DEPTH_CAP) depth = INLINE_DEPTH_CAP;
-    for (; depth > 0; depth--) w *= INLINE_LOOP_WEIGHT;
+    if (depth > LLVM_STREAM_DEPTH_CAP) depth = LLVM_STREAM_DEPTH_CAP;
+    for (; depth > 0; depth--) w *= LLVM_STREAM_LOOP_WEIGHT;
     return w;
 }
 
@@ -1780,19 +1783,25 @@ static int fn_within_size(LLVMValueRef fn, int max_blocks, int max_insts)
     return 1;
 }
 
+/* Discover the eligible call sites of caller_fn (reported in sites_out /
+   ncand_out, in a deterministic order that is identical across clones of
+   the same pristine module) and rewrite a subset of them as real calls
+   to linked-in callee clones: all of them when `select` is NULL, else
+   exactly those with select[ordinal] set. Returns the number rewritten. */
 static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
-    int caller_symbol, inline_site *sites_out)
+    int caller_symbol, inline_site *sites_out, int *ncand_out,
+    const unsigned char *select)
 {
     LLVMBasicBlockRef bb;
     LLVMValueRef calls[INLINE_MAX_SITES];
     int callee_sym[INLINE_MAX_SITES];
     int arity[INLINE_MAX_SITES];
-    int depth_of[INLINE_MAX_SITES];
     int ncalls = 0, i, did = 0;
     LLVMBuilderRef bld;
     LLVMBasicBlockRef *blocks;
     int *bdepths, nblocks = 0, bidx;
 
+    *ncand_out = 0;
     if (!inlining_enabled()) return 0;
 
     /* Loop depths per block, for the gate's site weights. */
@@ -1846,7 +1855,8 @@ static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
                     calls[ncalls] = in;
                     callee_sym[ncalls] = callee_symbol;
                     arity[ncalls] = n;
-                    depth_of[ncalls] = bdepths[bidx];
+                    sites_out[ncalls].ce = ce;
+                    sites_out[ncalls].depth = bdepths[bidx];
                     ncalls++;
                 }
                 break;
@@ -1855,6 +1865,7 @@ static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
     }
     free(blocks);
     free(bdepths);
+    *ncand_out = ncalls;
     if (ncalls == 0) return 0;
 
     bld = LLVMCreateBuilderInContext(llctx);
@@ -1867,6 +1878,7 @@ static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
         LLVMValueRef args[16];
         char uniq[48];
 
+        if (select && !select[i]) continue;
         if (!ce || !ce->mod || !ce->fn) continue;
         clone = LLVMCloneModule(ce->mod);
         cfn = LLVMGetNamedFunction(clone, LLVMGetValueName(ce->fn));
@@ -1900,8 +1912,6 @@ static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
         real = LLVMBuildCall2(bld, fty, target, args, nparams, "inl");
         LLVMReplaceAllUsesWith(calls[i], real);
         LLVMInstructionEraseFromParent(calls[i]);
-        sites_out[did].ce = ce;
-        sites_out[did].depth = depth_of[i];
         did++;
     }
     LLVMDisposeBuilder(bld);
@@ -1950,50 +1960,65 @@ static int try_optimize_and_lower(LLVMModuleRef mod, LLVMValueRef fn,
     return TRUE;
 }
 
-/* The callee's standalone lowered cost (loop-weighted), the gate's
-   "what the calls would have cost anyway" term. Measured once by
-   lowering a clone (the retained module stays pristine) and cached in
-   the retained unit. Clobbers the working event buffer -- the gate
-   computes these before lowering the form it intends to keep. Falls
-   back to the pre-optimization instruction count if the measurement
-   lowering fails. */
-static int32 retained_body_cost(routine_unit *ce)
+/* The gate's "what the call would have cost anyway" charge for a site:
+   the callee's standalone lowered instructions, binned by internal loop
+   depth (measured once by lowering a clone -- the retained module stays
+   pristine -- and cached in the retained unit), each bin weighted at the
+   site's depth plus the bin's, under the same cap the inlined form's
+   own weighting uses. Charging with a flat weight x total-cost product
+   instead measurably over-credited loopy callees at deep sites: the
+   product can exceed the cap while the inlined body cannot. Clobbers
+   the working event buffer -- the gate computes charges before lowering
+   any form it intends to keep. Falls back to the pre-optimization
+   instruction count (all at depth 0) if the measurement lowering
+   fails. */
+static long long inline_site_charge(routine_unit *ce, int site_depth)
 {
-    LLVMModuleRef clone;
-    LLVMValueRef cfn;
-    const char *stage, *why;
-    int in_c, out_c;
+    long long charge = 0;
+    int d;
 
-    if (ce->body_cost > 0) return ce->body_cost;
-    clone = LLVMCloneModule(ce->mod);
-    cfn = LLVMGetNamedFunction(clone, LLVMGetValueName(ce->fn));
-    if (cfn) {
-        /* The lowerer checks the routine-being-emitted invariant
-           params == no_locals; satisfy it with the callee's own count
-           for the measurement, then restore the caller's. */
-        int saved_locals = no_locals;
-        int lowered;
-        no_locals = (int)LLVMCountParams(ce->fn);
-        lowered = try_optimize_and_lower(clone, cfn, &stage, &why,
-            &in_c, &out_c);
-        no_locals = saved_locals;
-        if (lowered)
-            ce->body_cost = llvm_stream_weighted_cost();
-    }
-    if (ce->body_cost <= 0) {
-        LLVMBasicBlockRef bb;
-        int insts = 0;
-        for (bb = LLVMGetFirstBasicBlock(ce->fn); bb;
-             bb = LLVMGetNextBasicBlock(bb)) {
-            LLVMValueRef in;
-            for (in = LLVMGetFirstInstruction(bb); in;
-                 in = LLVMGetNextInstruction(in)) insts++;
+    if (!ce->body_hist_valid) {
+        LLVMModuleRef clone = LLVMCloneModule(ce->mod);
+        LLVMValueRef cfn =
+            LLVMGetNamedFunction(clone, LLVMGetValueName(ce->fn));
+        const char *stage, *why;
+        int in_c, out_c, lowered = FALSE;
+        if (cfn) {
+            /* The lowerer checks the routine-being-emitted invariant
+               params == no_locals; satisfy it with the callee's own
+               count for the measurement, then restore the caller's. */
+            int saved_locals = no_locals;
+            no_locals = (int)LLVMCountParams(ce->fn);
+            lowered = try_optimize_and_lower(clone, cfn, &stage, &why,
+                &in_c, &out_c);
+            no_locals = saved_locals;
         }
-        ce->body_cost = insts;
+        if (lowered) {
+            llvm_stream_depth_histogram(ce->body_hist);
+            ce->body_loopfree = (ce->body_hist[1] == 0
+                && ce->body_hist[2] == 0 && ce->body_hist[3] == 0);
+        }
+        else {
+            LLVMBasicBlockRef bb;
+            int insts = 0;
+            for (bb = LLVMGetFirstBasicBlock(ce->fn); bb;
+                 bb = LLVMGetNextBasicBlock(bb)) {
+                LLVMValueRef in;
+                for (in = LLVMGetFirstInstruction(bb); in;
+                     in = LLVMGetNextInstruction(in)) insts++;
+            }
+            for (d = 0; d <= LLVM_STREAM_DEPTH_CAP; d++)
+                ce->body_hist[d] = 0;
+            ce->body_hist[0] = insts ? insts : 1;
+            ce->body_loopfree = FALSE;  /* unmeasured: don't trust it */
+        }
+        ce->body_hist_valid = TRUE;
+        LLVMDisposeModule(clone);
     }
-    LLVMDisposeModule(clone);
-    if (ce->body_cost <= 0) ce->body_cost = 1;
-    return ce->body_cost;
+    for (d = 0; d <= LLVM_STREAM_DEPTH_CAP; d++)
+        charge += (long long)ce->body_hist[d]
+            * inline_site_weight(site_depth + d);
+    return charge > 0 ? charge : 1;
 }
 
 static int process_direct_routine(void)
@@ -2003,8 +2028,6 @@ static int process_direct_routine(void)
     int insts_in = 0, insts_out = 0;
 
     const char *stage = NULL;
-    LLVMModuleRef inl;
-    LLVMValueRef inl_fn;
     int stream_ready = 0;
 
     if (LLVMVerifyModule(direct_ru.mod, LLVMReturnStatusAction, &errmsg)) {
@@ -2015,81 +2038,210 @@ static int process_direct_routine(void)
     LLVMDisposeMessage(errmsg);
     dump_module(direct_ru.mod, "direct-pre-opt");
 
-    /* Inlining, gated on profitability: lower the un-inlined baseline and
-       the inlined form on throwaway clones and keep whichever the
-       loop-weighted estimate scores cheaper. The un-inlined total charges
-       each rewritten site with what its call would have cost anyway (the
-       callee's standalone lowered cost, weighted by the site's loop
-       depth); the inlined form carries those bodies in situ. This both
-       preserves the revert-on-fallback guard (an inlined form that fails
-       to lower reverts) and rejects inlinings that pessimize the caller,
-       which unconditional acceptance measurably did (Life). */
+    /* Inlining, gated per site on profitability. Candidate sites are
+       discovered once on the pristine module and then tried greedily,
+       hottest (deepest-loop) first: each trial clones the pristine
+       module, splices in the accepted set plus the candidate, and lowers
+       for real. A site is kept only if the resulting form's residual --
+       its loop-weighted lowered cost minus a charge for every inlined
+       site (the callee's standalone lowered cost at the site's weight,
+       i.e. what the call would have cost anyway) -- beats the best form
+       so far, starting from the un-inlined baseline. A site whose trial
+       fails to lower or scores worse is dropped individually, so one bad
+       site neither rejects a caller's good sites nor hides behind them;
+       the old revert-on-fallback guard is subsumed. */
     if (direct_lowering_retained && inlining_enabled()) {
         inline_site sites[INLINE_MAX_SITES];
-        int nsites = 0;
-        void *base_snap = NULL;
-        int base_n = 0, base_locals = 0, base_ok = 0;
-        int b_in = 0, b_out = 0;
-        long long ucost = 0, icost = 0, budget = 0;
+        inline_site scratch[INLINE_MAX_SITES];
+        unsigned char selected[INLINE_MAX_SITES];
+        int order[INLINE_MAX_SITES];
+        long long charge[INLINE_MAX_SITES];
+        int ncand = 0, nacc = 0;
+        void *best_snap = NULL;
+        int best_n = 0, best_locals = 0, best_in = 0, best_out = 0;
+        int base_ok = 0;
+        long long r_best = 0, acc_charge = 0;
+        int i, k;
+
+        memset(selected, 0, sizeof selected);
 
         {   LLVMModuleRef base = LLVMCloneModule(direct_ru.mod);
             LLVMValueRef base_fn =
                 LLVMGetNamedFunction(base, LLVMGetValueName(direct_ru.fn));
             base_ok = base_fn && try_optimize_and_lower(base, base_fn,
-                &stage, &why, &b_in, &b_out);
+                &stage, &why, &best_in, &best_out);
             if (base_ok) {
-                ucost = llvm_stream_weighted_cost();
-                base_snap = llvm_stream_snapshot(&base_n);
-                base_locals = llvm_last_patched_locals();
+                r_best = llvm_stream_weighted_cost();
+                best_snap = llvm_stream_snapshot(&best_n);
+                best_locals = llvm_last_patched_locals();
             }
             LLVMDisposeModule(base);
         }
 
-        inl = LLVMCloneModule(direct_ru.mod);
-        inl_fn = LLVMGetNamedFunction(inl, LLVMGetValueName(direct_ru.fn));
-        if (inl_fn)
-            nsites = inline_direct_calls(inl, inl_fn,
-                direct_ru.routine_symbol, sites);
-        if (nsites > 0) {
-            int i;
-            budget = ucost;
-            for (i = 0; i < nsites; i++)
-                budget += (long long)inline_site_weight(sites[i].depth)
-                    * retained_body_cost(sites[i].ce);
-            if (try_optimize_and_lower(inl, inl_fn, &stage, &why,
-                    &insts_in, &insts_out)) {
-                int accept;
-                icost = llvm_stream_weighted_cost();
-                accept = !base_ok || icost < budget;
-                if (llvm_diagnostics_enabled())
-                    printf("LLVM: inline gate %s: sites=%d inlined=%lld "
-                        "un-inlined+calls=%lld -> %s\n",
-                        llvm_current_routine_name(), nsites, icost, budget,
-                        accept ? "inlined" : "reverted");
-                if (!accept) {
-                    llvm_stream_restore(base_snap, base_n);
-                    if (!llvm_patch_routine_locals(base_locals))
-                        compiler_error(
-                            "inline gate could not re-patch header");
-                    insts_in = b_in;
-                    insts_out = b_out;
+        /* Candidate discovery on the pristine module: nothing is
+           selected, so nothing is rewritten or linked into it. */
+        inline_direct_calls(direct_ru.mod, direct_ru.fn,
+            direct_ru.routine_symbol, sites, &ncand, selected);
+
+        /* Re-derive each candidate's depth from the baseline lowered
+           stream (which the buffer still holds), matching @callf* sites
+           to IR candidates by callee and per-callee ordinal. The charge
+           side must use the same depth model that scores the inlined
+           form; IR-layout depth measurably disagrees with it and the
+           mismatch manufactures large phantom wins. Unmatched candidates
+           keep their IR depth. */
+        if (ncand > 0 && base_ok) {
+            llvm_call_site_info scs[INLINE_MAX_SITES];
+            int nsc = llvm_stream_call_sites(scs, INLINE_MAX_SITES);
+            int j;
+            for (i = 0; i < ncand; i++) {
+                int want = sites[i].ce->routine_symbol;
+                int ordinal = 0, seen = 0;
+                for (j = 0; j < i; j++)
+                    if (sites[j].ce->routine_symbol == want) ordinal++;
+                for (j = 0; j < nsc; j++) {
+                    int sym = (scs[j].marker == VROUTINE_MV)
+                        ? veneer_symbol_for_index(scs[j].value)
+                        : scs[j].symindex;
+                    if (sym != want) continue;
+                    if (seen++ == ordinal) {
+                        sites[i].depth = scs[j].depth;
+                        break;
+                    }
                 }
-                stream_ready = 1;
             }
         }
-        LLVMDisposeModule(inl);
+
+        if (ncand > 0 && base_ok) {
+            long long base_cost = r_best;
+            /* Estimation noise floor: a site must beat the best form by
+               more than this to be kept, so near-zero "wins" (which
+               measurably regress as often as not) are rejected. */
+            long long margin = base_cost / 128 + 1;
+            int ntry = 0;
+            /* Per-site charge. (Measuring a callee body clobbers the
+               event buffer; the baseline is already snapshotted.) Only
+               sites whose callee's lowered body is loop-free are tried:
+               a loopy body's true cost is dominated by iteration counts
+               the static estimator guesses at (8 per level), and its
+               error there measurably swamps the real per-call signal.
+               Loop-free bodies cost what they count. */
+            for (i = 0; i < ncand; i++) {
+                charge[i] = inline_site_charge(sites[i].ce,
+                    sites[i].depth);
+                if (sites[i].ce->body_loopfree) order[ntry++] = i;
+            }
+            /* Deepest-loop sites first; cheaper bodies first among
+               equals (small helpers fold best); same-callee sites kept
+               adjacent so the group loop below sees them as one unit. */
+            for (i = 1; i < ntry; i++) {
+                int o = order[i], j = i;
+                while (j > 0) {
+                    int p = order[j-1];
+                    if (sites[p].depth > sites[o].depth) break;
+                    if (sites[p].depth == sites[o].depth) {
+                        if (charge[p] < charge[o]) break;
+                        if (charge[p] == charge[o]
+                            && sites[p].ce->routine_symbol
+                                <= sites[o].ce->routine_symbol) break;
+                    }
+                    order[j] = order[j-1];
+                    j--;
+                }
+                order[j] = o;
+            }
+
+            /* One greedy trial per (callee, depth) group: sites of the
+               same callee at the same depth are symmetric, and deciding
+               them together keeps the trial count (each trial is a full
+               lowering of the caller) proportional to distinct callees
+               rather than raw call sites. The sort above makes groups
+               adjacent in order[]. */
+            for (k = 0; k < ntry; ) {
+                int gsize = 1;
+                long long gcharge = charge[order[k]];
+                LLVMModuleRef trial;
+                LLVMValueRef trial_fn;
+                int did = 0, nc2, t_in = 0, t_out = 0;
+                int keep = 0, g;
+                while (k + gsize < ntry
+                    && sites[order[k + gsize]].ce == sites[order[k]].ce
+                    && sites[order[k + gsize]].depth
+                        == sites[order[k]].depth) {
+                    gcharge += charge[order[k + gsize]];
+                    gsize++;
+                }
+                for (g = 0; g < gsize; g++) selected[order[k + g]] = 1;
+                trial = LLVMCloneModule(direct_ru.mod);
+                trial_fn = LLVMGetNamedFunction(trial,
+                    LLVMGetValueName(direct_ru.fn));
+                if (trial_fn)
+                    did = inline_direct_calls(trial, trial_fn,
+                        direct_ru.routine_symbol, scratch, &nc2, selected);
+                if (did == nacc + gsize
+                    && try_optimize_and_lower(trial, trial_fn, &stage, &why,
+                           &t_in, &t_out)) {
+                    long long r = llvm_stream_weighted_cost()
+                        - (acc_charge + gcharge);
+                    keep = r + margin <= r_best;
+                    if (llvm_diagnostics_enabled())
+                        printf("LLVM: inline site %s <- %s: depth=%d "
+                            "sites=%d residual=%lld best=%lld -> %s\n",
+                            llvm_current_routine_name(),
+                            symbols[sites[order[k]].ce->routine_symbol].name,
+                            sites[order[k]].depth, gsize, r, r_best,
+                            keep ? "kept" : "rejected");
+                    if (keep) {
+                        r_best = r;
+                        acc_charge += gcharge;
+                        free(best_snap);
+                        best_snap = llvm_stream_snapshot(&best_n);
+                        best_locals = llvm_last_patched_locals();
+                        best_in = t_in;
+                        best_out = t_out;
+                        nacc += gsize;
+                    }
+                }
+                if (!keep)
+                    for (g = 0; g < gsize; g++) selected[order[k + g]] = 0;
+                LLVMDisposeModule(trial);
+                k += gsize;
+            }
+            if (llvm_diagnostics_enabled())
+                printf("LLVM: inline gate %s: candidates=%d tried=%d "
+                    "accepted=%d residual=%lld baseline=%lld\n",
+                    llvm_current_routine_name(), ncand, ntry, nacc, r_best,
+                    base_cost);
+        }
+        else if (ncand > 0 && !base_ok) {
+            /* No baseline to compare against (the un-inlined form is
+               already known not to lower): take the fully inlined form
+               if it lowers. */
+            LLVMModuleRef trial = LLVMCloneModule(direct_ru.mod);
+            LLVMValueRef trial_fn = LLVMGetNamedFunction(trial,
+                LLVMGetValueName(direct_ru.fn));
+            int nc2;
+            if (trial_fn
+                && inline_direct_calls(trial, trial_fn,
+                       direct_ru.routine_symbol, scratch, &nc2, NULL) > 0
+                && try_optimize_and_lower(trial, trial_fn, &stage, &why,
+                       &insts_in, &insts_out))
+                stream_ready = 1;
+            LLVMDisposeModule(trial);
+        }
 
         if (!stream_ready && base_ok) {
-            /* No eligible sites, or the inlined form failed to lower:
-               use the baseline already lowered above. */
-            llvm_stream_restore(base_snap, base_n);
-            if (!llvm_patch_routine_locals(base_locals))
+            /* Put the winning stream (possibly the untouched baseline)
+               back in the buffer and re-patch its header; measurement
+               lowerings clobbered both. */
+            llvm_stream_restore(best_snap, best_n);
+            if (!llvm_patch_routine_locals(best_locals))
                 compiler_error("inline gate could not re-patch header");
-            insts_in = b_in;
-            insts_out = b_out;
+            insts_in = best_in;
+            insts_out = best_out;
             stream_ready = 1;
         }
-        free(base_snap);
+        free(best_snap);
     }
 
     if (!stream_ready) {

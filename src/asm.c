@@ -1357,21 +1357,21 @@ extern int llvm_patch_routine_locals(int newcount)
    the kept one. Events are POD (ai.text is nulled at capture), so a
    snapshot is a plain copy. */
 
-#define STREAM_LOOP_WEIGHT 8
-#define STREAM_LOOP_DEPTH_CAP 3
-
-extern int32 llvm_stream_weighted_cost(void)
+/* Per-event capped loop depth for the buffer, malloc'd (caller frees);
+   NULL for an empty buffer. A branch to an already-defined label closes
+   a loop over [target, branch]; overlap count approximates nesting. */
+static int *stream_event_depths(void)
 {
     int32 *labelpos;
-    int   *delta;
+    int   *delta, *depths;
     int i, k, depth;
-    int32 cost = 0;
 
-    if (cur_emit.event_count == 0) return 0;
+    if (cur_emit.event_count == 0) return NULL;
     labelpos = malloc((size_t)(next_label > 0 ? next_label : 1)
         * sizeof(int32));
     delta = calloc((size_t)cur_emit.event_count + 1, sizeof(int));
-    if (!labelpos || !delta)
+    depths = malloc((size_t)cur_emit.event_count * sizeof(int));
+    if (!labelpos || !delta || !depths)
         fatalerror("Out of memory weighing lowered stream");
     for (i = 0; i < next_label; i++) labelpos[i] = -1;
     for (i = 0; i < cur_emit.event_count; i++) {
@@ -1379,8 +1379,6 @@ extern int32 llvm_stream_weighted_cost(void)
         if (ev->is_label && ev->label >= 0 && ev->label < next_label)
             labelpos[ev->label] = i;
     }
-    /* A branch to an already-defined label closes a loop over
-       [target, branch]; overlap count approximates nesting depth. */
     for (i = 0; i < cur_emit.event_count; i++) {
         llvm_event *ev = &cur_emit.events[i];
         if (ev->is_label) continue;
@@ -1396,16 +1394,84 @@ extern int32 llvm_stream_weighted_cost(void)
     }
     depth = 0;
     for (i = 0; i < cur_emit.event_count; i++) {
-        int d, w;
         depth += delta[i];
-        if (cur_emit.events[i].is_label) continue;
-        d = depth;
-        if (d > STREAM_LOOP_DEPTH_CAP) d = STREAM_LOOP_DEPTH_CAP;
-        for (w = 1; d > 0; d--) w *= STREAM_LOOP_WEIGHT;
-        cost += w;
+        depths[i] = (depth > LLVM_STREAM_DEPTH_CAP)
+            ? LLVM_STREAM_DEPTH_CAP : depth;
     }
     free(labelpos);
     free(delta);
+    return depths;
+}
+
+/* Bin the buffer's instructions by capped loop depth. Weighted cost and
+   the inline gate's charge model both derive from these bins, so the
+   depth cap applies identically to an inlined body and to the charge
+   for leaving the call in place. */
+extern void llvm_stream_depth_histogram(int32 bins[LLVM_STREAM_DEPTH_CAP + 1])
+{
+    int *depths;
+    int i;
+
+    for (i = 0; i <= LLVM_STREAM_DEPTH_CAP; i++) bins[i] = 0;
+    depths = stream_event_depths();
+    if (!depths) return;
+    for (i = 0; i < cur_emit.event_count; i++)
+        if (!cur_emit.events[i].is_label)
+            bins[depths[i]]++;
+    free(depths);
+}
+
+/* The buffer's direct routine calls (@callf*) whose target operand
+   carries a routine marker, in stream order with their loop depths. The
+   gate matches these against IR-level candidates so the charge for
+   leaving a call in place is weighted by the same depth model that
+   scores the inlined form. */
+extern int llvm_stream_call_sites(llvm_call_site_info *out, int max)
+{
+    static int32 call_ops[4];
+    static int call_ops_resolved = FALSE;
+    int *depths;
+    int i, k, n = 0;
+
+    if (!call_ops_resolved) {
+        call_ops[0] = glulx_opcode_by_name("callf");
+        call_ops[1] = glulx_opcode_by_name("callfi");
+        call_ops[2] = glulx_opcode_by_name("callfii");
+        call_ops[3] = glulx_opcode_by_name("callfiii");
+        call_ops_resolved = TRUE;
+    }
+    depths = stream_event_depths();
+    if (!depths) return 0;
+    for (i = 0; i < cur_emit.event_count && n < max; i++) {
+        llvm_event *ev = &cur_emit.events[i];
+        assembly_operand *op;
+        int is_call = FALSE;
+        if (ev->is_label || ev->ai.operand_count < 1) continue;
+        for (k = 0; k < 4; k++)
+            if (ev->ai.internal_number == call_ops[k]) is_call = TRUE;
+        if (!is_call) continue;
+        op = &ev->ai.operand[0];
+        if (op->marker != SYMBOL_MV && op->marker != IROUTINE_MV
+            && op->marker != VROUTINE_MV) continue;
+        out[n].marker = op->marker;
+        out[n].value = op->value;
+        out[n].symindex = op->symindex;
+        out[n].depth = depths[i];
+        n++;
+    }
+    free(depths);
+    return n;
+}
+
+extern int32 llvm_stream_weighted_cost(void)
+{
+    int32 bins[LLVM_STREAM_DEPTH_CAP + 1];
+    int32 cost = 0;
+    int d, w;
+    llvm_stream_depth_histogram(bins);
+    for (d = 0, w = 1; d <= LLVM_STREAM_DEPTH_CAP;
+         d++, w *= LLVM_STREAM_LOOP_WEIGHT)
+        cost += bins[d] * w;
     return cost;
 }
 

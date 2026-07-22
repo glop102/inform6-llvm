@@ -2265,7 +2265,20 @@ extern int   llvm_pipeline_routine(void);
 extern int   llvm_retain_direct_routine(int routine_symbol);
 extern int   llvm_lower_retained_routine(int handle);
 extern int   llvm_inlining_enabled(void);
+/* Loop weighting shared by the inline gate's cost model: instructions
+   count 8^depth, with depth capped so weights stay bounded. */
+#define LLVM_STREAM_LOOP_WEIGHT 8
+#define LLVM_STREAM_DEPTH_CAP   3
 extern int32 llvm_stream_weighted_cost(void);
+extern void  llvm_stream_depth_histogram(int32 bins[LLVM_STREAM_DEPTH_CAP + 1]);
+/* A @callf* instruction in the buffer whose target operand carries a
+   routine marker, with its capped loop depth measured by the same
+   backward-branch model as the weighted cost. */
+typedef struct llvm_call_site_info_s {
+    int32 marker, value, symindex;
+    int   depth;
+} llvm_call_site_info;
+extern int   llvm_stream_call_sites(llvm_call_site_info *out, int max);
 extern void *llvm_stream_snapshot(int *count_out);
 extern void  llvm_stream_restore(void *snap, int count);
 extern int   llvm_last_patched_locals(void);
