@@ -108,6 +108,8 @@ typedef struct routine_unit_s {
     int            spilled;      /* values our code left on the real stack */
     int32          assigned_pc;  /* reserved: Phase 1 end-of-pass address  */
     int            routine_symbol; /* which routine this is (for inlining)  */
+    int32          body_cost;    /* cached standalone lowered weighted cost
+                                    (inline gate); <=0 means uncached      */
 } routine_unit;
 
 /* The one routine currently being built. */
@@ -1688,9 +1690,58 @@ static void direct_fallback(const char *stage, const char *detail)
 
 #define INLINE_MAX_BLOCKS 16
 #define INLINE_MAX_INSTS  70
+#define INLINE_MAX_SITES  128
+#define INLINE_LOOP_WEIGHT 8
+#define INLINE_DEPTH_CAP   3
 
 static const char *const inline_call_names[4] =
     { "i6.callf", "i6.callfi", "i6.callfii", "i6.callfiii" };
+
+/* One rewritten call site, reported back to the profitability gate: the
+   callee's retained unit and the site's loop depth in the caller. */
+typedef struct inline_site_s {
+    routine_unit *ce;
+    int depth;
+} inline_site;
+
+static int inline_site_weight(int depth)
+{   int w = 1;
+    if (depth > INLINE_DEPTH_CAP) depth = INLINE_DEPTH_CAP;
+    for (; depth > 0; depth--) w *= INLINE_LOOP_WEIGHT;
+    return w;
+}
+
+static int ir_block_index(LLVMBasicBlockRef *blocks, int n,
+    LLVMBasicBlockRef b)
+{   int i;
+    for (i = 0; i < n; i++) if (blocks[i] == b) return i;
+    return -1;
+}
+
+/* Loop depth per basic block, approximated from layout order: an edge to
+   an earlier (or the same) block closes a loop over that block range, and
+   the number of such ranges covering a block is its depth. */
+static void ir_block_depths(LLVMBasicBlockRef *blocks, int *depths,
+    int nblocks)
+{
+    int *delta = calloc((size_t)nblocks + 1, sizeof(int));
+    int i, d;
+    if (!delta) fatalerror("Out of memory computing block loop depths");
+    for (i = 0; i < nblocks; i++) {
+        LLVMValueRef term = LLVMGetBasicBlockTerminator(blocks[i]);
+        unsigned ns, s;
+        if (!term) continue;
+        ns = LLVMGetNumSuccessors(term);
+        for (s = 0; s < ns; s++) {
+            int k = ir_block_index(blocks, nblocks,
+                LLVMGetSuccessor(term, s));
+            if (k >= 0 && k <= i) { delta[k]++; delta[i + 1]--; }
+        }
+    }
+    d = 0;
+    for (i = 0; i < nblocks; i++) { d += delta[i]; depths[i] = d; }
+    free(delta);
+}
 
 static routine_unit *retained_for_symbol(int symindex);  /* defined below */
 
@@ -1730,22 +1781,38 @@ static int fn_within_size(LLVMValueRef fn, int max_blocks, int max_insts)
 }
 
 static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
-    int caller_symbol)
+    int caller_symbol, inline_site *sites_out)
 {
     LLVMBasicBlockRef bb;
-    LLVMValueRef calls[128];
-    int callee_sym[128];
-    int arity[128];
+    LLVMValueRef calls[INLINE_MAX_SITES];
+    int callee_sym[INLINE_MAX_SITES];
+    int arity[INLINE_MAX_SITES];
+    int depth_of[INLINE_MAX_SITES];
     int ncalls = 0, i, did = 0;
     LLVMBuilderRef bld;
+    LLVMBasicBlockRef *blocks;
+    int *bdepths, nblocks = 0, bidx;
 
     if (!inlining_enabled()) return 0;
 
+    /* Loop depths per block, for the gate's site weights. */
+    for (bb = LLVMGetFirstBasicBlock(caller_fn); bb;
+         bb = LLVMGetNextBasicBlock(bb)) nblocks++;
+    blocks = malloc((size_t)(nblocks > 0 ? nblocks : 1) * sizeof *blocks);
+    bdepths = malloc((size_t)(nblocks > 0 ? nblocks : 1) * sizeof *bdepths);
+    if (!blocks || !bdepths)
+        fatalerror("Out of memory collecting inline sites");
+    for (bb = LLVMGetFirstBasicBlock(caller_fn), i = 0; bb;
+         bb = LLVMGetNextBasicBlock(bb)) blocks[i++] = bb;
+    ir_block_depths(blocks, bdepths, nblocks);
+
     /* Collect eligible i6.callf* (0..3 arg) calls to a retained direct
        routine other than ourselves whose body is within the size caps. */
+    bidx = -1;
     for (bb = LLVMGetFirstBasicBlock(caller_fn); bb;
          bb = LLVMGetNextBasicBlock(bb)) {
         LLVMValueRef in;
+        bidx++;
         for (in = LLVMGetFirstInstruction(bb); in;
              in = LLVMGetNextInstruction(in)) {
             int n;
@@ -1773,18 +1840,21 @@ static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
                 else break;
                 if (callee_symbol < 0 || callee_symbol == caller_symbol) break;
                 ce = retained_for_symbol(callee_symbol);
-                if (ce && ce->mod && ce->fn && ncalls < 128
+                if (ce && ce->mod && ce->fn && ncalls < INLINE_MAX_SITES
                     && fn_within_size(ce->fn, INLINE_MAX_BLOCKS,
                         INLINE_MAX_INSTS)) {
                     calls[ncalls] = in;
                     callee_sym[ncalls] = callee_symbol;
                     arity[ncalls] = n;
+                    depth_of[ncalls] = bdepths[bidx];
                     ncalls++;
                 }
                 break;
             }
         }
     }
+    free(blocks);
+    free(bdepths);
     if (ncalls == 0) return 0;
 
     bld = LLVMCreateBuilderInContext(llctx);
@@ -1830,6 +1900,8 @@ static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
         real = LLVMBuildCall2(bld, fty, target, args, nparams, "inl");
         LLVMReplaceAllUsesWith(calls[i], real);
         LLVMInstructionEraseFromParent(calls[i]);
+        sites_out[did].ce = ce;
+        sites_out[did].depth = depth_of[i];
         did++;
     }
     LLVMDisposeBuilder(bld);
@@ -1878,6 +1950,52 @@ static int try_optimize_and_lower(LLVMModuleRef mod, LLVMValueRef fn,
     return TRUE;
 }
 
+/* The callee's standalone lowered cost (loop-weighted), the gate's
+   "what the calls would have cost anyway" term. Measured once by
+   lowering a clone (the retained module stays pristine) and cached in
+   the retained unit. Clobbers the working event buffer -- the gate
+   computes these before lowering the form it intends to keep. Falls
+   back to the pre-optimization instruction count if the measurement
+   lowering fails. */
+static int32 retained_body_cost(routine_unit *ce)
+{
+    LLVMModuleRef clone;
+    LLVMValueRef cfn;
+    const char *stage, *why;
+    int in_c, out_c;
+
+    if (ce->body_cost > 0) return ce->body_cost;
+    clone = LLVMCloneModule(ce->mod);
+    cfn = LLVMGetNamedFunction(clone, LLVMGetValueName(ce->fn));
+    if (cfn) {
+        /* The lowerer checks the routine-being-emitted invariant
+           params == no_locals; satisfy it with the callee's own count
+           for the measurement, then restore the caller's. */
+        int saved_locals = no_locals;
+        int lowered;
+        no_locals = (int)LLVMCountParams(ce->fn);
+        lowered = try_optimize_and_lower(clone, cfn, &stage, &why,
+            &in_c, &out_c);
+        no_locals = saved_locals;
+        if (lowered)
+            ce->body_cost = llvm_stream_weighted_cost();
+    }
+    if (ce->body_cost <= 0) {
+        LLVMBasicBlockRef bb;
+        int insts = 0;
+        for (bb = LLVMGetFirstBasicBlock(ce->fn); bb;
+             bb = LLVMGetNextBasicBlock(bb)) {
+            LLVMValueRef in;
+            for (in = LLVMGetFirstInstruction(bb); in;
+                 in = LLVMGetNextInstruction(in)) insts++;
+        }
+        ce->body_cost = insts;
+    }
+    LLVMDisposeModule(clone);
+    if (ce->body_cost <= 0) ce->body_cost = 1;
+    return ce->body_cost;
+}
+
 static int process_direct_routine(void)
 {
     char *errmsg = NULL;
@@ -1887,7 +2005,7 @@ static int process_direct_routine(void)
     const char *stage = NULL;
     LLVMModuleRef inl;
     LLVMValueRef inl_fn;
-    int inlined_ok = 0;
+    int stream_ready = 0;
 
     if (LLVMVerifyModule(direct_ru.mod, LLVMReturnStatusAction, &errmsg)) {
         direct_fallback("direct-verify", errmsg ? errmsg : "verification failed");
@@ -1897,22 +2015,84 @@ static int process_direct_routine(void)
     LLVMDisposeMessage(errmsg);
     dump_module(direct_ru.mod, "direct-pre-opt");
 
-    /* Try inlining on a throwaway clone: if the inlined form optimizes and
-       lowers, use it; otherwise fall back to the un-inlined module, so
-       inlining can never make a routine worse than it already was (e.g. by
-       bloating a hot caller past a lowerer limit into a classic fallback). */
+    /* Inlining, gated on profitability: lower the un-inlined baseline and
+       the inlined form on throwaway clones and keep whichever the
+       loop-weighted estimate scores cheaper. The un-inlined total charges
+       each rewritten site with what its call would have cost anyway (the
+       callee's standalone lowered cost, weighted by the site's loop
+       depth); the inlined form carries those bodies in situ. This both
+       preserves the revert-on-fallback guard (an inlined form that fails
+       to lower reverts) and rejects inlinings that pessimize the caller,
+       which unconditional acceptance measurably did (Life). */
     if (direct_lowering_retained && inlining_enabled()) {
+        inline_site sites[INLINE_MAX_SITES];
+        int nsites = 0;
+        void *base_snap = NULL;
+        int base_n = 0, base_locals = 0, base_ok = 0;
+        int b_in = 0, b_out = 0;
+        long long ucost = 0, icost = 0, budget = 0;
+
+        {   LLVMModuleRef base = LLVMCloneModule(direct_ru.mod);
+            LLVMValueRef base_fn =
+                LLVMGetNamedFunction(base, LLVMGetValueName(direct_ru.fn));
+            base_ok = base_fn && try_optimize_and_lower(base, base_fn,
+                &stage, &why, &b_in, &b_out);
+            if (base_ok) {
+                ucost = llvm_stream_weighted_cost();
+                base_snap = llvm_stream_snapshot(&base_n);
+                base_locals = llvm_last_patched_locals();
+            }
+            LLVMDisposeModule(base);
+        }
+
         inl = LLVMCloneModule(direct_ru.mod);
         inl_fn = LLVMGetNamedFunction(inl, LLVMGetValueName(direct_ru.fn));
-        if (inl_fn
-            && inline_direct_calls(inl, inl_fn, direct_ru.routine_symbol) > 0
-            && try_optimize_and_lower(inl, inl_fn, &stage, &why,
-                   &insts_in, &insts_out))
-            inlined_ok = 1;
+        if (inl_fn)
+            nsites = inline_direct_calls(inl, inl_fn,
+                direct_ru.routine_symbol, sites);
+        if (nsites > 0) {
+            int i;
+            budget = ucost;
+            for (i = 0; i < nsites; i++)
+                budget += (long long)inline_site_weight(sites[i].depth)
+                    * retained_body_cost(sites[i].ce);
+            if (try_optimize_and_lower(inl, inl_fn, &stage, &why,
+                    &insts_in, &insts_out)) {
+                int accept;
+                icost = llvm_stream_weighted_cost();
+                accept = !base_ok || icost < budget;
+                if (llvm_diagnostics_enabled())
+                    printf("LLVM: inline gate %s: sites=%d inlined=%lld "
+                        "un-inlined+calls=%lld -> %s\n",
+                        llvm_current_routine_name(), nsites, icost, budget,
+                        accept ? "inlined" : "reverted");
+                if (!accept) {
+                    llvm_stream_restore(base_snap, base_n);
+                    if (!llvm_patch_routine_locals(base_locals))
+                        compiler_error(
+                            "inline gate could not re-patch header");
+                    insts_in = b_in;
+                    insts_out = b_out;
+                }
+                stream_ready = 1;
+            }
+        }
         LLVMDisposeModule(inl);
+
+        if (!stream_ready && base_ok) {
+            /* No eligible sites, or the inlined form failed to lower:
+               use the baseline already lowered above. */
+            llvm_stream_restore(base_snap, base_n);
+            if (!llvm_patch_routine_locals(base_locals))
+                compiler_error("inline gate could not re-patch header");
+            insts_in = b_in;
+            insts_out = b_out;
+            stream_ready = 1;
+        }
+        free(base_snap);
     }
 
-    if (!inlined_ok) {
+    if (!stream_ready) {
         int ok;
         if (direct_lowering_retained && inlining_enabled()) {
             /* The retained module is the snapshot other routines inline;

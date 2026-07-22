@@ -139,11 +139,12 @@ follows is the still-open work.
 - Byte-identical output with inlining off, master vs branch, across the
   full story corpus in both `$LLVM=0` and `$LLVM=4`, from a clean
   worktree baseline. All nine test gates pass.
-- Cloak with inlining on: 153,588 → 144,344 dispatches (−6.02%),
-  transcript identical, no routine changes backend. (Measured against
-  the deterministic pre-optimization inline snapshot; the audit's
-  −6.30% was under the earlier order-dependent snapshot.)
-  Microbenchmark (helper called 1,000× in a loop): −28.5%.
+- Cloak with inlining on (gated): 153,588 → 144,636 dispatches (−5.83%),
+  transcript identical, no routine changes backend; Life is exactly its
+  inline-off count (the pre-gate +1,634 regression is gone). The
+  ungated form measured −6.02% on cloak, so the gate costs 0.2pp there
+  while eliminating the regression class. Microbenchmark (helper called
+  1,000× in a loop): −28.5%.
 - The revert-on-fallback guard is implemented and works: inlining runs on
   a throwaway clone and the un-inlined module lowers instead if the
   inlined form fails to optimize or lower. Measured essential: without
@@ -175,21 +176,27 @@ corpus" held anyway. Any further emission-order work should hunt for the
 same class: reads of `symbols[].value` or pc-derived values between
 parse and end-of-pass.
 
+### The profitability gate (implemented)
+
+Every inline decision now compares two real lowerings on throwaway
+clones: the un-inlined baseline and the inlined form. Each lowered
+stream gets a loop-weighted cost (instructions weighted 8^depth, depth
+capped at 3, inferred from backward branches); the inlined form is kept
+only if it scores below the baseline *plus* what the rewritten calls
+would have cost anyway (each callee's standalone lowered cost — measured
+once and cached per retained unit — weighted by the site's loop depth in
+the caller's IR CFG). Rejection restores the baseline stream and
+re-patches the header; the lower-failure revert guard is subsumed.
+`I6_LLVM_DIAGNOSTICS=1` prints one `LLVM: inline gate` line per
+candidate caller with both scores and the decision (on Life it keeps
+`DrawFull`/`DrawDiff`/`Main` and reverts the hot `Stir`, which is the
+routine that caused the pre-gate regression). Costs: gated compile time
+on glulxercise is ~0.8 s inline-on (three lowerings per candidate
+caller); cloak story size is +27% gated vs +31% ungated — size growth
+is bounded only by the estimate today and remains a tuning knob.
+
 ### Design gaps in the inlining prototype
 
-- **The profitability gate is not implemented — only the lower-failure
-  revert exists.** The inlined form is used unconditionally whenever it
-  lowers (`process_direct_routine`); nothing compares it against the
-  un-inlined lowering, and there is no heat ranking. Measured
-  consequences: on cloak 264 routines get strictly larger static output
-  (+8,718 instructions; 11 shrink), stories grow +32-42%
-  (cloak 152,576 → 201,216 bytes), and **Life regresses** by +1,634
-  dispatches because cold sites inline as eagerly as hot ones. The
-  needed gate, unchanged from the original design: rank candidate sites
-  by measured `calls × per-call overhead` from dynamic attribution,
-  estimate post-inline cost from CFG/loop structure, and keep the
-  pre-inline form when the estimate regresses. Default-on is
-  unjustifiable before this exists.
 - **The same callee is cloned + linked once per call site**
   (`i6.inl.<caller>.<i>`), not once per caller; compile time with
   inlining on is ~4× (glulxercise 0.13 s → 0.55 s). Cache one clone per
@@ -252,10 +259,15 @@ parse and end-of-pass.
 
 ### Remaining inlining work
 
-- Tune `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS` (currently 16/70 on
-  pre-optimization IR — a crude proxy) *after* the profitability gate
-  exists; decide default-on only on cross-corpus evidence (cloak −6.02%,
-  Life must not regress, size growth bounded).
+- Tune the gate and caps: `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS`
+  (currently 16/70 on pre-optimization IR — a crude proxy), the loop
+  weight/depth cap, and a size-growth term (the gate bounds dynamic
+  regressions but story size is still +27% on cloak). Per-site
+  selection is a known refinement: the gate is all-or-nothing per
+  caller, so one pessimizing site rejects a caller's good sites (a
+  warm-sites-only retry is the natural next step). Decide default-on
+  only on cross-corpus evidence (cloak −5.83%, Life exactly neutral,
+  Advent unmeasured, size growth bounded).
 - Phase 3 landing: inline `Z__Region` and hot siblings by default, pin
   the new cloak baseline in `tests/corpusTest.nix`.
 - Focused fixtures: a hot-loop helper that must inline (assert the
@@ -269,15 +281,17 @@ parse and end-of-pass.
   bisection.
 - Track the deferred-model costs as first-class benchmark outputs: peak
   compiler RSS and compile time (current data on glulxercise: RSS
-  49.9 eager / 53.1 inline-off / 61 MB inline-on; compile time ~0.2 s
-  inline-off, ~0.5 s inline-on) on the largest corpus game.
+  49.9 eager / 53.1 inline-off / 62 MB inline-on; compile time ~0.2 s
+  inline-off, ~0.8 s inline-on gated) on the largest corpus game.
 - Open design question: transitive inlining (flatten at snapshot vs
   caller time, depth budget vs recursion guard).
 
 ### Recommended fix order for the branch
 
 1. Clear the open secondary defects above (all minor).
-2. Then, and only then, build the profitability gate and re-tune.
+2. Tune the gate (size term, per-site retry, caps) on cross-corpus
+   measurements, including Advent; then decide default-on and pin
+   baselines.
 
 ## Open Correctness Work
 
@@ -326,16 +340,18 @@ parse and end-of-pass.
 
 ## Profitability Model
 
-Successfully lowered routines replace the shadow stream unconditionally,
-and (on the branch) successfully lowered *inlined* forms replace the
-un-inlined form unconditionally. A blanket static-count rule would be
-wrong — cold static growth can buy hot dynamic wins — so the needed model
-estimates cost from CFG loop structure, pathwise-safe rules, and measured
-target instruction costs (no PGO). The retained shadow (and the retained
-un-inlined module) are the ready-made fallbacks when an estimate
-regresses. Until the model exists, focused instruction-count tests are
-the protection that keeps LLVM upgrades and lowerer refactors from
-silently spending IR-level gains on VM dispatches.
+Successfully lowered routines replace the shadow stream unconditionally.
+Inline acceptance is now conditional on the branch's loop-weighted
+estimate (see the profitability gate above), which is the first working
+instance of the model this section calls for: cost from loop structure
+and measured lowered streams, no PGO, with the retained un-inlined form
+as the ready-made fallback. Still open is applying the same idea to
+*routine replacement* — a direct lowering that estimates worse than the
+shadow stream still replaces it unconditionally — and refining the
+weights with measured per-opcode/operand-mode costs. Until then, focused
+instruction-count tests are the protection that keeps LLVM upgrades and
+lowerer refactors from silently spending IR-level gains on VM
+dispatches.
 
 ## Remaining Test Matrix
 
@@ -395,8 +411,9 @@ four-block layout, switch ordering, global coalescing + clobber decline):
 
 1. Finish the branch (order above): clear the minor open defects; land
    deferred lowering byte-identical.
-2. Build the inlining profitability gate; only then tune caps, land
-   `Z__Region`-class inlining, and pin new baselines.
+2. Tune the inlining gate (size term, per-site retry, caps) on
+   cross-corpus measurements; then land `Z__Region`-class inlining by
+   default and pin new baselines.
 3. Put the real LLVM build and strict optimization suite in Linux CI.
 4. Measure per-opcode/operand-mode costs; validate a weighted dynamic
    cost model against repeated timings.

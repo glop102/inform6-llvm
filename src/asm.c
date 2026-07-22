@@ -1143,6 +1143,10 @@ typedef struct routine_emission_s {
     int          header_stackargs;
     int          prelowered_locals; /* count recorded by a headerless patch,
                                        or -1 */
+    int          last_patched_locals; /* count of the most recent header
+                                         (emit or patch), for re-patching
+                                         after the inline gate restores a
+                                         competing lowered stream */
 } routine_emission;
 
 /* The one routine currently being captured/emitted. */
@@ -1310,6 +1314,7 @@ extern int llvm_patch_routine_locals(int newcount)
        the count for the end-of-pass header emission. */
     if (cur_emit.header_ha_start == cur_emit.header_ha_end) {
         cur_emit.prelowered_locals = newcount;
+        cur_emit.last_patched_locals = newcount;
         return TRUE;
     }
 
@@ -1337,7 +1342,98 @@ extern int llvm_patch_routine_locals(int newcount)
         /* @copy sp _vararg_count; */
         byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0);
     }
+    /* Track the rewritten span so a later patch (the inline gate lowers
+       several competing forms against one header) still matches. */
+    cur_emit.header_ha_end = zcode_ha_size;
+    cur_emit.last_patched_locals = newcount;
     return TRUE;
+}
+
+/* --- Inline-gate stream analysis ----------------------------------------- */
+/* The profitability gate compares competing lowered forms of one routine.
+   These helpers operate on the working event buffer: an estimated dynamic
+   cost (instructions weighted by loop nesting inferred from backward
+   branches), and snapshot/restore so a rejected form can be replaced by
+   the kept one. Events are POD (ai.text is nulled at capture), so a
+   snapshot is a plain copy. */
+
+#define STREAM_LOOP_WEIGHT 8
+#define STREAM_LOOP_DEPTH_CAP 3
+
+extern int32 llvm_stream_weighted_cost(void)
+{
+    int32 *labelpos;
+    int   *delta;
+    int i, k, depth;
+    int32 cost = 0;
+
+    if (cur_emit.event_count == 0) return 0;
+    labelpos = malloc((size_t)(next_label > 0 ? next_label : 1)
+        * sizeof(int32));
+    delta = calloc((size_t)cur_emit.event_count + 1, sizeof(int));
+    if (!labelpos || !delta)
+        fatalerror("Out of memory weighing lowered stream");
+    for (i = 0; i < next_label; i++) labelpos[i] = -1;
+    for (i = 0; i < cur_emit.event_count; i++) {
+        llvm_event *ev = &cur_emit.events[i];
+        if (ev->is_label && ev->label >= 0 && ev->label < next_label)
+            labelpos[ev->label] = i;
+    }
+    /* A branch to an already-defined label closes a loop over
+       [target, branch]; overlap count approximates nesting depth. */
+    for (i = 0; i < cur_emit.event_count; i++) {
+        llvm_event *ev = &cur_emit.events[i];
+        if (ev->is_label) continue;
+        for (k = 0; k < ev->ai.operand_count; k++) {
+            assembly_operand *op = &ev->ai.operand[k];
+            if (op->marker != BRANCH_MV && op->marker != JUMP_MV) continue;
+            if (op->value >= 0 && op->value < next_label
+                && labelpos[op->value] >= 0 && labelpos[op->value] <= i) {
+                delta[labelpos[op->value]]++;
+                delta[i + 1]--;
+            }
+        }
+    }
+    depth = 0;
+    for (i = 0; i < cur_emit.event_count; i++) {
+        int d, w;
+        depth += delta[i];
+        if (cur_emit.events[i].is_label) continue;
+        d = depth;
+        if (d > STREAM_LOOP_DEPTH_CAP) d = STREAM_LOOP_DEPTH_CAP;
+        for (w = 1; d > 0; d--) w *= STREAM_LOOP_WEIGHT;
+        cost += w;
+    }
+    free(labelpos);
+    free(delta);
+    return cost;
+}
+
+extern void *llvm_stream_snapshot(int *count_out)
+{
+    void *snap = NULL;
+    *count_out = cur_emit.event_count;
+    if (cur_emit.event_count > 0) {
+        snap = malloc((size_t)cur_emit.event_count * sizeof(llvm_event));
+        if (!snap) fatalerror("Out of memory snapshotting lowered stream");
+        memcpy(snap, cur_emit.events,
+            (size_t)cur_emit.event_count * sizeof(llvm_event));
+    }
+    return snap;
+}
+
+extern void llvm_stream_restore(void *snap, int count)
+{
+    cur_emit.event_count = count;
+    if (count > 0) {
+        ensure_memory_list_available(&cur_emit.events_memlist, count);
+        memcpy(cur_emit.events, snap, (size_t)count * sizeof(llvm_event));
+    }
+}
+
+extern int llvm_last_patched_locals(void)
+{
+    return cur_emit.last_patched_locals;
 }
 
 
@@ -2229,6 +2325,7 @@ static void emit_glulx_routine_header(int stackargs, int locals)
     byteout(0, 0); byteout(0, 0);
     if (stackargs) { byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0); }
     cur_emit.header_ha_end = zcode_ha_size;
+    cur_emit.last_patched_locals = locals;
 }
 
 /* Snapshot the just-parsed routine (its captured stream deep-copied, and a

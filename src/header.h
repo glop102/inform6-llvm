@@ -2265,6 +2265,10 @@ extern int   llvm_pipeline_routine(void);
 extern int   llvm_retain_direct_routine(int routine_symbol);
 extern int   llvm_lower_retained_routine(int handle);
 extern int   llvm_inlining_enabled(void);
+extern int32 llvm_stream_weighted_cost(void);
+extern void *llvm_stream_snapshot(int *count_out);
+extern void  llvm_stream_restore(void *snap, int count);
+extern int   llvm_last_patched_locals(void);
 extern void  llvm_direct_routine_begin(const char *name, int local_count,
                  int embedded_flag, int stack_arguments);
 extern void  llvm_direct_routine_finish(int embedded_flag,
