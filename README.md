@@ -30,10 +30,8 @@ The devshell also provides `glulxe` for behavioral tests and
 `GLULXE_INSTRUCTION_COUNT=<n>` on stderr. Pass `--opcode-histogram` to also
 emit `GLULXE_OPCODE_COUNT_0x<opcode>=<n>` records for every executed opcode.
 `make bench` uses it to report deterministic classic-versus-LLVM dynamic
-instruction totals and writes their opcode comparison to
-`tests/life.opcodes.tsv` alongside timing medians. Set `BENCH_RUNS` to change
-the default five timing runs. Older counted interpreters which do not support
-histograms still provide total counts but skip the opcode TSV.
+instruction totals, per-routine attribution, and opcode-mix differences.
+Set `BENCH_RUNS` to change the default five timing runs for Life.
 
 LLVM is optional: the Makefile detects it via `llvm-config` and, when it
 isn't found (or with `make WITH_LLVM=0`), builds `src/llvm_stub.c` in
@@ -77,8 +75,14 @@ statements are parsed, before Glulx instructions are selected. At routine end:
 4. `src/asm.c` sends the lowered stream through the
    classic encoder, preserving branch shortening, labels, and backpatching.
 
-Unsupported routines fall back independently to classic code generation. The
-Z-machine target always uses the classic path.
+A routine the pipeline cannot translate falls back independently to classic
+code generation, replaying the classic event stream captured during its
+parse. The whole test and benchmark corpus — including glulxercise's raw
+custom-opcode and catch/throw torture tests — compiles with zero fallbacks;
+the mechanism remains as a safety valve for constructs with no
+instruction-level meaning to translate (raw code-byte arrays) and for
+whatever user code does next. The Z-machine target always uses the classic
+path.
 
 Locals begin as LLVM allocas and are promoted by `mem2reg`; source control
 flow forms the CFG, globals become external `i32` globals, and backpatchable
@@ -99,9 +103,14 @@ excluded because it increased dynamic work in benchmarks.
 
 The direct generate/optimize/lower pipeline is enabled by default and has
 focused behavioral, compliance, static instruction, and dynamic
-instruction-count tests. Unsupported constructs, fixed resource limits, debug
-output, traced routines, or unfamiliar post-LLVM shapes can cause per-routine
-fallback to classic code generation.
+instruction-count tests. Every routine in the test and benchmark corpus
+builds direct IR (the tests pin fallback counts at zero); inline assembly,
+custom `@"..."` opcodes, catch/throw, explicit stack manipulation,
+asterisk-traced routines, and C0 stack-argument routines are all
+translated. Raw code-byte arrays, unsupported statements, fixed resource
+limits, or unfamiliar post-LLVM shapes can still cause per-routine
+fallback to classic code generation; debug-file builds bypass the
+pipeline entirely.
 
 Glulx permits `jumpabs` to branch to an arbitrary absolute code address,
 including code in another function. Inform does not guarantee the generated
@@ -122,7 +131,7 @@ optimization roadmap.
 
 ```
 nix run .#tests              # build the stories, then run all test gates
-nix run .#benchmarks         # build and run the Game of Life benchmark
+nix run .#benchmarks         # run the Life, Cloak, and Advent benchmarks
 
 make test                    # alias for nix run .#tests
 make bench                   # alias for nix run .#benchmarks
@@ -167,6 +176,13 @@ requires identical simulation output, alternates execution order, and reports ti
 median, minimum, maximum, and dynamic instruction totals. It runs each version
 five times by default; set `BENCH_RUNS` to change this.
 
+The Advent benchmark (`tests/adventBenchmark.nix`) compiles Colossal Cave
+from the pinned
+[erkyrath/Inform6-Testing](https://github.com/erkyrath/Inform6-Testing)
+flake input (with its bundled 6/11 library) and plays a 252-command
+start-to-victory walkthrough under `glulxe --rngseed 1` for a
+deterministic dynamic-instruction comparison; nothing is vendored.
+
 `cloak.inf` (a full library game) needs the Inform 6 standard library.
 Inside the devshell it is provided automatically (the `inform6lib-src`
 flake input, exported as `INFORM6_LIB`); outside, the scripts fall back
@@ -198,5 +214,3 @@ default language include is capitalized "English", while the library ships
 - Resolve the correctness and LLVM-effect-model findings in the review.
 - Consider typed memory and fuller Glk modeling only after corpus validation
   shows that the additional optimization scope is worthwhile.
-- Represent custom `@"..."` opcodes directly where their operand and effect
-  declarations are trustworthy.
