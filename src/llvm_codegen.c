@@ -237,16 +237,14 @@ static void mark_opaque_fn_attrs(LLVMValueRef f, const char *opname)
 }
 
 /* ------------------------------------------------------------------------- */
-/*   Post-optimization cleanup                                               */
-/*                                                                           */
-/*   simplifycfg/instcombine merge conditional reads of two globals into a   */
-/*   load of a select-of-pointers, which has no Glulx encoding. Rewrite      */
-/*   such loads back into selects of loads (globals are always readable,     */
-/*   so hoisting the loads is safe), leaving IR the lowerer understands.     */
+/*   Legalization: IR-to-IR rewrites, run after the pass pipeline, that      */
+/*   turn shapes LLVM likes into shapes the lowerer accepts. Any future      */
+/*   shape normalization belongs here (or as a real LLVM pass), not in the   */
+/*   lowerer.                                                                */
 /* ------------------------------------------------------------------------- */
 
-/* The optimizer likes to merge accesses of different globals into a
-   load/store through a select or phi of global POINTERS (instcombine,
+/* The optimizer merges accesses of different globals into a load/store
+   through a select or phi of global POINTERS (instcombine,
    jump-threading and simplifycfg all do it).  The lowerer's operand
    model has no indirect global access, so this rewrite de-pointerizes
    them: every select/phi network whose leaves are all i6.g globals is
@@ -1193,8 +1191,8 @@ extern void llvm_direct_resolve_label(int label, int used)
 /* ------------------------------------------------------------------------- */
 /*   Direct translation of parsed inline Glulx assembly                       */
 /*                                                                           */
-/*   Inline instructions arrive as assembly_instruction records exactly as   */
-/*   the lifter sees captured ones, and translate under the same rules:      */
+/*   Inline instructions arrive as assembly_instruction records and          */
+/*   translate under the same rules as everything else:                      */
 /*   native IR where semantics provably match, typed opaque i6.<opcode>      */
 /*   calls otherwise, explicit control flow for branches and returns.        */
 /*   Operands naming "sp" use a parse-time symbolic stack of SSA values;     */
