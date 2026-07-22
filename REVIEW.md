@@ -139,15 +139,17 @@ follows is the still-open work.
 - Byte-identical output with inlining off, master vs branch, across the
   full story corpus in both `$LLVM=0` and `$LLVM=4`, from a clean
   worktree baseline. All nine test gates pass.
-- Cloak with inlining on: 153,588 → 143,916 dispatches (−6.30%),
-  transcript identical. Microbenchmark (helper called 1,000× in a loop):
-  −28.5%.
+- Cloak with inlining on: 153,588 → 144,344 dispatches (−6.02%),
+  transcript identical, no routine changes backend. (Measured against
+  the deterministic pre-optimization inline snapshot; the audit's
+  −6.30% was under the earlier order-dependent snapshot.)
+  Microbenchmark (helper called 1,000× in a loop): −28.5%.
 - The revert-on-fallback guard is implemented and works: inlining runs on
   a throwaway clone and the un-inlined module lowers instead if the
   inlined form fails to optimize or lower. Measured essential: without
   it, `Parser__parse` bloats past the local-slot limit, falls back to
-  classic, and erases most of the program-wide gain (−1.39% vs −6.30%).
-  Under the guard no routine changes backend.
+  classic, and erases most of the program-wide gain (−1.39% vs −6.30%
+  at the time of the audit).
 - The SYMBOL_MV address-decoupling argument is sound end-to-end: marked
   operands are forced to 4-byte `CONSTANT_OT` (width invariant), and
   `bpatch.c`'s ROUTINE_T `SYMBOL_MV` case applies the identical
@@ -188,19 +190,6 @@ parse and end-of-pass.
   estimate post-inline cost from CFG/loop structure, and keep the
   pre-inline form when the estimate regresses. Default-on is
   unjustifiable before this exists.
-- **Retained callee modules are optimized in place by their own
-  lowering**, so what a caller inlines depends on emission order (a
-  caller emitted before its callee clones pre-optimization IR; after,
-  post-optimization IR that has also been through
-  `unmerge_pointer_selects`). Not unsound — both forms are verified
-  equivalents — but order-dependent output under a flag violates the
-  design's own snapshot invariant and will confound tuning. Snapshot or
-  clone before the callee's own lowering mutates it.
-- **All retained modules persist to end of compile even with inlining
-  off**: +21% peak compiler RSS on glulxercise (49.9 → 60.6 MB). Dispose
-  each module after its routine lowers when inlining is disabled (or
-  after its last inline use when enabled). The
-  "should have been consumed" comment in `llvm_codegen_free` is stale.
 - **The same callee is cloned + linked once per call site**
   (`i6.inl.<caller>.<i>`), not once per caller; compile time with
   inlining on is ~4× (glulxercise 0.13 s → 0.55 s). Cache one clone per
@@ -244,6 +233,20 @@ parse and end-of-pass.
   conservatively); default-return convention per `embedded_flag`;
   address-assignment order must match emission order; an inlined body
   must not create dependence on a routine's generated address.
+- **The inline source is the callee's pristine pre-optimization module**
+  (settled, deliberately): with inlining on, retained modules are never
+  mutated — each routine's own lowering runs on a clone — so what a
+  caller inlines is independent of emission order, and the caller's
+  pipeline optimizes the inlined body in context. The size-eligibility
+  caps are measured on the same pre-optimization IR.
+- **Module lifetime**: with inlining off, a deferred routine is lowered
+  at stash time (SYMBOL_MV means lowering needs no addresses; only
+  header emission and address assignment are deferred), its module
+  disposed immediately, and the small lowered stream retained in place
+  of the shadow copy — peak RSS on glulxercise is 53.1 MB vs 49.9 eager
+  and 60.6 fully-retained; the ~3 MB residue is the deferred event
+  streams themselves. With inlining on, modules persist to end of
+  compile as inline snapshots.
 - `I6_LLVM_SHADOW=0` now means "do not retain shadows" — any routine
   needing a fallback becomes a compile error, evaluated at end of pass.
 
@@ -251,7 +254,7 @@ parse and end-of-pass.
 
 - Tune `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS` (currently 16/70 on
   pre-optimization IR — a crude proxy) *after* the profitability gate
-  exists; decide default-on only on cross-corpus evidence (cloak −6.30%,
+  exists; decide default-on only on cross-corpus evidence (cloak −6.02%,
   Life must not regress, size growth bounded).
 - Phase 3 landing: inline `Z__Region` and hot siblings by default, pin
   the new cloak baseline in `tests/corpusTest.nix`.
@@ -265,20 +268,16 @@ parse and end-of-pass.
   `I6_LLVM_DIAGNOSTICS=1`; `I6_LLVM_INLINE=0` already works for
   bisection.
 - Track the deferred-model costs as first-class benchmark outputs: peak
-  compiler RSS and compile time (current data: glulxercise RSS
-  49.9 → 60.6 MB inline-off, ×4 compile time inline-on) on the largest
-  corpus game.
-- Open design questions: snapshot point for the inline source (decide
-  pre- vs post-optimize deliberately — currently accidental, see design
-  gaps); transitive inlining (flatten at snapshot vs caller time, depth
-  budget vs recursion guard).
+  compiler RSS and compile time (current data on glulxercise: RSS
+  49.9 eager / 53.1 inline-off / 61 MB inline-on; compile time ~0.2 s
+  inline-off, ~0.5 s inline-on) on the largest corpus game.
+- Open design question: transitive inlining (flatten at snapshot vs
+  caller time, depth budget vs recursion guard).
 
 ### Recommended fix order for the branch
 
-1. Snapshot callee modules before their own lowering; dispose retained
-   modules when inlining is off (fixes the RSS regression together).
-2. Clear the open secondary defects above (all minor).
-3. Then, and only then, build the profitability gate and re-tune.
+1. Clear the open secondary defects above (all minor).
+2. Then, and only then, build the profitability gate and re-tune.
 
 ## Open Correctness Work
 
@@ -394,8 +393,8 @@ four-block layout, switch ordering, global coalescing + clobber decline):
 
 ## Recommended Order of Work
 
-1. Finish the branch (order above): snapshot/dispose callee modules,
-   clear the minor open defects; land deferred lowering byte-identical.
+1. Finish the branch (order above): clear the minor open defects; land
+   deferred lowering byte-identical.
 2. Build the inlining profitability gate; only then tune caps, land
    `Z__Region`-class inlining, and pin new baselines.
 3. Put the real LLVM build and strict optimization suite in Linux CI.

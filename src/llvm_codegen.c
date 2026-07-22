@@ -487,8 +487,9 @@ extern void llvm_note_classic_routine(const char *reason)
 }
 
 /* While lowering a retained routine (deferred/end-of-pass), its module is
-   not owned by direct_ru -- it stays in retained_units so callees remain
-   available for inlining -- and is freed later with the context. */
+   not owned by direct_ru -- it stays in retained_units, whose lifetime
+   llvm_lower_retained_routine manages (disposed after lowering with
+   inlining off; kept pristine as the inline snapshot with inlining on). */
 static int direct_lowering_retained;
 
 static void direct_dispose_ir(void)
@@ -1698,6 +1699,13 @@ static int inlining_enabled(void)
     return v && v[0] && strcmp(v, "0") != 0;
 }
 
+/* asm.c consults this to decide whether a deferred routine can be lowered
+   at stash time (inlining off: nothing reads the module later) or must
+   keep its module retained as an inline source. */
+extern int llvm_inlining_enabled(void)
+{   return inlining_enabled();
+}
+
 static int is_call_to(LLVMValueRef call, const char *name)
 {
     LLVMValueRef f;
@@ -1904,12 +1912,29 @@ static int process_direct_routine(void)
         LLVMDisposeModule(inl);
     }
 
-    if (!inlined_ok
-        && !try_optimize_and_lower(direct_ru.mod, direct_ru.fn, &stage, &why,
-               &insts_in, &insts_out)) {
-        direct_fallback(stage ? stage : "direct-lower",
-            why ? why : "lowering failed");
-        return FALSE;
+    if (!inlined_ok) {
+        int ok;
+        if (direct_lowering_retained && inlining_enabled()) {
+            /* The retained module is the snapshot other routines inline;
+               optimization would mutate it in place and make what a
+               caller inlines depend on emission order. Lower a clone and
+               keep the retained module pristine pre-optimization IR. */
+            LLVMModuleRef work = LLVMCloneModule(direct_ru.mod);
+            LLVMValueRef wfn =
+                LLVMGetNamedFunction(work, LLVMGetValueName(direct_ru.fn));
+            ok = wfn && try_optimize_and_lower(work, wfn, &stage, &why,
+                     &insts_in, &insts_out);
+            if (!wfn) { stage = "direct-lower"; why = "clone lost function"; }
+            LLVMDisposeModule(work);
+        }
+        else
+            ok = try_optimize_and_lower(direct_ru.mod, direct_ru.fn, &stage,
+                     &why, &insts_in, &insts_out);
+        if (!ok) {
+            direct_fallback(stage ? stage : "direct-lower",
+                why ? why : "lowering failed");
+            return FALSE;
+        }
     }
     report_backend("direct", "lower", insts_in, insts_out);
     no_routines_direct++;
@@ -1999,17 +2024,22 @@ extern int llvm_lower_retained_routine(int handle)
 {
     if (handle < 0 || handle >= retained_unit_count)
         return FALSE;
-    /* direct_dispose_ir (reached via the pipeline) frees the container's
-       resources, so hand it the retained copy and blank the slot. */
     /* Lower a non-owning view of the retained unit: the module stays in
-       retained_units[handle] (alive for other routines to inline) and is
-       freed with the context, not here. */
+       retained_units[handle] while the pipeline runs. With inlining
+       enabled it must survive this call untouched (other routines clone
+       it as their inline source); with inlining off nothing reads it
+       again, so it is disposed here rather than held to end of compile. */
     direct_ru = retained_units[handle];
     direct_lowering_retained = TRUE;
     {   int ok = llvm_pipeline_routine();
         direct_lowering_retained = FALSE;
         memset(&direct_ru, 0, sizeof direct_ru);
         direct_ru.state = DIRECT_INACTIVE;
+        if (!inlining_enabled() && retained_units[handle].mod) {
+            LLVMDisposeModule(retained_units[handle].mod);
+            retained_units[handle].mod = NULL;
+            retained_units[handle].fn = NULL;
+        }
         return ok;
     }
 }
@@ -2018,9 +2048,9 @@ extern void llvm_codegen_free(void)
 {
     direct_dispose_ir();
     direct_ru.state = DIRECT_INACTIVE;
-    /* Any retained modules should have been consumed by end-of-pass
-       lowering; free the tracking array (the modules themselves die with
-       the context below). */
+    /* With inlining off each retained module was disposed when its
+       routine lowered; with inlining on they persist as inline snapshots
+       and die with the context below. Free the tracking array. */
     free(retained_units);
     retained_units = NULL;
     retained_unit_count = retained_unit_cap = 0;

@@ -2264,6 +2264,7 @@ extern int   llvm_pipeline_routine(void);
    module for a handle is lowered through the normal pipeline. */
 extern int   llvm_retain_direct_routine(int routine_symbol);
 extern int   llvm_lower_retained_routine(int handle);
+extern int   llvm_inlining_enabled(void);
 extern void  llvm_direct_routine_begin(const char *name, int local_count,
                  int embedded_flag, int stack_arguments);
 extern void  llvm_direct_routine_finish(int embedded_flag,
