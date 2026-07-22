@@ -185,11 +185,10 @@ static void mark_fn_as_inaccessible_rw(LLVMValueRef f)
 /*   Opcode memory behavior                                                  */
 /*                                                                           */
 /*   Glulx opcodes that never write RAM, globals, or locals and never call   */
-/*   back into VM code. Direct declarations use these attributes, and the    */
-/*   lowerer's clobber analysis (via                                         */
-/*   llvm_codegen.h) uses the same answer. Stream opcodes are deliberately   */
-/*   absent: under @setiosys 1 ("filter") every one of them invokes an       */
-/*   arbitrary routine per character.                                        */
+/*   back into VM code; their opaque declarations carry the matching         */
+/*   memory attributes. Stream opcodes are deliberately absent: under        */
+/*   @setiosys 1 ("filter") every one of them invokes an arbitrary           */
+/*   routine per character.                                                  */
 /* ------------------------------------------------------------------------- */
 
 /* Pure functions of their operands (Glulx float math is deterministic
@@ -223,13 +222,6 @@ static int name_in_list(const char *name, const char *const *list)
     for (i = 0; list[i]; i++)
         if (strcmp(name, list[i]) == 0) return TRUE;
     return FALSE;
-}
-
-extern int llvm_opcode_no_ram_write(const char *opname)
-{
-    return name_in_list(opname, pure_opcodes)
-        || name_in_list(opname, readonly_opcodes)
-        || name_in_list(opname, inaccessible_opcodes);
 }
 
 static void mark_opaque_fn_attrs(LLVMValueRef f, const char *opname)

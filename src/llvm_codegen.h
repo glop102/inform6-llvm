@@ -18,10 +18,4 @@ extern int llvm_lower_routine(LLVMModuleRef mod, LLVMValueRef fn,
 /* Static instruction counts over all successfully lowered routines. */
 extern int llvm_lower_insts_in, llvm_lower_insts_out;
 
-/* TRUE if the named Glulx opcode never writes RAM, globals, or locals
-   and never calls back into VM code (so it cannot clobber anything the
-   lowerer's memory analyses track). Direct codegen grades the same opcodes'
-   IR declarations with matching attributes. */
-extern int llvm_opcode_no_ram_write(const char *opname);
-
 #endif
