@@ -1290,28 +1290,13 @@ the names \"%s\" and \"%s\" actually refer to the same property",
                 ensure_memory_list_available(&embedded_function_name, strlen(prefix)+strlen(sep)+strlen(sym)+1);
                 sprintf(embedded_function_name.data, "%s%s%s", prefix, sep, sym);
 
-                if (deferred_lowering_active()) {
-                    /* Mint a symbol for this anonymous embedded routine so
-                       its address is deferred through SYMBOL_MV (see the
-                       matching site below). */
-                    int es = symbol_index(embedded_function_name.data, -1, NULL);
-                    /* parse_routine() releases lexer text! */
-                    AO.value = parse_routine(NULL, TRUE,
-                        embedded_function_name.data, FALSE, es);
-                    assign_symbol(es, AO.value, ROUTINE_T);
-                    symbols[es].flags |= AUTOGEN_SFLAG | USED_SFLAG;
-                    AO.value = es;
-                    AO.type = CONSTANT_OT;
-                    AO.marker = SYMBOL_MV;
-                    AO.symindex = es;
-                }
-                else {
-                    /* parse_routine() releases lexer text! */
-                    AO.value = parse_routine(NULL, TRUE,
-                        embedded_function_name.data, FALSE, -1);
-                    AO.type = LONG_CONSTANT_OT;
-                    AO.marker = IROUTINE_MV;
-                }
+                /* No deferred-lowering branch here: deferral requires
+                   Glulx, and this is the Z-code segment parser. */
+                /* parse_routine() releases lexer text! */
+                AO.value = parse_routine(NULL, TRUE,
+                    embedded_function_name.data, FALSE, -1);
+                AO.type = LONG_CONSTANT_OT;
+                AO.marker = IROUTINE_MV;
 
                 directives.enabled = FALSE;
                 segment_markers.enabled = TRUE;
@@ -1579,9 +1564,27 @@ the names \"%s\" and \"%s\" actually refer to the same property",
                        deferred lowering mint one (from the mangled name we
                        already built) and reference it through SYMBOL_MV, so
                        its address is assigned at end of pass like any routine.
-                       AUTOGEN_SFLAG tags it for the post-backpatch cleanup and
-                       keeps it out of unused-symbol warnings. */
+                       AUTOGEN_SFLAG marks it compiler-synthesized and keeps
+                       it out of unused-symbol warnings; the symbol persists
+                       in the table for the rest of the compile. */
                     int es = symbol_index(embedded_function_name.data, -1, NULL);
+                    if (!(symbols[es].flags & UNKNOWN_SFLAG)) {
+                        /* The mangled name is already a defined symbol: the
+                           prefix is not collision-proof (a user object named
+                           nameless_obj__N shadows an auto-named nameless
+                           object, so two embedded routines mangle to the
+                           same name). assign_symbol would silently redefine
+                           it, aliasing both routines to one address --
+                           uniquify instead. */
+                        int un = 1;
+                        do {
+                            ensure_memory_list_available(&embedded_function_name,
+                                strlen(prefix)+strlen(sep)+strlen(sym)+32);
+                            sprintf(embedded_function_name.data, "%s%s%s__A%d",
+                                prefix, sep, sym, un++);
+                            es = symbol_index(embedded_function_name.data, -1, NULL);
+                        } while (!(symbols[es].flags & UNKNOWN_SFLAG));
+                    }
                     /* parse_routine() releases lexer text! */
                     AO.value = parse_routine(NULL, TRUE,
                         embedded_function_name.data, FALSE, es);

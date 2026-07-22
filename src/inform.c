@@ -1037,7 +1037,7 @@ static void run_pass(void)
     parse_program(NULL);
 
     ensure_builtin_globals();
-    find_the_actions();
+    find_the_actions(TRUE);
     issue_unused_warnings();
     compile_veneer();
 
@@ -1050,7 +1050,9 @@ static void run_pass(void)
     if (deferred_lowering_active()) {
         emit_deferred_routines();
         veneer_backpatch_addresses();
-        find_the_actions();
+        /* Refresh actions[].byte_offset only; errors were reported by the
+           first call, before unused-symbol warnings. */
+        find_the_actions(FALSE);
         grammar_backpatch_routines();
     }
 

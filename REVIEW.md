@@ -128,9 +128,11 @@ and emitted in one end-of-pass pass after `parse_program` +
 `I6_LLVM_INLINE` (clone the callee module, link into the caller, rewrite
 the opaque `i6.callf*` as a real call marked alwaysinline, run the
 always-inline pass). A full skeptical audit (2026-07-21, all findings
-independently reproduced) follows. **The four blocking defects it found
-are now fixed** (see that section); the inlining design gaps and
-secondary defects remain open.
+independently reproduced) found four blocking miscompiles and five
+secondary defects; all nine are fixed, guarded by the
+`direct-ir-deferred-timing` and `direct-ir-autogen-collision` regression
+fixtures in `tests/directIrTest.nix` (details in git history). What
+follows is the still-open work.
 
 ### Verified claims (adversarially checked, hold)
 
@@ -159,66 +161,16 @@ secondary defects remain open.
   (missing attributes default to full-barrier); no double-frees in the
   retained-module lifetime.
 
-### Blocking defects (all reproduced; ALL FIXED 2026-07-21)
+### Lesson for further emission-order work
 
-Resolutions, in order: (1+3) the deferral decision is latched once in
-`asm_begin_pass` (`deferred_lowering_wanted()` no longer consults
-`trace_fns_setting` at all), and asterisk-traced / `-g` routines are now
-captured and deferred as classic-policy routines — the capture block in
-`assemble_routine_header` moved above the trace preamble so the preamble
-is ordinary captured code; nothing emits eagerly under an active gate, so
-`Main__` is always first and a mid-source `Switches g` compiles
-correctly (a directive change that *would* alter the latched decision is
-a `fatalerror` via `deferred_lowering_latch_conflict()`, as a backstop —
-upstream already blocks `-k` in `Switches`). (2) `defer_replace_original`
-attaches Y to the just-stashed first definition of X (and gives Y its
-`ROUTINE_T` placeholder identity immediately, since the `Replace`
-directive had defined it as a zero constant); `emit_deferred_routines`
-assigns Y alongside the routine's own symbol. (4) the two stubs were
-added to `llvm_stub.c`. All fixed outputs are byte-identical to master's
-eager output (asterisk, `Replace`, `-g` cases verified byte-for-byte),
-the full corpus sweep and all nine gates stay green, and a combined
-regression fixture (`direct-ir-deferred-timing` in
-`tests/directIrTest.nix`: `Switches g` + `[ Traced * ]` + two-symbol
-`Replace`, compared behaviorally against upstream) now guards all three
-miscompiles. The original findings, kept for the record:
-
-1. **An asterisked routine hijacks program startup.** `[ Foo * ...; ]`
-   routines emit eagerly (uncapturable), and under deferral nothing else
-   has been emitted during parse — so the eager routine lands at
-   code-area offset 0, where the Glulx header's start-function field is
-   hardcoded to point (`src/files.c:723` bakes the code-area start, not
-   the `Main__` symbol). The story boots into the traced routine and
-   never runs Main. Also falsifies the commit's "reproduces the eager
-   layout exactly" claim. Fix: defer-or-refuse asterisked routines, or
-   emit `Main__` eagerly first, or resolve the header start function
-   through the symbol.
-2. **`Replace X Y` resolves the preserved original to `Main__`.**
-   `src/syntax.c:222` copies X's value into Y at parse time, when every
-   deferred routine's value is the placeholder 0; Y is never a stashed
-   `routine_symbol`, so it backpatches to `0 + code_offset` = Main.
-   Calling the preserved original recurses into Main (reproduced to a
-   stack fault). This is the standard library-customization idiom. Fix:
-   re-resolve `rep_symbol` at end of pass.
-3. **The deferral gate is a live predicate, not a latched decision.**
-   `deferred_lowering_active()` re-reads `trace_fns_setting` at every
-   call site; a mid-source `Switches g;` flips it after `Main__` is
-   stashed — later routines emit eagerly from pc 0 and the stash
-   (including Main) is silently never emitted. Fix: latch the decision
-   once at `begin_pass` and make `Switches` error if it would change a
-   gate input after the first stash.
-4. **`make WITH_LLVM=0` no longer links** — `llvm_stub.c` is missing
-   stubs for `llvm_retain_direct_routine` / `llvm_lower_retained_routine`
-   (unconditional call sites in `asm.c`).
-
-The root cause of 1-3 is systematic: the commit enumerated the *table*
-consumers of parse-time addresses (action table, veneer table, GV2
-grammar tokens — all correctly refreshed) but missed the *scalar*
+The audit's blocking miscompiles shared one systematic root cause: the
+deferral commit enumerated the *table* consumers of parse-time addresses
+(action table, veneer table, GV2 grammar tokens) but missed the *scalar*
 consumers (`Replace`'s value copy, the header's implicit "Main is first"
-invariant) and treated a mutable predicate as a constant. All three sit
-in gaps the corpus never exercises, which is why "byte-identical across
-the corpus" held anyway. Any further emission-order work should hunt for
-the same class: reads of `symbols[].value` or pc-derived values between
+invariant) and treated a mutable predicate as a constant — all in gaps
+the corpus never exercises, which is why "byte-identical across the
+corpus" held anyway. Any further emission-order work should hunt for the
+same class: reads of `symbols[].value` or pc-derived values between
 parse and end-of-pass.
 
 ### Design gaps in the inlining prototype
@@ -260,31 +212,8 @@ parse and end-of-pass.
   guard is not implemented (moot today only because inlining is strictly
   single-level — revisit if transitive inlining is added).
 
-### Secondary defects
+### Secondary defects (open)
 
-- **AUTOGEN embedded-routine symbols are name-keyed with no collision
-  guard.** The mangled `<object>.<prop>` names include
-  `nameless_obj__N`, a legal user identifier; `assign_symbol` silently
-  overwrites on name match, so a collision aliases two embedded routines
-  to one address (latent silent wrong-code). Detect a non-UNKNOWN
-  existing symbol at the mint sites (`objects.c`) and uniquify.
-- **The promised AUTOGEN post-backpatch cleanup pass was never written**;
-  the comment at `objects.c:1582` claims it exists. Either implement the
-  discard (DISCARDED/UNHASHED machinery) or fix the comment. Until then
-  AUTOGEN symbols persist in the table (and keep the collision surface).
-- **`find_the_actions()` runs twice under deferral**
-  (`inform.c:1040`, `:1053` — the first for USED_SFLAG before unused
-  warnings, the second to refresh addresses); its error paths are not
-  idempotent, so a missing `...Sub` reports twice and doubles the error
-  count. Make the second pass silent.
-- The deferred branch in `properties_segment_z` (`objects.c`) is
-  unreachable (deferral requires Glulx) and sets Glulx `CONSTANT_OT`
-  inside the Z path — wrong if ever enabled. Copy-paste residue; delete
-  or fix.
-- `verbs.c` registers ATTRIBUTE_T grammar tokens in the routine-address
-  fixup list; currently a harmless no-op rewrite, but semantically wrong
-  and a trap if either mechanism is extended. Limit to the routine token
-  cases.
 - Errors raised inside `emit_deferred_routines` are attributed to the
   end-of-file lexer position, not the routine's source line (diagnostic
   modes only).
@@ -318,7 +247,7 @@ parse and end-of-pass.
 - `I6_LLVM_SHADOW=0` now means "do not retain shadows" — any routine
   needing a fallback becomes a compile error, evaluated at end of pass.
 
-### Remaining inlining work (beyond the fixes above)
+### Remaining inlining work
 
 - Tune `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS` (currently 16/70 on
   pre-optimization IR — a crude proxy) *after* the profitability gate
@@ -346,13 +275,10 @@ parse and end-of-pass.
 
 ### Recommended fix order for the branch
 
-1. ~~Blocking defects 1-4~~ — done, with the `direct-ir-deferred-timing`
-   regression fixture (see above).
-2. Snapshot callee modules before their own lowering; dispose retained
+1. Snapshot callee modules before their own lowering; dispose retained
    modules when inlining is off (fixes the RSS regression together).
-3. Fix the secondary defects (AUTOGEN collision guard + comment, silent
-   second `find_the_actions`, dead Z branch, attribute fixup).
-4. Then, and only then, build the profitability gate and re-tune.
+2. Clear the open secondary defects above (all minor).
+3. Then, and only then, build the profitability gate and re-tune.
 
 ## Open Correctness Work
 
@@ -468,8 +394,8 @@ four-block layout, switch ordering, global coalescing + clobber decline):
 
 ## Recommended Order of Work
 
-1. Fix the branch's blocking defects and secondary defects (order above)
-   with regression fixtures; land deferred lowering byte-identical.
+1. Finish the branch (order above): snapshot/dispose callee modules,
+   clear the minor open defects; land deferred lowering byte-identical.
 2. Build the inlining profitability gate; only then tune caps, land
    `Z__Region`-class inlining, and pin new baselines.
 3. Put the real LLVM build and strict optimization suite in Linux CI.

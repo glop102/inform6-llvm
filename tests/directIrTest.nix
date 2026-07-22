@@ -56,6 +56,37 @@ let
         print "orig=", Orig(), " traced=", Traced(2), "^";
     ];
   '';
+  # Regression canary for AUTOGEN embedded-routine symbol collisions.
+  # The user object is deliberately named nameless_obj__6: with the four
+  # metaclass prototypes it is object #5, so the nameless object that
+  # follows is #6 and auto-names to exactly the same identifier. Both
+  # embedded 'foo' routines then mangle to "nameless_obj__6.foo"; without
+  # the uniquify guard the second assign_symbol silently aliases both
+  # property values to one routine ("ALIASED"). Compared behaviorally
+  # against upstream, which must print "distinct".
+  autogenCollisionSource = writeText "direct-ir-autogen-collision.inf" ''
+    Property foo;
+    Object nameless_obj__6 "decoy"
+      with foo [; print "decoy foo^"; ];
+    Object "unnamed"
+      with foo [; print "unnamed foo^"; ];
+    [ Main o a b win dummy;
+        @setiosys 2 0;
+        @copy 0 sp;
+        @copy 3 sp;
+        @copy 0 sp;
+        @copy 0 sp;
+        @copy 0 sp;
+        @glk $0023 5 win;
+        @copy win sp;
+        @glk $002F 1 dummy;
+        objectloop (o provides foo) {
+            print (name) o, ": "; o.foo();
+            if (a == 0) a = o.foo; else b = o.foo;
+        }
+        if (a == b) print "ALIASED^"; else print "distinct^";
+    ];
+  '';
   direct = runCommand "direct-ir-build" { } ''
     mkdir "$out"
     I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
@@ -127,6 +158,14 @@ let
   '';
   deferredTimingUpstream = runCommand "direct-ir-deferred-timing-upstream.ulx" { } ''
     ${lib.getExe inform6-upstream} -G ${deferredTimingSource} "$out"
+  '';
+  autogenCollisionDirect = runCommand "direct-ir-autogen-collision" { } ''
+    mkdir "$out"
+    ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${autogenCollisionSource} "$out/story.ulx" >"$out/compile.log" 2>&1
+  '';
+  autogenCollisionUpstream = runCommand "direct-ir-autogen-collision-upstream.ulx" { } ''
+    ${lib.getExe inform6-upstream} -G ${autogenCollisionSource} "$out"
   '';
   memoryStrictDirect = runCommand "direct-ir-memory-strict" { } ''
     mkdir "$out"
@@ -421,6 +460,27 @@ writeShellApplication {
        ! cmp -s "$work/deferred-timing-upstream.log" \
                 "$work/deferred-timing-direct.log"; then
         echo "FAIL  direct-ir (deferred address-timing behavior differs)"
+        fail=1
+    fi
+
+    set +e
+    timeout 30 glulxe ${autogenCollisionUpstream} </dev/null \
+        >"$work/autogen-collision-upstream.log" 2>&1
+    collision_upstream_status=$?
+    timeout 30 glulxe ${autogenCollisionDirect}/story.ulx </dev/null \
+        >"$work/autogen-collision-direct.log" 2>&1
+    collision_direct_status=$?
+    set -e
+    if [ "$collision_upstream_status" -eq 124 ] || \
+       [ "$collision_direct_status" -eq 124 ] || \
+       [ "$collision_upstream_status" -ne "$collision_direct_status" ] || \
+       ! cmp -s "$work/autogen-collision-upstream.log" \
+                "$work/autogen-collision-direct.log"; then
+        echo "FAIL  direct-ir (AUTOGEN symbol-collision behavior differs)"
+        fail=1
+    fi
+    if ! grep -aq '^distinct$' "$work/autogen-collision-direct.log"; then
+        echo "FAIL  direct-ir (AUTOGEN collision fixture did not print distinct)"
         fail=1
     fi
 

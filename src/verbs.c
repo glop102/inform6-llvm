@@ -722,7 +722,11 @@ extern assembly_operand action_of_name(char *name)
     return AO;
 }
 
-extern void find_the_actions(void)
+/* Under deferred lowering this runs twice: once before unused-symbol
+   warnings (report_errors TRUE) and once after end-of-pass address
+   assignment purely to refresh byte_offset. The second run must not
+   re-report missing/mistyped ...Sub routines. */
+extern void find_the_actions(int report_errors)
 {   int i; int32 j;
 
     for (i=0; i<no_actions; i++)
@@ -742,11 +746,13 @@ extern void find_the_actions(void)
         j = symbol_index(action_sub, -1, NULL);
         if (symbols[j].flags & UNKNOWN_SFLAG)
         {
-            error_named_at("No ...Sub action routine found for action:", action_name, symbols[actions[i].symbol].line);
+            if (report_errors)
+                error_named_at("No ...Sub action routine found for action:", action_name, symbols[actions[i].symbol].line);
         }
         else if (symbols[j].type != ROUTINE_T)
         {
-            ebf_symbol_error("action's ...Sub routine", action_sub, typename(symbols[j].type), symbols[j].line);
+            if (report_errors)
+                ebf_symbol_error("action's ...Sub routine", action_sub, typename(symbols[j].type), symbols[j].line);
         }
         else
         {   actions[i].byte_offset = symbols[j].value;
@@ -1215,7 +1221,9 @@ are using grammar version 2 or later");
                  if (symbols[token_value].type==ATTRIBUTE_T)
                  {   if (grammar_version_number == 1)
                          bytecode = 128 + symbols[token_value].value;
-                     else { bytecode = 4; wordcode = symbols[token_value].value; grammar_pending_routine_sym = token_value; }
+                     else { bytecode = 4; wordcode = symbols[token_value].value; }
+                     /* Attribute numbers are final at parse time: no
+                        routine-address fixup is registered for them. */
                  }
                  else
                  {   if (grammar_version_number == 1)
