@@ -68,36 +68,40 @@ every suppressed instruction whether or not its event is retained, and
 (byte-identical output on any story with zero fallbacks; pinned for
 cloak and the memory fixture).
 
-## Why the rule causes some rejects ("bails")
+## Data-area side effects: ownership conflicts and the handoff pattern
 
-The rule generalizes to a broader invariant: **classic generation owns
-every parse-time side effect; direct must neither duplicate one nor
-reach into one.** A few constructs violate that structurally:
+The rule generalizes to a broader invariant: **every piece of shared
+state has exactly one writer per compile.** For parser bookkeeping that
+writer is classic generation, always. For data-area side effects the
+ownership is per construct:
 
-- **Multi-argument `random(a, b, c)`** — classic's statement handler,
-  as a side effect of generating code, compiles a word array of the
-  choices into the story's data area; the emitted code indexes it. If
-  direct generated this itself it would either create a *second* array
-  (duplicated side effect, shifted addresses) or have to consume the
-  array classic just created (direct depending on classic's mutation of
-  shared compiler state). It rejects instead
-  (`unsupported random arity`).
-- **`box`** — same shape; its text table is compiled by classic's
-  handler during parsing.
+- **Multi-argument `random(a, b, c)`** — the choices live in a word
+  array compiled into the story's data area, indexed by the emitted
+  code. This used to reject as an ownership conflict (two generators
+  would mean two arrays, or direct depending on classic's mutation).
+  It is now handled by an aligned handoff: the direct build creates
+  the array and queues its address
+  (`llvm_direct_random_array_set/take`); classic generation of the
+  same expression tree takes the address instead of building its own.
+  Direct build strictly precedes classic generation per statement, and
+  an aborted direct build stops before pushing, so consumption never
+  misaligns — exactly one array exists whichever backend's stream is
+  kept, and each array still has exactly one writer.
+- **`box`** — the same shape (its text table is compiled by classic's
+  statement handler during parsing) and still a reject
+  (`unsupported statement`), because nothing in the corpus uses it.
+  The random() handoff is the template if it ever matters.
 
-These rejects are *not* representation gaps — an array load is trivial
-IR. They are ownership conflicts, and the pragmatic choice was to
-reject. Contrast `objectloop`, `spaces`, and `children()`, which needed
-nontrivial generation but went direct: their complexity lives in
-codegen-local state (LLVM blocks and phis the direct backend owns), not
-in shared parser or data-area state.
-
-The fix, if ever worth it, is to relax ownership per construct: hoist
-the word-array creation out of classic's statement handler into a shared
-helper that runs once regardless of backend, with both backends
-referencing the result. Measured payoff today is ~zero: cloak compiles
-with zero fallbacks, so real library games never hit these constructs —
-they live in glulxercise and test fixtures.
+These were never representation gaps — an array load is trivial IR.
+Contrast `objectloop`, `spaces`, and `children()`, which needed
+nontrivial generation but went direct without any ownership question:
+their complexity lives in codegen-local state (LLVM blocks and phis the
+direct backend owns), not in shared parser or data-area state. The
+zero-fallback conversions (branch opcodes, two-store opcodes,
+catch/throw, custom opcodes, sub-word copies) all follow that same
+pattern — the new complexity is carried in name-encoded opaque-call
+contracts between builder and lowerer, precisely so that no new shared
+mutable state exists between the two generators.
 
 ## Mental model correction: how the backends mix (they don't)
 
@@ -134,26 +138,24 @@ simply *become* the single writer, calling the same `asm_parser_*`
 helpers the capture stubs call now. The Phase 6 separation built exactly
 that seam; flipping the writer is mechanical once classic stops running.
 
-The real blockers to IR-only are the constructs with no direct
-representation, graded roughly:
+The representation gaps that once made this list are all closed:
+custom `@"..."` opcodes and sub-word copies emit verbatim with
+per-operand forms, explicit stack opcodes escalate the routine to
+real-stack mode mid-build (spill first, then the real stack provably
+matches classic's), multi-arg `random()` uses the array handoff above,
+and `@catch`'s setjmp shape is carried by the `i6.catchtok` /
+`i6.catchflag` pair — one real `catch S ?L` whose store operand is the
+token value's slot, so a throw rewrites exactly the value the IR reads
+(catch tokens still expose frame layout, which optimization
+legitimately changes; glulxercise's ten catch-token failures are the
+story hardcoding classic frame depths, and the catch *values* all
+pass). What remains excluded:
 
-**Tractable engineering**
-- Custom `@"..."` opcodes: representable as opaque calls with
-  conservative full-barrier effects.
-- Explicit stack opcodes (`@stkswap`, `@stkroll`, `@stkcopy`) in
-  ordinary routines: C0 real-stack mode already emits them verbatim as
-  ordered opaque calls; against the symbolic stack their effects are
-  untrackable, so the remaining work is spill-then-verbatim with
-  honest depth accounting.
-- Multi-arg `random()` / `box`: the shared-helper ownership relaxation
-  above.
-
-**Genuinely awkward**
-- `@catch`/`@throw`: `@catch` is setjmp-shaped — a call that
-  effectively returns twice — which LLVM IR has no comfortable encoding
-  for, and catch tokens expose frame layout, which optimization
-  legitimately changes (glulxercise's ten catch-token failures are the
-  story hardcoding classic frame depths; the catch *values* all pass).
+**By design**
+- Raw code-byte arrays (`@ -> ...`): arbitrary bytes with no
+  instruction-level meaning to translate.
+- `box` and a handful of unsupported statements: no representation
+  yet, nothing in the corpus needs one.
 
 **Design problems, not codegen problems**
 - Debug-file builds: sequence points must survive instruction
@@ -179,31 +181,20 @@ smaller than it appears.
 
 ## Would full IR coverage unlock optimization wins? (honest assessment)
 
-The hypothesis considered: glulxercise's 79 fallbacks might be reducing
-medium-to-long-horizon optimization, and larger games might hit the same
-thing. The hypothesis mostly does not hold — but the instinct that a
-longer-horizon win exists is correct; it lives elsewhere.
+Full corpus coverage has since been reached — every routine in cloak,
+Advent, glulxercise, and the fixtures builds direct IR — and the
+assessment below predicted the outcome correctly: coverage was a
+correctness and completeness win, not a performance one (Advent moved
++0.02%).
 
 **Fallbacks poison nothing beyond themselves.** The optimization horizon
-is strictly intra-routine by design: one LLVM module per routine, no
-inlining, no IPO, and every call is a full optimization barrier for
-globals and RAM. The barrier is not a fallback concession — Glulx
-semantics force it regardless, because any callee can touch any global
-or RAM address, whether it was compiled direct or classic. A fallback
-routine therefore costs exactly its own body's optimization and degrades
-no neighbor by a single dispatch. Glulxercise is also the worst corpus
-to extrapolate from: it is a VM conformance exerciser whose purpose is
-to poke the weird opcodes (`@stkroll`, `@catch` chains, custom opcodes)
-— hence 34% fallback there vs 0% on cloak.
-
-**Real-game exposure is near zero.** The entire Inform library — the
-parser, verb dispatch, everything — compiles with zero fallbacks.
-Larger games are the library plus more ordinary Inform source, plus
-occasionally a few inline-assembly routines from extensions, most of
-which use `@glk` and covered opcodes. A rare `@catch`/`@throw` or
-stack-trick routine compiles classic and costs its self-ops only. If one
-is ever *hot* in a real game, the targeted fix is that one construct's
-representation, justified by attribution evidence.
+is strictly intra-routine by design: one shared module, no inlining, no
+IPO, and every call is a full optimization barrier for globals and RAM.
+The barrier is not a fallback concession — Glulx semantics force it
+regardless, because any callee can touch any global or RAM address,
+whichever backend compiled it. A fallback routine therefore costs
+exactly its own body's optimization and degrades no neighbor by a
+single dispatch.
 
 **Removing the shadow stream buys no code quality.** Proven, not
 guessed: `I6_LLVM_SHADOW=0` is byte-identical on any zero-fallback
@@ -211,10 +202,10 @@ story. The shadow stream is write-only and never constrains the IR.
 Removal buys ~5% compile time. Meanwhile the safety valve has an
 underrated second job: it gracefully absorbs *limit* overflows
 (symbolic-stack depth, slot pressure, connective depth) and
-LLVM-version shape drift on arbitrary wild code. IR-only converts those
-from silent classic degradation into compile failures of someone's
-game; dynamic limits and a much broader fuzz corpus should precede any
-such move.
+LLVM-version shape drift on arbitrary wild code. Dropping it converts
+those from silent classic degradation into compile failures of
+someone's game; dynamic limits and a much broader fuzz corpus should
+precede any such move.
 
 **The real medium/long-horizon prize is selective inlining.** Cloak's
 own profile makes the case: `Z__Region` is 17% of all self-ops at 2,776
@@ -227,8 +218,9 @@ same way — helper-heavy code is exactly where per-call overhead
 compounds. Crucially, **fallback does not block this project**: inlining
 would be direct-into-direct only, and with classic-by-policy gone
 (C0 routines now build direct IR in real-stack mode) every hot cloak
-routine, `CA__Pr` included, is already direct. The work is elsewhere: revisiting the
-one-module-per-routine structure and being careful with the
+routine, `CA__Pr` included, is already direct. The one shared IR module
+is the intended substrate; the work is devirtualizing
+`i6.callf*(i6.sym)` sites into real IR calls and being careful with the
 call-barrier effect model once a callee's body is visible to the
 caller's optimizer. Notably, inlining also *dissolves* the barrier
 problem for inlined callees — LLVM sees the callee's actual global
@@ -240,11 +232,12 @@ wins (GVN/LICM across what used to be an opaque call).
 1. Selective inlining of small hot routines, ranked by the per-routine
    attribution the benchmarks already print by default (calls x
    per-call overhead is the sort key, not routine size).
-2. Construct-by-construct representation work only when a real game's
-   profile demands it (`@catch`/`@throw` likely first to surface, and
-   also the hardest).
-3. Shadow removal last — it becomes nearly free once coverage is
-   empirically total, and is pure downside before then.
+2. Recovering the plain-translator dispatch gap at the IR level.
+   Construct coverage is done and bought no dispatches — the wins are
+   in optimization, not representation.
+3. Shadow removal not at all: coverage is empirically total on the
+   corpus and retention still costs only ~5% compile time while
+   absorbing limit overflows and LLVM shape drift on wild code.
 
 ## Current measured context (for calibration)
 
