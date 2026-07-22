@@ -3,9 +3,12 @@
 /*                                                                           */
 /*   Part of inform6-llvm. Not part of the upstream Inform 6 compiler.       */
 /*                                                                           */
-/*   Expression and statement parsing build one LLVM function per routine.   */
-/*   This module verifies and optimizes that function; llvm_lower.c then      */
-/*   lowers it to buffered Glulx instructions for the classic encoder.        */
+/*   Expression and statement parsing build one LLVM function per routine,   */
+/*   all in a single module shared by the whole compile. When a routine is   */
+/*   processed (at end of pass under deferred lowering), its function is     */
+/*   verified, run through LLVM's function passes, legalized into shapes     */
+/*   the lowerer accepts, and handed to llvm_lower.c, which turns it into    */
+/*   buffered Glulx instructions for the classic encoder.                    */
 /* ------------------------------------------------------------------------- */
 
 #include "header.h"
@@ -14,7 +17,6 @@
 #include <llvm-c/Core.h>
 #include <llvm-c/Analysis.h>
 #include <llvm-c/Error.h>
-#include <llvm-c/Linker.h>
 #include <llvm-c/Transforms/PassBuilder.h>
 #include <llvm/Config/llvm-config.h>
 
@@ -29,6 +31,7 @@
 #define MEMATTR_INACCESSIBLE_RW 0x0Cu   /* memory(inaccessiblemem: readwrite) */
 
 static LLVMContextRef llctx;        /* created lazily, lives all compile     */
+static LLVMModuleRef  llmod;        /* the one module holding every routine  */
 static FILE *dump_file;             /* diagnostics dump, opened lazily       */
 
 static int no_routines_direct;
@@ -43,31 +46,12 @@ static int llvm_diagnostics_enabled(void)
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
-/* The optimization pipeline (new pass manager syntax). Deliberately no
-   inlining or IPO: one IR function per routine. licm hoists loop-invariant
-   computations, loads, and readonly opcode calls out of loops (a pure
-   dynamic win under the instructions-dispatched cost model).
-
-   loop-rotate was tried and rejected: the rotated bottom test reads the
-   *incremented* induction variable, giving the increment a third use,
-   which defeats the lowerer's edge-copy folding — the saved backedge jump
-   comes back as a phi copy per iteration, and the duplicated guards cost
-   static size for nothing (measured: cloak +744 instructions, life bench
-   ~40ms slower). Revisit if the lowerer learns interference-based
-   coalescing of the increment with its phi's slot.
-
-   Re-tuned on direct-IR shapes for Phase 5. reassociate (inherited from
-   the lifted-shape pipeline) was dropped: it helped nothing and cost
-   cloak +1 / life +494 dynamic instructions. Also measured and rejected:
-   sccp, instsimplify, and adce (no effect anywhere); a second
-   instcombine after gvn (produces shapes the lowerer refuses — cloak
-   coverage 277->274, +594 dynamic); early-cse before instcombine
-   (LLVM's instcombine fixpoint verifier hard-aborts the process on
-   library code); simplifycfg<hoist-common-insts> (cloak +25). Removing
-   jump-threading costs cloak +1048, so it stays. */
+/* The optimization pipeline (new pass manager syntax), run per routine
+   function. All IR-level optimization belongs here (or in the
+   legalization step below) — the lowerer is a plain translator. */
 #define LLVM_PASS_PIPELINE \
-    "function(mem2reg,instcombine,simplifycfg," \
-    "loop-mssa(licm),gvn,jump-threading,dce,simplifycfg)"
+    "mem2reg,instcombine,simplifycfg," \
+    "loop-mssa(licm),gvn,jump-threading,dce,simplifycfg"
 
 /* The i32 type; context-owned, so it is stable for the whole compile. */
 static LLVMTypeRef    i32t;
@@ -84,17 +68,12 @@ enum direct_state_e {
    stack, exactly as classic's would. */
 #define DIRECT_SYMSTACK_MAX 64
 
-/* All per-routine IR-build state, gathered into one container. Today
-   exactly one routine is live at a time (`direct_ru`, reset at each
-   routine_begin), so this is a pure regrouping of the former loose
-   statics with identical timing. The point is the datatype: a finished
-   routine's module and function can then be retained past its own
-   lowering as a single value -- the prerequisite for end-of-pass
-   deferral (Phase 1) and for making a callee's IR visible to a caller
-   when inlining (Phase 2). */
+/* All per-routine IR-build state, gathered into one container. Exactly
+   one routine is being built at a time (`direct_ru`, reset at each
+   routine_begin); a finished routine's function is retained past parse
+   time as one of these so it can be lowered at end of pass. */
 typedef struct routine_unit_s {
     enum direct_state_e state;
-    LLVMModuleRef  mod;
     LLVMBuilderRef bld;
     LLVMValueRef   fn;
     LLVMValueRef  *locals;
@@ -106,15 +85,7 @@ typedef struct routine_unit_s {
     LLVMValueRef   symstack[DIRECT_SYMSTACK_MAX];
     int            symstack_depth;
     int            spilled;      /* values our code left on the real stack */
-    int32          assigned_pc;  /* reserved: Phase 1 end-of-pass address  */
-    int            routine_symbol; /* which routine this is (for inlining)  */
-    int            body_hist_valid; /* inline gate: body_hist is cached    */
-    int            body_loopfree;   /* lowered body has no loops: the only
-                                       case whose static cost the gate's
-                                       estimator can be trusted on        */
-    int32          body_hist[LLVM_STREAM_DEPTH_CAP + 1];
-                                 /* standalone lowered instructions binned
-                                    by internal loop depth                 */
+    int            routine_symbol;
 } routine_unit;
 
 /* The one routine currently being built. */
@@ -493,28 +464,24 @@ extern void llvm_note_classic_routine(const char *reason)
     putchar('\n');
 }
 
-/* While lowering a retained routine (deferred/end-of-pass), its module is
-   not owned by direct_ru -- it stays in retained_units, whose lifetime
-   llvm_lower_retained_routine manages (disposed after lowering with
-   inlining off; kept pristine as the inline snapshot with inlining on). */
-static int direct_lowering_retained;
-
+/* Discard the routine being built (or just lowered): its function is
+   deleted from the shared module. Routines never reference each other's
+   functions directly (calls are opaque i6.callf* operations), so a
+   deletion is always safe. */
 static void direct_dispose_ir(void)
 {
     if (direct_ru.bld) {
         LLVMDisposeBuilder(direct_ru.bld);
         direct_ru.bld = NULL;
     }
-    if (direct_ru.mod) {
-        if (!direct_lowering_retained)
-            LLVMDisposeModule(direct_ru.mod);
-        direct_ru.mod = NULL;
+    if (direct_ru.fn) {
+        LLVMDeleteFunction(direct_ru.fn);
+        direct_ru.fn = NULL;
     }
     free(direct_ru.locals);
     direct_ru.locals = NULL;
     free(direct_ru.labels);
     direct_ru.labels = NULL;
-    direct_ru.fn = NULL;
     direct_ru.local_count = 0;
     direct_ru.label_count = 0;
 }
@@ -546,21 +513,30 @@ extern void llvm_direct_routine_begin(const char *name, int local_count,
         return;
     }
 
-    if (!llctx)
+    if (!llctx) {
         llctx = LLVMContextCreate();
-    i32t = LLVMInt32TypeInContext(llctx);
-    direct_ru.mod = LLVMModuleCreateWithNameInContext(name, llctx);
-    LLVMSetDataLayout(direct_ru.mod, "e-p:32:32-i32:32-n32");
+        i32t = LLVMInt32TypeInContext(llctx);
+        llmod = LLVMModuleCreateWithNameInContext("i6", llctx);
+        LLVMSetDataLayout(llmod, "e-p:32:32-i32:32-n32");
+    }
     {   LLVMTypeRef *params = local_count
             ? malloc((size_t)local_count * sizeof(*params)) : NULL;
         LLVMTypeRef ft;
+        char *fname;
         int i;
         if (local_count && !params)
             fatalerror("Out of memory creating direct LLVM parameters");
         for (i = 0; i < local_count; i++)
             params[i] = i32t;
         ft = LLVMFunctionType(i32t, params, (unsigned)local_count, FALSE);
-        direct_ru.fn = LLVMAddFunction(direct_ru.mod, name, ft);
+        /* The "i6fn." prefix keeps routine names out of the "i6.*"
+           helper-declaration namespace; LLVM uniquifies duplicates. */
+        fname = malloc(strlen(name) + 7);
+        if (!fname)
+            fatalerror("Out of memory creating direct LLVM function");
+        sprintf(fname, "i6fn.%s", name);
+        direct_ru.fn = LLVMAddFunction(llmod, fname, ft);
+        free(fname);
         free(params);
     }
     direct_ru.bld = LLVMCreateBuilderInContext(llctx);
@@ -678,9 +654,9 @@ static LLVMValueRef direct_global_var(int32 index)
     char name[32];
     LLVMValueRef g;
     sprintf(name, "i6.g%d", (int)index);
-    g = LLVMGetNamedGlobal(direct_ru.mod, name);
+    g = LLVMGetNamedGlobal(llmod, name);
     if (!g)
-        g = LLVMAddGlobal(direct_ru.mod, i32t, name);
+        g = LLVMAddGlobal(llmod, i32t, name);
     return g;
 }
 
@@ -696,10 +672,10 @@ extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
 
     params[0] = i32t; params[1] = i32t; params[2] = i32t;
     ft = LLVMFunctionType(i32t, params, 3, FALSE);
-    f = LLVMGetNamedFunction(direct_ru.mod, "i6.sym");
+    f = LLVMGetNamedFunction(llmod, "i6.sym");
     is_new = (f == NULL);
     if (!f)
-        f = LLVMAddFunction(direct_ru.mod, "i6.sym", ft);
+        f = LLVMAddFunction(llmod, "i6.sym", ft);
     if (is_new)
         mark_fn_as_constant(f);
     args[0] = LLVMConstInt(i32t, (unsigned)marker, FALSE);
@@ -775,10 +751,10 @@ static LLVMValueRef direct_opaque_call_ex(const char *name, LLVMValueRef *args,
         params[i] = i32t;
     ft = LLVMFunctionType(void_return ? LLVMVoidTypeInContext(llctx) : i32t,
         params, (unsigned)count, FALSE);
-    f = LLVMGetNamedFunction(direct_ru.mod, name);
+    f = LLVMGetNamedFunction(llmod, name);
     is_new = (f == NULL);
     if (!f)
-        f = LLVMAddFunction(direct_ru.mod, name, ft);
+        f = LLVMAddFunction(llmod, name, ft);
     if (is_new)
         mark_opaque_fn_attrs(f, name + 3);
     return LLVMBuildCall2(direct_ru.bld, ft, f, args, (unsigned)count,
@@ -1634,7 +1610,7 @@ extern void llvm_direct_glulx_macro(const assembly_instruction *ai,
 }
 
 /* Dump the routine's IR when machine-readable diagnostics are enabled. */
-static void dump_module(LLVMModuleRef m, const char *phase)
+static void dump_fn(LLVMValueRef fn, const char *phase)
 {
     char *ir;
     if (!llvm_diagnostics_enabled())
@@ -1643,7 +1619,7 @@ static void dump_module(LLVMModuleRef m, const char *phase)
         dump_file = fopen("inform6-llvm-dump.ll", "w");
     if (!dump_file)
         return;
-    ir = LLVMPrintModuleToString(m);
+    ir = LLVMPrintValueToString(fn);
     fprintf(dump_file, "; ===== %s (%s)\n%s\n",
         llvm_current_routine_name(), phase, ir);
     LLVMDisposeMessage(ir);
@@ -1684,589 +1660,55 @@ static void direct_fallback(const char *stage, const char *detail)
     direct_ru.reason = NULL;
 }
 
-/* ---- Selective inlining (Phase 2) ------------------------------------- */
-/* Before a routine is optimized and lowered, small direct callees whose IR
-   is still retained are spliced in: the callee module is cloned and linked
-   in, each opaque i6.callf* to it becomes a real call to the clone (marked
-   alwaysinline), and an always-inline pass folds them in. This removes the
-   call/return dispatch and the opaque-call optimization barrier for hot
-   leaf helpers (e.g. Z__Region). Inlining is off unless I6_LLVM_INLINE is
-   set while the transform is under evaluation. */
-
-#define INLINE_MAX_BLOCKS 16
-#define INLINE_MAX_INSTS  70
-#define INLINE_MAX_SITES  128
-
-static const char *const inline_call_names[4] =
-    { "i6.callf", "i6.callfi", "i6.callfii", "i6.callfiii" };
-
-/* One rewritten call site, reported back to the profitability gate: the
-   callee's retained unit and the site's loop depth in the caller. */
-typedef struct inline_site_s {
-    routine_unit *ce;
-    int depth;
-} inline_site;
-
-static int inline_site_weight(int depth)
-{   int w = 1;
-    if (depth > LLVM_STREAM_DEPTH_CAP) depth = LLVM_STREAM_DEPTH_CAP;
-    for (; depth > 0; depth--) w *= LLVM_STREAM_LOOP_WEIGHT;
-    return w;
-}
-
-static int ir_block_index(LLVMBasicBlockRef *blocks, int n,
-    LLVMBasicBlockRef b)
-{   int i;
-    for (i = 0; i < n; i++) if (blocks[i] == b) return i;
-    return -1;
-}
-
-/* Loop depth per basic block, approximated from layout order: an edge to
-   an earlier (or the same) block closes a loop over that block range, and
-   the number of such ranges covering a block is its depth. */
-static void ir_block_depths(LLVMBasicBlockRef *blocks, int *depths,
-    int nblocks)
-{
-    int *delta = calloc((size_t)nblocks + 1, sizeof(int));
-    int i, d;
-    if (!delta) fatalerror("Out of memory computing block loop depths");
-    for (i = 0; i < nblocks; i++) {
-        LLVMValueRef term = LLVMGetBasicBlockTerminator(blocks[i]);
-        unsigned ns, s;
-        if (!term) continue;
-        ns = LLVMGetNumSuccessors(term);
-        for (s = 0; s < ns; s++) {
-            int k = ir_block_index(blocks, nblocks,
-                LLVMGetSuccessor(term, s));
-            if (k >= 0 && k <= i) { delta[k]++; delta[i + 1]--; }
-        }
-    }
-    d = 0;
-    for (i = 0; i < nblocks; i++) { d += delta[i]; depths[i] = d; }
-    free(delta);
-}
-
-static routine_unit *retained_for_symbol(int symindex);  /* defined below */
-
-static int inlining_enabled(void)
-{   const char *v = getenv("I6_LLVM_INLINE");
-    return v && v[0] && strcmp(v, "0") != 0;
-}
-
-/* asm.c consults this to decide whether a deferred routine can be lowered
-   at stash time (inlining off: nothing reads the module later) or must
-   keep its module retained as an inline source. */
-extern int llvm_inlining_enabled(void)
-{   return inlining_enabled();
-}
-
-static int is_call_to(LLVMValueRef call, const char *name)
-{
-    LLVMValueRef f;
-    if (!call || !LLVMIsACallInst(call)) return 0;
-    f = LLVMGetCalledValue(call);
-    if (!f || !LLVMIsAFunction(f)) return 0;
-    return strcmp(LLVMGetValueName(f), name) == 0;
-}
-
-static int fn_within_size(LLVMValueRef fn, int max_blocks, int max_insts)
-{
-    int blocks = 0, insts = 0;
-    LLVMBasicBlockRef bb;
-    for (bb = LLVMGetFirstBasicBlock(fn); bb; bb = LLVMGetNextBasicBlock(bb)) {
-        LLVMValueRef in;
-        if (++blocks > max_blocks) return 0;
-        for (in = LLVMGetFirstInstruction(bb); in;
-             in = LLVMGetNextInstruction(in))
-            if (++insts > max_insts) return 0;
-    }
-    return 1;
-}
-
-/* Discover the eligible call sites of caller_fn (reported in sites_out /
-   ncand_out, in a deterministic order that is identical across clones of
-   the same pristine module) and rewrite a subset of them as real calls
-   to linked-in callee clones: all of them when `select` is NULL, else
-   exactly those with select[ordinal] set. Returns the number rewritten. */
-static int inline_direct_calls(LLVMModuleRef mod, LLVMValueRef caller_fn,
-    int caller_symbol, inline_site *sites_out, int *ncand_out,
-    const unsigned char *select)
-{
-    LLVMBasicBlockRef bb;
-    LLVMValueRef calls[INLINE_MAX_SITES];
-    int callee_sym[INLINE_MAX_SITES];
-    int arity[INLINE_MAX_SITES];
-    int ncalls = 0, i, did = 0;
-    LLVMBuilderRef bld;
-    LLVMBasicBlockRef *blocks;
-    int *bdepths, nblocks = 0, bidx;
-
-    *ncand_out = 0;
-    if (!inlining_enabled()) return 0;
-
-    /* Loop depths per block, for the gate's site weights. */
-    for (bb = LLVMGetFirstBasicBlock(caller_fn); bb;
-         bb = LLVMGetNextBasicBlock(bb)) nblocks++;
-    blocks = malloc((size_t)(nblocks > 0 ? nblocks : 1) * sizeof *blocks);
-    bdepths = malloc((size_t)(nblocks > 0 ? nblocks : 1) * sizeof *bdepths);
-    if (!blocks || !bdepths)
-        fatalerror("Out of memory collecting inline sites");
-    for (bb = LLVMGetFirstBasicBlock(caller_fn), i = 0; bb;
-         bb = LLVMGetNextBasicBlock(bb)) blocks[i++] = bb;
-    ir_block_depths(blocks, bdepths, nblocks);
-
-    /* Collect eligible i6.callf* (0..3 arg) calls to a retained direct
-       routine other than ourselves whose body is within the size caps. */
-    bidx = -1;
-    for (bb = LLVMGetFirstBasicBlock(caller_fn); bb;
-         bb = LLVMGetNextBasicBlock(bb)) {
-        LLVMValueRef in;
-        bidx++;
-        for (in = LLVMGetFirstInstruction(bb); in;
-             in = LLVMGetNextInstruction(in)) {
-            int n;
-            if (!LLVMIsACallInst(in)) continue;
-            for (n = 0; n <= 3; n++) {
-                LLVMValueRef func;
-                routine_unit *ce;
-                int32 marker, value, symindex, callee_symbol;
-                if (!is_call_to(in, inline_call_names[n])) continue;
-                func = LLVMGetOperand(in, 0);
-                if (!is_call_to(func, "i6.sym")) break;
-                marker = (int32)LLVMConstIntGetSExtValue(LLVMGetOperand(func, 0));
-                value  = (int32)LLVMConstIntGetSExtValue(LLVMGetOperand(func, 1));
-                symindex =
-                    (int32)LLVMConstIntGetSExtValue(LLVMGetOperand(func, 2));
-                /* Resolve the reference to the callee's routine symbol. A
-                   direct routine reference is SYMBOL_MV (address deferred
-                   through the symbol) or occasionally the baked IROUTINE_MV,
-                   both carrying the symbol in operand 2. A veneer reference
-                   is VROUTINE_MV carrying the veneer index in operand 1. */
-                if (marker == SYMBOL_MV || marker == IROUTINE_MV)
-                    callee_symbol = symindex;
-                else if (marker == VROUTINE_MV)
-                    callee_symbol = veneer_symbol_for_index(value);
-                else break;
-                if (callee_symbol < 0 || callee_symbol == caller_symbol) break;
-                ce = retained_for_symbol(callee_symbol);
-                if (ce && ce->mod && ce->fn && ncalls < INLINE_MAX_SITES
-                    && fn_within_size(ce->fn, INLINE_MAX_BLOCKS,
-                        INLINE_MAX_INSTS)) {
-                    calls[ncalls] = in;
-                    callee_sym[ncalls] = callee_symbol;
-                    arity[ncalls] = n;
-                    sites_out[ncalls].ce = ce;
-                    sites_out[ncalls].depth = bdepths[bidx];
-                    ncalls++;
-                }
-                break;
-            }
-        }
-    }
-    free(blocks);
-    free(bdepths);
-    *ncand_out = ncalls;
-    if (ncalls == 0) return 0;
-
-    bld = LLVMCreateBuilderInContext(llctx);
-    for (i = 0; i < ncalls; i++) {
-        routine_unit *ce = retained_for_symbol(callee_sym[i]);
-        LLVMModuleRef clone;
-        LLVMValueRef cfn, target, real;
-        LLVMTypeRef fty;
-        unsigned nparams, p;
-        LLVMValueRef args[16];
-        char uniq[48];
-
-        if (select && !select[i]) continue;
-        if (!ce || !ce->mod || !ce->fn) continue;
-        clone = LLVMCloneModule(ce->mod);
-        cfn = LLVMGetNamedFunction(clone, LLVMGetValueName(ce->fn));
-        if (!cfn) { LLVMDisposeModule(clone); continue; }
-        sprintf(uniq, "i6.inl.%d.%d", caller_symbol, i);
-        LLVMSetValueName2(cfn, uniq, strlen(uniq));
-        /* Keep external linkage across the link so the linker does not
-           dead-strip this (as yet unreferenced) function; it is made
-           internal below, once the real call references it. */
-        {   unsigned kind =
-                LLVMGetEnumAttributeKindForName("alwaysinline", 12);
-            LLVMAddAttributeAtIndex(cfn, LLVMAttributeFunctionIndex,
-                LLVMCreateEnumAttribute(llctx, kind, 0));
-        }
-        if (LLVMLinkModules2(mod, clone)) continue;  /* clone consumed */
-        target = LLVMGetNamedFunction(mod, uniq);
-        if (!target) continue;
-        /* Now referenced by the call built below; internal + alwaysinline
-           lets the always-inline pass fold it in and delete it. */
-        LLVMSetLinkage(target, LLVMInternalLinkage);
-        fty = LLVMGlobalGetValueType(target);
-        nparams = LLVMCountParams(target);
-        if (nparams > 16) continue;
-        /* Glulx passes each argument to the matching local; missing locals
-           default to 0, extra arguments are discarded. */
-        for (p = 0; p < nparams; p++)
-            args[p] = ((int)p < arity[i])
-                ? LLVMGetOperand(calls[i], 1 + p)
-                : LLVMConstInt(i32t, 0, FALSE);
-        LLVMPositionBuilderBefore(bld, calls[i]);
-        real = LLVMBuildCall2(bld, fty, target, args, nparams, "inl");
-        LLVMReplaceAllUsesWith(calls[i], real);
-        LLVMInstructionEraseFromParent(calls[i]);
-        did++;
-    }
-    LLVMDisposeBuilder(bld);
-
-    if (did) {
-        LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-        LLVMErrorRef err = LLVMRunPasses(mod, "always-inline", NULL, opts);
-        if (err) LLVMConsumeError(err);
-        LLVMDisposePassBuilderOptions(opts);
-    }
-    return did;
-}
-
-/* Optimize and lower `fn` in `mod`, filling the event buffer on success.
-   On failure sets the stage and why strings to the failing phase and returns FALSE with
-   no other side effects (no fallback logging, no disposal), so the caller
-   can retry a different module. */
-static int try_optimize_and_lower(LLVMModuleRef mod, LLVMValueRef fn,
-    const char **stage, const char **why, int *insts_in, int *insts_out)
-{
-    char *errmsg = NULL;
-    {   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
-        LLVMErrorRef err = LLVMRunPasses(mod, LLVM_PASS_PIPELINE, NULL, opts);
-        LLVMDisposePassBuilderOptions(opts);
-        if (err) {
-            *stage = "direct-optimize";
-            *why = "optimization pass failure";
-            LLVMConsumeError(err);
-            return FALSE;
-        }
-    }
-    unmerge_pointer_selects(fn);
-    if (LLVMVerifyModule(mod, LLVMReturnStatusAction, &errmsg)) {
-        *stage = "direct-post-verify";
-        *why = "post-optimization verification failed";
-        LLVMDisposeMessage(errmsg);
-        return FALSE;
-    }
-    LLVMDisposeMessage(errmsg);
-    dump_module(mod, "direct-post-opt");
-    if (!llvm_lower_routine(mod, fn, why, insts_in, insts_out)) {
-        *stage = "direct-lower";
-        if (!*why) *why = "lowering failed";
-        return FALSE;
-    }
-    return TRUE;
-}
-
-/* The gate's "what the call would have cost anyway" charge for a site:
-   the callee's standalone lowered instructions, binned by internal loop
-   depth (measured once by lowering a clone -- the retained module stays
-   pristine -- and cached in the retained unit), each bin weighted at the
-   site's depth plus the bin's, under the same cap the inlined form's
-   own weighting uses. Charging with a flat weight x total-cost product
-   instead measurably over-credited loopy callees at deep sites: the
-   product can exceed the cap while the inlined body cannot. Clobbers
-   the working event buffer -- the gate computes charges before lowering
-   any form it intends to keep. Falls back to the pre-optimization
-   instruction count (all at depth 0) if the measurement lowering
-   fails. */
-static long long inline_site_charge(routine_unit *ce, int site_depth)
-{
-    long long charge = 0;
-    int d;
-
-    if (!ce->body_hist_valid) {
-        LLVMModuleRef clone = LLVMCloneModule(ce->mod);
-        LLVMValueRef cfn =
-            LLVMGetNamedFunction(clone, LLVMGetValueName(ce->fn));
-        const char *stage, *why;
-        int in_c, out_c, lowered = FALSE;
-        if (cfn) {
-            /* The lowerer checks the routine-being-emitted invariant
-               params == no_locals; satisfy it with the callee's own
-               count for the measurement, then restore the caller's. */
-            int saved_locals = no_locals;
-            no_locals = (int)LLVMCountParams(ce->fn);
-            lowered = try_optimize_and_lower(clone, cfn, &stage, &why,
-                &in_c, &out_c);
-            no_locals = saved_locals;
-        }
-        if (lowered) {
-            llvm_stream_depth_histogram(ce->body_hist);
-            ce->body_loopfree = (ce->body_hist[1] == 0
-                && ce->body_hist[2] == 0 && ce->body_hist[3] == 0);
-        }
-        else {
-            LLVMBasicBlockRef bb;
-            int insts = 0;
-            for (bb = LLVMGetFirstBasicBlock(ce->fn); bb;
-                 bb = LLVMGetNextBasicBlock(bb)) {
-                LLVMValueRef in;
-                for (in = LLVMGetFirstInstruction(bb); in;
-                     in = LLVMGetNextInstruction(in)) insts++;
-            }
-            for (d = 0; d <= LLVM_STREAM_DEPTH_CAP; d++)
-                ce->body_hist[d] = 0;
-            ce->body_hist[0] = insts ? insts : 1;
-            ce->body_loopfree = FALSE;  /* unmeasured: don't trust it */
-        }
-        ce->body_hist_valid = TRUE;
-        LLVMDisposeModule(clone);
-    }
-    for (d = 0; d <= LLVM_STREAM_DEPTH_CAP; d++)
-        charge += (long long)ce->body_hist[d]
-            * inline_site_weight(site_depth + d);
-    return charge > 0 ? charge : 1;
-}
-
+/* The per-routine pipeline: verify the function, run LLVM's function
+   passes over it, legalize the result into shapes the lowerer accepts,
+   and lower it into the event buffer. Returns FALSE with a stage/reason
+   on any failure, leaving fallback logging to the caller. */
 static int process_direct_routine(void)
 {
-    char *errmsg = NULL;
-    const char *why = NULL;
+    const char *stage = NULL, *why = NULL;
     int insts_in = 0, insts_out = 0;
+    int ok = TRUE;
 
-    const char *stage = NULL;
-    int stream_ready = 0;
-
-    if (LLVMVerifyModule(direct_ru.mod, LLVMReturnStatusAction, &errmsg)) {
-        direct_fallback("direct-verify", errmsg ? errmsg : "verification failed");
-        LLVMDisposeMessage(errmsg);
+    if (LLVMVerifyFunction(direct_ru.fn, LLVMReturnStatusAction)) {
+        stage = "direct-verify";
+        why = "verification failed";
+        ok = FALSE;
+    }
+    if (ok) {
+        dump_fn(direct_ru.fn, "direct-pre-opt");
+        {   LLVMPassBuilderOptionsRef opts = LLVMCreatePassBuilderOptions();
+            LLVMErrorRef err = LLVMRunPassesOnFunction(direct_ru.fn,
+                LLVM_PASS_PIPELINE, NULL, opts);
+            LLVMDisposePassBuilderOptions(opts);
+            if (err) {
+                stage = "direct-optimize";
+                why = "optimization pass failure";
+                LLVMConsumeError(err);
+                ok = FALSE;
+            }
+        }
+    }
+    if (ok) {
+        unmerge_pointer_selects(direct_ru.fn);
+        if (LLVMVerifyFunction(direct_ru.fn, LLVMReturnStatusAction)) {
+            stage = "direct-post-verify";
+            why = "post-optimization verification failed";
+            ok = FALSE;
+        }
+    }
+    if (ok) {
+        dump_fn(direct_ru.fn, "direct-post-opt");
+        if (!llvm_lower_routine(llmod, direct_ru.fn, &why,
+                &insts_in, &insts_out)) {
+            stage = "direct-lower";
+            if (!why) why = "lowering failed";
+            ok = FALSE;
+        }
+    }
+    if (!ok) {
+        direct_fallback(stage, why);
         return FALSE;
-    }
-    LLVMDisposeMessage(errmsg);
-    dump_module(direct_ru.mod, "direct-pre-opt");
-
-    /* Inlining, gated per site on profitability. Candidate sites are
-       discovered once on the pristine module and then tried greedily,
-       hottest (deepest-loop) first: each trial clones the pristine
-       module, splices in the accepted set plus the candidate, and lowers
-       for real. A site is kept only if the resulting form's residual --
-       its loop-weighted lowered cost minus a charge for every inlined
-       site (the callee's standalone lowered cost at the site's weight,
-       i.e. what the call would have cost anyway) -- beats the best form
-       so far, starting from the un-inlined baseline. A site whose trial
-       fails to lower or scores worse is dropped individually, so one bad
-       site neither rejects a caller's good sites nor hides behind them;
-       the old revert-on-fallback guard is subsumed. */
-    if (direct_lowering_retained && inlining_enabled()) {
-        inline_site sites[INLINE_MAX_SITES];
-        inline_site scratch[INLINE_MAX_SITES];
-        unsigned char selected[INLINE_MAX_SITES];
-        int order[INLINE_MAX_SITES];
-        long long charge[INLINE_MAX_SITES];
-        int ncand = 0, nacc = 0;
-        void *best_snap = NULL;
-        int best_n = 0, best_locals = 0, best_in = 0, best_out = 0;
-        int base_ok = 0;
-        long long r_best = 0, acc_charge = 0;
-        int i, k;
-
-        memset(selected, 0, sizeof selected);
-
-        {   LLVMModuleRef base = LLVMCloneModule(direct_ru.mod);
-            LLVMValueRef base_fn =
-                LLVMGetNamedFunction(base, LLVMGetValueName(direct_ru.fn));
-            base_ok = base_fn && try_optimize_and_lower(base, base_fn,
-                &stage, &why, &best_in, &best_out);
-            if (base_ok) {
-                r_best = llvm_stream_weighted_cost();
-                best_snap = llvm_stream_snapshot(&best_n);
-                best_locals = llvm_last_patched_locals();
-            }
-            LLVMDisposeModule(base);
-        }
-
-        /* Candidate discovery on the pristine module: nothing is
-           selected, so nothing is rewritten or linked into it. */
-        inline_direct_calls(direct_ru.mod, direct_ru.fn,
-            direct_ru.routine_symbol, sites, &ncand, selected);
-
-        /* Re-derive each candidate's depth from the baseline lowered
-           stream (which the buffer still holds), matching @callf* sites
-           to IR candidates by callee and per-callee ordinal. The charge
-           side must use the same depth model that scores the inlined
-           form; IR-layout depth measurably disagrees with it and the
-           mismatch manufactures large phantom wins. Unmatched candidates
-           keep their IR depth. */
-        if (ncand > 0 && base_ok) {
-            llvm_call_site_info scs[INLINE_MAX_SITES];
-            int nsc = llvm_stream_call_sites(scs, INLINE_MAX_SITES);
-            int j;
-            for (i = 0; i < ncand; i++) {
-                int want = sites[i].ce->routine_symbol;
-                int ordinal = 0, seen = 0;
-                for (j = 0; j < i; j++)
-                    if (sites[j].ce->routine_symbol == want) ordinal++;
-                for (j = 0; j < nsc; j++) {
-                    int sym = (scs[j].marker == VROUTINE_MV)
-                        ? veneer_symbol_for_index(scs[j].value)
-                        : scs[j].symindex;
-                    if (sym != want) continue;
-                    if (seen++ == ordinal) {
-                        sites[i].depth = scs[j].depth;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if (ncand > 0 && base_ok) {
-            long long base_cost = r_best;
-            /* Estimation noise floor: a site must beat the best form by
-               more than this to be kept, so near-zero "wins" (which
-               measurably regress as often as not) are rejected. */
-            long long margin = base_cost / 128 + 1;
-            int ntry = 0;
-            /* Per-site charge. (Measuring a callee body clobbers the
-               event buffer; the baseline is already snapshotted.) Only
-               sites whose callee's lowered body is loop-free are tried:
-               a loopy body's true cost is dominated by iteration counts
-               the static estimator guesses at (8 per level), and its
-               error there measurably swamps the real per-call signal.
-               Loop-free bodies cost what they count. */
-            for (i = 0; i < ncand; i++) {
-                charge[i] = inline_site_charge(sites[i].ce,
-                    sites[i].depth);
-                if (sites[i].ce->body_loopfree) order[ntry++] = i;
-            }
-            /* Deepest-loop sites first; cheaper bodies first among
-               equals (small helpers fold best); same-callee sites kept
-               adjacent so the group loop below sees them as one unit. */
-            for (i = 1; i < ntry; i++) {
-                int o = order[i], j = i;
-                while (j > 0) {
-                    int p = order[j-1];
-                    if (sites[p].depth > sites[o].depth) break;
-                    if (sites[p].depth == sites[o].depth) {
-                        if (charge[p] < charge[o]) break;
-                        if (charge[p] == charge[o]
-                            && sites[p].ce->routine_symbol
-                                <= sites[o].ce->routine_symbol) break;
-                    }
-                    order[j] = order[j-1];
-                    j--;
-                }
-                order[j] = o;
-            }
-
-            /* One greedy trial per (callee, depth) group: sites of the
-               same callee at the same depth are symmetric, and deciding
-               them together keeps the trial count (each trial is a full
-               lowering of the caller) proportional to distinct callees
-               rather than raw call sites. The sort above makes groups
-               adjacent in order[]. */
-            for (k = 0; k < ntry; ) {
-                int gsize = 1;
-                long long gcharge = charge[order[k]];
-                LLVMModuleRef trial;
-                LLVMValueRef trial_fn;
-                int did = 0, nc2, t_in = 0, t_out = 0;
-                int keep = 0, g;
-                while (k + gsize < ntry
-                    && sites[order[k + gsize]].ce == sites[order[k]].ce
-                    && sites[order[k + gsize]].depth
-                        == sites[order[k]].depth) {
-                    gcharge += charge[order[k + gsize]];
-                    gsize++;
-                }
-                for (g = 0; g < gsize; g++) selected[order[k + g]] = 1;
-                trial = LLVMCloneModule(direct_ru.mod);
-                trial_fn = LLVMGetNamedFunction(trial,
-                    LLVMGetValueName(direct_ru.fn));
-                if (trial_fn)
-                    did = inline_direct_calls(trial, trial_fn,
-                        direct_ru.routine_symbol, scratch, &nc2, selected);
-                if (did == nacc + gsize
-                    && try_optimize_and_lower(trial, trial_fn, &stage, &why,
-                           &t_in, &t_out)) {
-                    long long r = llvm_stream_weighted_cost()
-                        - (acc_charge + gcharge);
-                    keep = r + margin <= r_best;
-                    if (llvm_diagnostics_enabled())
-                        printf("LLVM: inline site %s <- %s: depth=%d "
-                            "sites=%d residual=%lld best=%lld -> %s\n",
-                            llvm_current_routine_name(),
-                            symbols[sites[order[k]].ce->routine_symbol].name,
-                            sites[order[k]].depth, gsize, r, r_best,
-                            keep ? "kept" : "rejected");
-                    if (keep) {
-                        r_best = r;
-                        acc_charge += gcharge;
-                        free(best_snap);
-                        best_snap = llvm_stream_snapshot(&best_n);
-                        best_locals = llvm_last_patched_locals();
-                        best_in = t_in;
-                        best_out = t_out;
-                        nacc += gsize;
-                    }
-                }
-                if (!keep)
-                    for (g = 0; g < gsize; g++) selected[order[k + g]] = 0;
-                LLVMDisposeModule(trial);
-                k += gsize;
-            }
-            if (llvm_diagnostics_enabled())
-                printf("LLVM: inline gate %s: candidates=%d tried=%d "
-                    "accepted=%d residual=%lld baseline=%lld\n",
-                    llvm_current_routine_name(), ncand, ntry, nacc, r_best,
-                    base_cost);
-        }
-        else if (ncand > 0 && !base_ok) {
-            /* No baseline to compare against (the un-inlined form is
-               already known not to lower): take the fully inlined form
-               if it lowers. */
-            LLVMModuleRef trial = LLVMCloneModule(direct_ru.mod);
-            LLVMValueRef trial_fn = LLVMGetNamedFunction(trial,
-                LLVMGetValueName(direct_ru.fn));
-            int nc2;
-            if (trial_fn
-                && inline_direct_calls(trial, trial_fn,
-                       direct_ru.routine_symbol, scratch, &nc2, NULL) > 0
-                && try_optimize_and_lower(trial, trial_fn, &stage, &why,
-                       &insts_in, &insts_out))
-                stream_ready = 1;
-            LLVMDisposeModule(trial);
-        }
-
-        if (!stream_ready && base_ok) {
-            /* Put the winning stream (possibly the untouched baseline)
-               back in the buffer and re-patch its header; measurement
-               lowerings clobbered both. */
-            llvm_stream_restore(best_snap, best_n);
-            if (!llvm_patch_routine_locals(best_locals))
-                compiler_error("inline gate could not re-patch header");
-            insts_in = best_in;
-            insts_out = best_out;
-            stream_ready = 1;
-        }
-        free(best_snap);
-    }
-
-    if (!stream_ready) {
-        int ok;
-        if (direct_lowering_retained && inlining_enabled()) {
-            /* The retained module is the snapshot other routines inline;
-               optimization would mutate it in place and make what a
-               caller inlines depend on emission order. Lower a clone and
-               keep the retained module pristine pre-optimization IR. */
-            LLVMModuleRef work = LLVMCloneModule(direct_ru.mod);
-            LLVMValueRef wfn =
-                LLVMGetNamedFunction(work, LLVMGetValueName(direct_ru.fn));
-            ok = wfn && try_optimize_and_lower(work, wfn, &stage, &why,
-                     &insts_in, &insts_out);
-            if (!wfn) { stage = "direct-lower"; why = "clone lost function"; }
-            LLVMDisposeModule(work);
-        }
-        else
-            ok = try_optimize_and_lower(direct_ru.mod, direct_ru.fn, &stage,
-                     &why, &insts_in, &insts_out);
-        if (!ok) {
-            direct_fallback(stage ? stage : "direct-lower",
-                why ? why : "lowering failed");
-            return FALSE;
-        }
     }
     report_backend("direct", "lower", insts_in, insts_out);
     no_routines_direct++;
@@ -2297,35 +1739,21 @@ extern int llvm_pipeline_routine(void)
 
 /* --- Deferred lowering ------------------------------------------------- */
 /* Under deferred lowering, a finished routine is not lowered at parse
-   time. Its whole IR container is moved into a retained array (the module
-   lives on in the shared llctx), keyed by handle, and reset so the next
-   routine builds cleanly. At end of pass asm.c restores each handle and
-   runs the normal pipeline. Rejected/absent IR retains nothing (-1); the
-   routine then replays its shadow stream. */
+   time. Its function stays in the shared module, tracked in a retained
+   array keyed by handle, and the build state resets so the next routine
+   builds cleanly. At end of pass asm.c restores each handle and runs the
+   normal pipeline. Rejected/absent IR retains nothing (-1); the routine
+   then replays its shadow stream. */
 static routine_unit *retained_units;
 static int retained_unit_count, retained_unit_cap;
-
-/* The retained unit for a routine symbol, or NULL. Used by the inliner to
-   find a callee's module. Linear scan; routine counts are modest and this
-   only runs when inlining is enabled. */
-static routine_unit *retained_for_symbol(int symindex)
-{
-    int i;
-    if (symindex < 0) return NULL;
-    for (i = 0; i < retained_unit_count; i++)
-        if (retained_units[i].mod && retained_units[i].routine_symbol == symindex)
-            return &retained_units[i];
-    return NULL;
-}
 
 extern int llvm_retain_direct_routine(int routine_symbol)
 {
     if (direct_ru.state != DIRECT_READY) {
-        /* No lowerable IR: log the build fallback (counts and diagnostics)
-           exactly as the eager pipeline would, so end-of-pass totals match.
-           The routine's captured shadow stream is replayed at end of pass. A
-           classic (INACTIVE) routine had no direct attempt and was already
-           noted, so it logs nothing here. */
+        /* No lowerable IR: log the build fallback now so end-of-pass
+           totals are right. The routine's captured shadow stream is
+           replayed at end of pass. A classic (INACTIVE) routine had no
+           direct attempt and was already noted, so it logs nothing. */
         if (direct_ru.state == DIRECT_REJECTED)
             direct_fallback("direct-build", direct_ru.reason);
         else if (direct_ru.state == DIRECT_BUILDING)
@@ -2341,8 +1769,7 @@ extern int llvm_retain_direct_routine(int routine_symbol)
         retained_unit_cap = nc;
     }
     /* The per-build scratch (allocas/blocks) is dead once the function is
-       finalized; only the module and function are needed to lower or inline
-       it. Free it now so the retained unit holds just those. */
+       finalized; only the function is needed to lower it later. */
     free(direct_ru.locals); direct_ru.locals = NULL; direct_ru.local_count = 0;
     free(direct_ru.labels); direct_ru.labels = NULL; direct_ru.label_count = 0;
     direct_ru.routine_symbol = routine_symbol;
@@ -2356,22 +1783,14 @@ extern int llvm_lower_retained_routine(int handle)
 {
     if (handle < 0 || handle >= retained_unit_count)
         return FALSE;
-    /* Lower a non-owning view of the retained unit: the module stays in
-       retained_units[handle] while the pipeline runs. With inlining
-       enabled it must survive this call untouched (other routines clone
-       it as their inline source); with inlining off nothing reads it
-       again, so it is disposed here rather than held to end of compile. */
+    /* Run the pipeline on the retained function. Success or failure, the
+       function is deleted from the shared module by the pipeline's
+       disposal, so clear the handle. */
     direct_ru = retained_units[handle];
-    direct_lowering_retained = TRUE;
     {   int ok = llvm_pipeline_routine();
-        direct_lowering_retained = FALSE;
         memset(&direct_ru, 0, sizeof direct_ru);
         direct_ru.state = DIRECT_INACTIVE;
-        if (!inlining_enabled() && retained_units[handle].mod) {
-            LLVMDisposeModule(retained_units[handle].mod);
-            retained_units[handle].mod = NULL;
-            retained_units[handle].fn = NULL;
-        }
+        retained_units[handle].fn = NULL;
         return ok;
     }
 }
@@ -2380,9 +1799,6 @@ extern void llvm_codegen_free(void)
 {
     direct_dispose_ir();
     direct_ru.state = DIRECT_INACTIVE;
-    /* With inlining off each retained module was disposed when its
-       routine lowered; with inlining on they persist as inline snapshots
-       and die with the context below. Free the tracking array. */
     free(retained_units);
     retained_units = NULL;
     retained_unit_count = retained_unit_cap = 0;
@@ -2409,6 +1825,10 @@ extern void llvm_codegen_free(void)
         dump_file = NULL;
     }
     if (llctx) {
+        if (llmod) {
+            LLVMDisposeModule(llmod);
+            llmod = NULL;
+        }
         LLVMContextDispose(llctx);
         llctx = NULL;
     }

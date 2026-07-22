@@ -138,11 +138,6 @@ extern int llvm_lower_retained_routine(int handle)
     return FALSE;
 }
 
-extern int llvm_inlining_enabled(void)
-{
-    return FALSE;
-}
-
 extern void llvm_codegen_free(void)
 {
     if (LLVM_CODEGEN && any_routine_captured) {

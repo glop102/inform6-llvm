@@ -1111,9 +1111,9 @@ typedef struct llvm_event_s
    container. Today exactly one routine is captured at a time (`cur_emit`,
    reset at each routine header), so this is a byte-identical regrouping
    of the former loose statics. The point is the datatype: end-of-pass
-   deferral (see the inlining plan) needs to capture a routine's lowered
-   stream and replay it out of parse order, which becomes a copy of this
-   record rather than wrangling ten globals.
+   deferral captures a routine's stream and replays it out of parse
+   order, which becomes a copy of this record rather than wrangling ten
+   globals.
 
    The parse-visible single-writer flags (execution_never_reaches_here,
    sequence_point_follows, labeluse[]) deliberately stay loose globals:
@@ -1134,19 +1134,10 @@ typedef struct routine_emission_s {
     int          direct_errors;
     int          direct_compiler_errors;
     /* The Glulx routine header's location in the holding area, so a
-       local-count rewrite (llvm_patch_routine_locals) can find it. An
-       empty span means no header has been emitted (parse-time lowering
-       under deferral): the patch then records its count here for the
-       end-of-pass header emission instead of rewriting. */
+       local-count rewrite (llvm_patch_routine_locals) can find it. */
     int32        header_ha_start;
     int32        header_ha_end;
     int          header_stackargs;
-    int          prelowered_locals; /* count recorded by a headerless patch,
-                                       or -1 */
-    int          last_patched_locals; /* count of the most recent header
-                                         (emit or patch), for re-patching
-                                         after the inline gate restores a
-                                         competing lowered stream */
 } routine_emission;
 
 /* The one routine currently being captured/emitted. */
@@ -1310,14 +1301,6 @@ extern int32 glulx_opcode_by_name(const char *name)
 extern int llvm_patch_routine_locals(int newcount)
 {   int i;
 
-    /* No header emitted yet (parse-time lowering under deferral): record
-       the count for the end-of-pass header emission. */
-    if (cur_emit.header_ha_start == cur_emit.header_ha_end) {
-        cur_emit.prelowered_locals = newcount;
-        cur_emit.last_patched_locals = newcount;
-        return TRUE;
-    }
-
     /* If anything else landed in the holding area since the header (it
        never should), rewriting would corrupt it; the caller falls back. */
     if (zcode_ha_size != cur_emit.header_ha_end)
@@ -1342,166 +1325,9 @@ extern int llvm_patch_routine_locals(int newcount)
         /* @copy sp _vararg_count; */
         byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0);
     }
-    /* Track the rewritten span so a later patch (the inline gate lowers
-       several competing forms against one header) still matches. */
     cur_emit.header_ha_end = zcode_ha_size;
-    cur_emit.last_patched_locals = newcount;
     return TRUE;
 }
-
-/* --- Inline-gate stream analysis ----------------------------------------- */
-/* The profitability gate compares competing lowered forms of one routine.
-   These helpers operate on the working event buffer: an estimated dynamic
-   cost (instructions weighted by loop nesting inferred from backward
-   branches), and snapshot/restore so a rejected form can be replaced by
-   the kept one. Events are POD (ai.text is nulled at capture), so a
-   snapshot is a plain copy. */
-
-/* Per-event capped loop depth for the buffer, malloc'd (caller frees);
-   NULL for an empty buffer. A branch to an already-defined label closes
-   a loop over [target, branch]; overlap count approximates nesting. */
-static int *stream_event_depths(void)
-{
-    int32 *labelpos;
-    int   *delta, *depths;
-    int i, k, depth;
-
-    if (cur_emit.event_count == 0) return NULL;
-    labelpos = malloc((size_t)(next_label > 0 ? next_label : 1)
-        * sizeof(int32));
-    delta = calloc((size_t)cur_emit.event_count + 1, sizeof(int));
-    depths = malloc((size_t)cur_emit.event_count * sizeof(int));
-    if (!labelpos || !delta || !depths)
-        fatalerror("Out of memory weighing lowered stream");
-    for (i = 0; i < next_label; i++) labelpos[i] = -1;
-    for (i = 0; i < cur_emit.event_count; i++) {
-        llvm_event *ev = &cur_emit.events[i];
-        if (ev->is_label && ev->label >= 0 && ev->label < next_label)
-            labelpos[ev->label] = i;
-    }
-    for (i = 0; i < cur_emit.event_count; i++) {
-        llvm_event *ev = &cur_emit.events[i];
-        if (ev->is_label) continue;
-        for (k = 0; k < ev->ai.operand_count; k++) {
-            assembly_operand *op = &ev->ai.operand[k];
-            if (op->marker != BRANCH_MV && op->marker != JUMP_MV) continue;
-            if (op->value >= 0 && op->value < next_label
-                && labelpos[op->value] >= 0 && labelpos[op->value] <= i) {
-                delta[labelpos[op->value]]++;
-                delta[i + 1]--;
-            }
-        }
-    }
-    depth = 0;
-    for (i = 0; i < cur_emit.event_count; i++) {
-        depth += delta[i];
-        depths[i] = (depth > LLVM_STREAM_DEPTH_CAP)
-            ? LLVM_STREAM_DEPTH_CAP : depth;
-    }
-    free(labelpos);
-    free(delta);
-    return depths;
-}
-
-/* Bin the buffer's instructions by capped loop depth. Weighted cost and
-   the inline gate's charge model both derive from these bins, so the
-   depth cap applies identically to an inlined body and to the charge
-   for leaving the call in place. */
-extern void llvm_stream_depth_histogram(int32 bins[LLVM_STREAM_DEPTH_CAP + 1])
-{
-    int *depths;
-    int i;
-
-    for (i = 0; i <= LLVM_STREAM_DEPTH_CAP; i++) bins[i] = 0;
-    depths = stream_event_depths();
-    if (!depths) return;
-    for (i = 0; i < cur_emit.event_count; i++)
-        if (!cur_emit.events[i].is_label)
-            bins[depths[i]]++;
-    free(depths);
-}
-
-/* The buffer's direct routine calls (@callf*) whose target operand
-   carries a routine marker, in stream order with their loop depths. The
-   gate matches these against IR-level candidates so the charge for
-   leaving a call in place is weighted by the same depth model that
-   scores the inlined form. */
-extern int llvm_stream_call_sites(llvm_call_site_info *out, int max)
-{
-    static int32 call_ops[4];
-    static int call_ops_resolved = FALSE;
-    int *depths;
-    int i, k, n = 0;
-
-    if (!call_ops_resolved) {
-        call_ops[0] = glulx_opcode_by_name("callf");
-        call_ops[1] = glulx_opcode_by_name("callfi");
-        call_ops[2] = glulx_opcode_by_name("callfii");
-        call_ops[3] = glulx_opcode_by_name("callfiii");
-        call_ops_resolved = TRUE;
-    }
-    depths = stream_event_depths();
-    if (!depths) return 0;
-    for (i = 0; i < cur_emit.event_count && n < max; i++) {
-        llvm_event *ev = &cur_emit.events[i];
-        assembly_operand *op;
-        int is_call = FALSE;
-        if (ev->is_label || ev->ai.operand_count < 1) continue;
-        for (k = 0; k < 4; k++)
-            if (ev->ai.internal_number == call_ops[k]) is_call = TRUE;
-        if (!is_call) continue;
-        op = &ev->ai.operand[0];
-        if (op->marker != SYMBOL_MV && op->marker != IROUTINE_MV
-            && op->marker != VROUTINE_MV) continue;
-        out[n].marker = op->marker;
-        out[n].value = op->value;
-        out[n].symindex = op->symindex;
-        out[n].depth = depths[i];
-        n++;
-    }
-    free(depths);
-    return n;
-}
-
-extern int32 llvm_stream_weighted_cost(void)
-{
-    int32 bins[LLVM_STREAM_DEPTH_CAP + 1];
-    int32 cost = 0;
-    int d, w;
-    llvm_stream_depth_histogram(bins);
-    for (d = 0, w = 1; d <= LLVM_STREAM_DEPTH_CAP;
-         d++, w *= LLVM_STREAM_LOOP_WEIGHT)
-        cost += bins[d] * w;
-    return cost;
-}
-
-extern void *llvm_stream_snapshot(int *count_out)
-{
-    void *snap = NULL;
-    *count_out = cur_emit.event_count;
-    if (cur_emit.event_count > 0) {
-        snap = malloc((size_t)cur_emit.event_count * sizeof(llvm_event));
-        if (!snap) fatalerror("Out of memory snapshotting lowered stream");
-        memcpy(snap, cur_emit.events,
-            (size_t)cur_emit.event_count * sizeof(llvm_event));
-    }
-    return snap;
-}
-
-extern void llvm_stream_restore(void *snap, int count)
-{
-    cur_emit.event_count = count;
-    if (count > 0) {
-        ensure_memory_list_available(&cur_emit.events_memlist, count);
-        memcpy(cur_emit.events, snap, (size_t)count * sizeof(llvm_event));
-    }
-}
-
-extern int llvm_last_patched_locals(void)
-{
-    return cur_emit.last_patched_locals;
-}
-
 
 /* ========================================================================= */
 /*   The assembler itself does four things:                                  */
@@ -2368,8 +2194,7 @@ typedef struct deferred_routine_s {
     int    shadow_store;
     int    shadow_instruction_count;
     int    next_label;          /* label count reached while parsing         */
-    int    ir_handle;           /* retained direct module, or -1 (classic)  */
-    int    prelowered;          /* events holds an already-lowered stream   */
+    int    ir_handle;           /* retained direct function, or -1 (classic) */
     llvm_event *events;         /* owned deep copy of the captured stream   */
     int    event_count;
 } deferred_routine;
@@ -2391,7 +2216,6 @@ static void emit_glulx_routine_header(int stackargs, int locals)
     byteout(0, 0); byteout(0, 0);
     if (stackargs) { byteout(0x40, 0); byteout(0x98, 0); byteout(0x00, 0); }
     cur_emit.header_ha_end = zcode_ha_size;
-    cur_emit.last_patched_locals = locals;
 }
 
 /* Snapshot the just-parsed routine (its captured stream deep-copied, and a
@@ -2420,7 +2244,6 @@ static void stash_deferred_routine(int embedded_flag, int ir_handle)
     d->shadow_instruction_count = llvm_shadow_instruction_count;
     d->next_label = next_label;
     d->ir_handle = ir_handle;
-    d->prelowered = FALSE;
     d->event_count = cur_emit.event_count;
     if (cur_emit.event_count > 0) {
         d->events = malloc((size_t)cur_emit.event_count * sizeof(llvm_event));
@@ -2507,11 +2330,9 @@ extern void emit_deferred_routines(void)
 
         /* Lower the retained direct IR (which refills the buffer with the
            lowered stream), or fall back to the captured classic stream,
-           then replay and transfer -- mirroring eager emission. A
-           prelowered routine's buffer already holds its lowered stream. */
-        {   int lowered = d->prelowered
-                || (d->ir_handle >= 0
-                    ? llvm_lower_retained_routine(d->ir_handle) : FALSE);
+           then replay and transfer. */
+        {   int lowered = (d->ir_handle >= 0)
+                ? llvm_lower_retained_routine(d->ir_handle) : FALSE;
             if (!lowered && !cur_emit.shadow_store) {
                 error_named("Routine fell back to classic generation with "
                     "shadow retention disabled (I6_LLVM_SHADOW=0):", d->name);
@@ -2869,39 +2690,6 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
            only when deferral is off. */
         int handle = llvm_retain_direct_routine(routine_symbol); /* -1 classic */
         stash_deferred_routine(embedded_flag, handle);
-        if (handle >= 0 && !llvm_inlining_enabled()) {
-            /* With inlining off no later routine reads this module as an
-               inline source, so lower it now -- routine references
-               resolve through SYMBOL_MV, so lowering needs no addresses
-               -- and retain the small lowered stream instead of holding
-               every module alive to end of pass (a +21% peak-RSS cost).
-               Only header emission and address assignment stay deferred.
-               The shadow copy stashed above remains the fallback if
-               lowering fails here. */
-            deferred_routine *d = &deferred_routines[deferred_routine_count-1];
-            cur_emit.prelowered_locals = -1;
-            if (llvm_lower_retained_routine(handle)) {
-                d->prelowered = TRUE;
-                d->next_label = next_label;  /* lowering allocated labels */
-                if (cur_emit.prelowered_locals >= 0)
-                    d->no_locals = cur_emit.prelowered_locals;
-                free(d->events);
-                d->events = NULL;
-                d->event_count = cur_emit.event_count;
-                if (cur_emit.event_count > 0) {
-                    d->events = malloc((size_t)cur_emit.event_count
-                        * sizeof(llvm_event));
-                    if (!d->events)
-                        fatalerror("Out of memory stashing deferred routine");
-                    memcpy(d->events, cur_emit.events,
-                        (size_t)cur_emit.event_count * sizeof(llvm_event));
-                }
-            }
-            /* Either way the module is gone (llvm_lower_retained_routine
-               disposes it when inlining is off); the handle must not be
-               lowered again at end of pass. */
-            d->ir_handle = -1;
-        }
         cur_emit.capturing = FALSE;
         cur_emit.event_count = 0;
     }
