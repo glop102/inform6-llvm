@@ -119,50 +119,17 @@ records (backend, stage, counts, bailout reason) plus IR dumps to
 `LLVM: backends` / `LLVM: direct fallbacks` counter lines, which the
 corpus tests pin.
 
-## Branch `inlining-deferred-lowering`: Review Findings
+## Branch `inlining-deferred-lowering`: Remaining Work
 
-The branch (commits d63c4f0..9cf10c1) implements deferred lowering —
-no routine is lowered/encoded/addressed during parse; all are retained
-and emitted in one end-of-pass pass after `parse_program` +
-`compile_veneer` — and, on top of it, selective procedure inlining behind
-`I6_LLVM_INLINE` (clone the callee module, link into the caller, rewrite
-the opaque `i6.callf*` as a real call marked alwaysinline, run the
-always-inline pass). A full skeptical audit (2026-07-21, all findings
-independently reproduced) found four blocking miscompiles and five
-secondary defects; all nine are fixed, guarded by the
-`direct-ir-deferred-timing` and `direct-ir-autogen-collision` regression
-fixtures in `tests/directIrTest.nix` (details in git history). What
-follows is the still-open work.
-
-### Verified claims (adversarially checked, hold)
-
-- Byte-identical output with inlining off, master vs branch, across the
-  full story corpus in both `$LLVM=0` and `$LLVM=4`, from a clean
-  worktree baseline. All nine test gates pass.
-- Cloak with inlining on (gated): 153,588 → 146,886 dispatches (−4.36%),
-  transcript identical, no routine changes backend; Life inline-on is
-  54,589,510 — 6 dispatches better than inline-off (ungated it regressed
-  +1,634). Ungated cloak measured −6.02%; the gap is the gate declining
-  what its estimator cannot verify (see the profitability gate section).
-  Microbenchmark (helper called 1,000× in a loop): −28.5%.
-- The revert-on-fallback guard is implemented and works: inlining runs on
-  a throwaway clone and the un-inlined module lowers instead if the
-  inlined form fails to optimize or lower. Measured essential: without
-  it, `Parser__parse` bloats past the local-slot limit, falls back to
-  classic, and erases most of the program-wide gain (−1.39% vs −6.30%
-  at the time of the audit).
-- The SYMBOL_MV address-decoupling argument is sound end-to-end: marked
-  operands are forced to 4-byte `CONSTANT_OT` (width invariant), and
-  `bpatch.c`'s ROUTINE_T `SYMBOL_MV` case applies the identical
-  stripped-address + `code_offset` computation as `IROUTINE_MV`. Veneer
-  overrides, GV2-only grammar, and Z-code isolation all check out.
-- The deferred event-stream deep copy is genuine (POD operands, `ai.text`
-  nulled at capture, memlist-registered buffer); the failed-inline retry
-  cannot leave partial output (every lowering failure exit precedes
-  emission and the buffer resets at emission start); effect-attribute
-  loss across module linking is impossible in the unsafe direction
-  (missing attributes default to full-barrier); no double-frees in the
-  retained-module lifetime.
+The branch defers all routine lowering/addressing to one end-of-pass
+pass and, on top of that, selectively inlines small direct callees
+behind `I6_LLVM_INLINE`, gated greedily per (callee, depth) site group
+against a loop-weighted cost estimate. Status reference (not pinned;
+inlining is opt-in): inline-off is byte-identical to master everywhere;
+inline-on measures cloak −4.36% (146,886) at +10.4% story size, Life −6
+dispatches, transcripts identical, no backend changes; compile time
+inline-on is ~1.1 s on glulxercise and ~12 s on cloak. Everything below
+is open work.
 
 ### Lesson for further emission-order work
 
@@ -176,45 +143,37 @@ corpus" held anyway. Any further emission-order work should hunt for the
 same class: reads of `symbols[].value` or pc-derived values between
 parse and end-of-pass.
 
-### The profitability gate (implemented, greedy per site group)
+### Rethink the inlining cost model
 
-Inline decisions are made greedily per (callee, depth) site group.
-Candidates are discovered on the pristine caller module; the un-inlined
-baseline is lowered first (its loop-weighted cost — instructions
-weighted 8^depth, cap 3, depth inferred from backward branches — is the
-starting best form); then groups are tried hottest-first, each trial a
-real lowering of a fresh clone with the accepted set plus the group
-spliced in. A group is kept only if the trial's residual — its weighted
-cost minus a charge for every inlined site — beats the best form by a
-noise margin (baseline/128). Sites of one callee at one depth decide
-together (they are symmetric, and each trial is a full caller lowering);
-a failing group is dropped individually, so one bad site neither rejects
-a caller's good sites nor hides behind them. Rejection leaves the prior
-best; the lower-failure revert guard is subsumed.
+The current gate's estimator (instructions weighted 8^depth, depth
+capped at 3, inferred from backward branches) has hit its precision
+limit, and the limits were bought with measured regressions — respect
+them until the model itself is replaced:
 
-Two model boundaries were measured in, not assumed:
-
-- **Charges use the same capped depth model that scores the inlined
-  form** (the callee's lowered instructions binned by internal depth,
-  each bin weighted at site depth + bin depth, same cap). A flat
-  weight×cost product over-credited loopy callees at deep sites by the
-  cap asymmetry and manufactured phantom wins.
-- **Only callees whose lowered body is loop-free are tried.** A loopy
-  body's true cost is dominated by iteration counts the estimator
-  guesses at (8 per level); on Life the guess accepted an inlined
-  `PrintGrid` (2,048 cells per call) as a win that measured +1,987
-  dispatches. Loop-free bodies cost what they count — and they are the
-  Z__Region-class leaf helpers the design targeted all along.
-
-`I6_LLVM_DIAGNOSTICS=1` prints one `LLVM: inline site` line per trial
-and an `LLVM: inline gate` summary per caller. Measured: Life inline-on
-is 54,589,510 — six dispatches *better* than inline-off (ungated it
-regressed +1,634); cloak keeps −4.36% (146,886) with story size +10.4%
-(the earlier whole-routine gate reached −5.83% but +27% size by
-accepting loopy-callee inlines the model cannot actually verify — that
-1.5pp is the price of trusting only what the estimator can measure).
-Compile time inline-on: glulxercise ~1.1 s, cloak ~12 s (one caller
-lowering per tried group; the dominant tuning target).
+- **The per-level iteration guess cannot price a loop.** It accepted an
+  inlined `PrintGrid` (2,048 real cells per call against a guessed 64)
+  as a win that measured +1,987 dispatches on Life; that is why only
+  loop-free callee bodies are eligible today, which forfeits the
+  loopy-callee wins the ungated form showed (~1.5pp of cloak's −6.02%).
+  Recovering them needs real cost evidence — the measured per-opcode /
+  weighted dynamic cost model from the metric hierarchy, and iteration
+  evidence (bounded-loop analysis of constant trip counts, or measured
+  attribution) — not a bigger guess.
+- **Any charge term must apply the exact weighting the inlined form's
+  own scoring uses** (same bins, same cap). Two asymmetries were caught
+  manufacturing phantom wins: flat weight×cost products exceeding the
+  cap, and IR-layout depth disagreeing with stream-measured depth. A
+  rethought model must keep this both-sides-identical property by
+  construction.
+- **Estimation noise around zero is real regression risk** — near-tie
+  accepts measurably regressed; the noise margin (baseline/128) is a
+  patch, not a model. A rethought model should quantify its own
+  uncertainty per decision instead.
+- **Trial cost is the binding constraint on model richness**: every
+  candidate group costs a full caller lowering (cloak ~12 s inline-on).
+  Prune groups whose maximum possible win is under the margin, make
+  trial evaluation incremental, or move the model to something cheap
+  enough to score without lowering.
 
 ### Design gaps in the inlining prototype
 
@@ -261,36 +220,26 @@ lowering per tried group; the dominant tuning target).
   conservatively); default-return convention per `embedded_flag`;
   address-assignment order must match emission order; an inlined body
   must not create dependence on a routine's generated address.
-- **The inline source is the callee's pristine pre-optimization module**
-  (settled, deliberately): with inlining on, retained modules are never
-  mutated — each routine's own lowering runs on a clone — so what a
-  caller inlines is independent of emission order, and the caller's
-  pipeline optimizes the inlined body in context. The size-eligibility
-  caps are measured on the same pre-optimization IR.
-- **Module lifetime**: with inlining off, a deferred routine is lowered
-  at stash time (SYMBOL_MV means lowering needs no addresses; only
-  header emission and address assignment are deferred), its module
-  disposed immediately, and the small lowered stream retained in place
-  of the shadow copy — peak RSS on glulxercise is 53.1 MB vs 49.9 eager
-  and 60.6 fully-retained; the ~3 MB residue is the deferred event
-  streams themselves. With inlining on, modules persist to end of
-  compile as inline snapshots.
+- The inline source is the callee's pristine pre-optimization module
+  (settled): retained modules are never mutated, so what a caller
+  inlines is independent of emission order. Future work must not
+  reintroduce in-place mutation of a retained module.
+- Module lifetime (settled): with inlining off, routines lower at stash
+  time and their modules are disposed immediately (only header emission
+  and address assignment stay deferred); with inlining on, modules
+  persist to end of compile as inline snapshots. Future work touching
+  either path keeps the other's lifetime intact.
 - `I6_LLVM_SHADOW=0` now means "do not retain shadows" — any routine
   needing a fallback becomes a compile error, evaluated at end of pass.
 
 ### Remaining inlining work
 
-- Tune the gate and caps: `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS`
-  (currently 16/70 on pre-optimization IR — a crude proxy), the loop
-  weight/depth cap, and the noise margin. Compile time is the dominant
-  cost (one caller lowering per tried group; cloak ~12 s inline-on) —
-  candidates: prune groups whose maximum possible win is below the
-  margin, or make trial evaluation incremental. Recovering the
-  loopy-callee wins the loop-free restriction gave up (~1.5pp on cloak)
-  needs real iteration-count evidence — the weighted dynamic cost model
-  in the metric hierarchy, not a bigger guess. Decide default-on only on
-  cross-corpus evidence (cloak −4.36%, Life −6 dispatches, Advent
-  unmeasured, size +10.4%).
+- Measure Advent inline-on (second real game; still unmeasured), and
+  decide default-on only on cross-corpus evidence: dispatch wins with no
+  regressions, bounded size growth, and acceptable compile time —
+  compile time currently fails that bar (cloak ~12 s).
+- Tune `INLINE_MAX_BLOCKS`/`INLINE_MAX_INSTS` (currently 16/70 on
+  pre-optimization IR — a crude proxy) once the cost model is settled.
 - Phase 3 landing: inline `Z__Region` and hot siblings by default, pin
   the new cloak baseline in `tests/corpusTest.nix`.
 - Focused fixtures: a hot-loop helper that must inline (assert the
@@ -299,23 +248,17 @@ lowering per tried group; the dominant tuning target).
   must not inline, an indirect call that must not, a varargs callee
   excluded, and an ordering fixture whose opaque stream op's barrier
   must survive inlining.
-- Diagnostics: per-routine inlined-callee counts in
-  `I6_LLVM_DIAGNOSTICS=1`; `I6_LLVM_INLINE=0` already works for
-  bisection.
-- Track the deferred-model costs as first-class benchmark outputs: peak
-  compiler RSS and compile time (current data on glulxercise: RSS
-  49.9 eager / 53.1 inline-off / 61 MB inline-on; compile time ~0.2 s
-  inline-off, ~1.1 s inline-on; cloak ~12 s inline-on) on the largest
-  corpus game.
+- Track the deferred-model costs as first-class benchmark outputs (peak
+  compiler RSS, compile time) on the largest corpus game.
 - Open design question: transitive inlining (flatten at snapshot vs
   caller time, depth budget vs recursion guard).
 
 ### Recommended fix order for the branch
 
 1. Clear the open secondary defects above (all minor).
-2. Tune the gate (size term, per-site retry, caps) on cross-corpus
-   measurements, including Advent; then decide default-on and pin
-   baselines.
+2. Rethink the cost model (section above); bring compile time down.
+3. Measure cross-corpus (including Advent); then decide default-on and
+   pin baselines.
 
 ## Open Correctness Work
 
@@ -364,18 +307,21 @@ lowering per tried group; the dominant tuning target).
 
 ## Profitability Model
 
-Successfully lowered routines replace the shadow stream unconditionally.
-Inline acceptance is now conditional on the branch's loop-weighted
-estimate (see the profitability gate above), which is the first working
-instance of the model this section calls for: cost from loop structure
-and measured lowered streams, no PGO, with the retained un-inlined form
-as the ready-made fallback. Still open is applying the same idea to
-*routine replacement* — a direct lowering that estimates worse than the
-shadow stream still replaces it unconditionally — and refining the
-weights with measured per-opcode/operand-mode costs. Until then, focused
-instruction-count tests are the protection that keeps LLVM upgrades and
-lowerer refactors from silently spending IR-level gains on VM
-dispatches.
+Two profitability decisions still need a real cost model (the shared
+requirements — measured per-opcode costs, iteration evidence, symmetric
+weighting, quantified uncertainty — are in the inlining cost-model
+rethink section above):
+
+- **Routine replacement is unconditional**: a direct lowering that
+  estimates worse than the shadow stream still replaces it. Make
+  replacement conditional on the model, with the retained shadow as the
+  ready-made fallback.
+- **Inline acceptance** should move from the current guessed-weight
+  estimator to the same model.
+
+Until then, focused instruction-count tests are the protection that
+keeps LLVM upgrades and lowerer refactors from silently spending
+IR-level gains on VM dispatches.
 
 ## Remaining Test Matrix
 
@@ -435,13 +381,13 @@ four-block layout, switch ordering, global coalescing + clobber decline):
 
 1. Finish the branch (order above): clear the minor open defects; land
    deferred lowering byte-identical.
-2. Tune the inlining gate (size term, per-site retry, caps) on
-   cross-corpus measurements; then land `Z__Region`-class inlining by
-   default and pin new baselines.
-3. Put the real LLVM build and strict optimization suite in Linux CI.
-4. Measure per-opcode/operand-mode costs; validate a weighted dynamic
+2. Measure per-opcode/operand-mode costs; validate a weighted dynamic
    cost model against repeated timings.
-5. Develop the generic CFG profitability estimate and make both routine
-   replacement and inline acceptance conditional on it.
+3. Rethink the inlining cost model on that evidence; bring inline-on
+   compile time down; then land `Z__Region`-class inlining by default on
+   cross-corpus measurements (including Advent) and pin new baselines.
+4. Put the real LLVM build and strict optimization suite in Linux CI.
+5. Make routine replacement (as well as inline acceptance) conditional
+   on the cost model.
 6. Work the open correctness items (poison proof, effect-classification
    tests) and the remaining test matrix opportunistically alongside.
