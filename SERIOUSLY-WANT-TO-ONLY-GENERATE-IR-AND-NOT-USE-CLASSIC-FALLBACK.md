@@ -88,10 +88,14 @@ bookkeeping). Direct IR hooks read this state (`direct_can_emit()`
 checks `execution_never_reaches_here`) but never write it.
 
 Consequence for cleanup: to stop running classic generation entirely,
-the direct backend must *become* the single writer by calling the same
-`asm_parser_*` helpers. EXPLAIN.md ("Is single-writer a blocker") calls
-this flip mechanical — the Phase 6 seam was built for it — but it has
-not been done.
+the direct backend must *become* the single writer. **This flip now
+exists**: the direct backend keeps a parser-state model (reachability +
+classically-entered blocks, `src/llvm_codegen.c`), an always-on
+cross-check compares it with classic's writes at every parser decision
+point (pinned clean over the corpus), and `I6_LLVM_PARSER_WRITER=direct`
+disables classic's bookkeeping writes and lets the model drive the
+globals — byte-identical output, pinned in the tests. See EXPLAIN.md
+("Is single-writer a blocker") for the mechanics.
 
 ### 1.4 Deferred lowering — replay out of parse order
 

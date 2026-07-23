@@ -132,11 +132,33 @@ direct routine's output; its stream is captured and discarded (or with
 
 No — it constrains the *transition state*, not the destination. The
 rule is not "direct may never write"; it is "exactly one writer." Today
-classic runs alongside for every routine, so classic must be the writer.
-If classic Glulx generation stopped running, the direct backend would
-simply *become* the single writer, calling the same `asm_parser_*`
-helpers the capture stubs call now. The Phase 6 separation built exactly
-that seam; flipping the writer is mechanical once classic stops running.
+classic runs alongside for every routine, so classic is the default
+writer. **The flip itself is built and proven** (2026-07-22): the direct
+backend maintains its own parser-state model — reachability mirrored
+from its build events (returns, jumps, noreturn opcodes close; label and
+continuation binds open, the latter only when the block is classically
+entered, so folded-away branches stay unreachable) and a
+classically-entered block set answering the labeluse[] boolean. An
+always-on cross-check compares the model against classic's writes at
+every parser decision point (statement dispatch, forward-label
+resolution, the routine-end fallthrough decision) and prints a
+`parser-crosscheck` line on mismatch; the corpus is pinned clean. With
+`I6_LLVM_PARSER_WRITER=direct` the writer actually flips: classic's
+bookkeeping (shadow_note_instruction and asm_parser_note_label) is
+disabled while the direct build is active and the model writes the
+globals — byte-identical output on every zero-fallback story, pinned
+for cloak, glulxercise, and the fixtures. The mode forces shadow
+retention off (event snapshots assume classic-timed writes), so a
+fallback under it is a compile error — which is exactly the IR-only
+contract it rehearses.
+
+The subtleties the cross-check flushed out, for the record: classic
+folds constant conditions in `assembleg_1_branch` (a plain-constant
+leaf becomes @jump or nothing — and front-end folding wraps constant
+comparisons in "expression used as condition" nodes, so the model looks
+through NONZERO_OP/ZERO_OP wrappers), and the if/else join label is
+materialized only when branched (states.c now uses the same
+forward-resolve idiom for it that loops always used).
 
 The representation gaps that once made this list are all closed:
 custom `@"..."` opcodes and sub-word copies emit verbatim with

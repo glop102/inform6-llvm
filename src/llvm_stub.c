@@ -42,6 +42,8 @@ extern void llvm_direct_random_array_set(int32 addr) { (void)addr; }
 extern int32 llvm_direct_random_array_take(void) { return -1; }
 extern int llvm_direct_can_generate(void) { return FALSE; }
 extern void llvm_direct_suspend(void) { }
+extern int llvm_parser_writer_flipped(void) { return FALSE; }
+extern int llvm_direct_is_parser_writer(void) { return FALSE; }
 extern void llvm_direct_resume(void) { }
 extern void llvm_direct_note_statement(int statement_code)
 { (void)statement_code; }
@@ -103,6 +105,11 @@ extern void llvm_direct_jump_block(llvm_direct_block block) { (void)block; }
 extern void llvm_direct_branch(llvm_direct_value condition,
     llvm_direct_block true_block, llvm_direct_block false_block)
 { (void)condition; (void)true_block; (void)false_block; }
+extern void llvm_direct_branch_leaf(const assembly_operand *leaf,
+    llvm_direct_value condition, llvm_direct_block true_block,
+    llvm_direct_block false_block, int branch_on_true, int negated)
+{ (void)leaf; (void)condition; (void)true_block; (void)false_block;
+  (void)branch_on_true; (void)negated; }
 extern llvm_direct_block llvm_direct_current_block(void) { return NULL; }
 extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
     llvm_direct_block first_block, llvm_direct_value second,

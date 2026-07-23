@@ -3291,7 +3291,8 @@ static llvm_direct_value direct_store_operand(assembly_operand AO,
 }
 
 static void direct_expression_condition(int node,
-    llvm_direct_block true_block, llvm_direct_block false_block);
+    llvm_direct_block true_block, llvm_direct_block false_block,
+    int branch_on_true);
 static llvm_direct_value direct_expression_value(int node);
 static llvm_direct_value direct_checked_object_value(llvm_direct_value obj,
     const assembly_operand *leaf, int rte_number, int allow_classes);
@@ -4092,7 +4093,8 @@ static llvm_direct_value direct_expression_value(int node)
             llvm_direct_block true_from, false_from;
             llvm_direct_value true_value, false_value;
 
-            direct_expression_condition(node, true_block, false_block);
+            direct_expression_condition(node, true_block, false_block,
+                FALSE);
             llvm_direct_bind_block(true_block);
             true_value = llvm_direct_constant(1, 0, 0);
             true_from = llvm_direct_current_block();
@@ -4534,8 +4536,13 @@ static llvm_direct_value direct_expression_value(int node)
     }
 }
 
+/* branch_on_true names the side classic's generation branches to at
+   this position in the tree (the other side is its fallthrough); it
+   decides how the parser-state model mirrors classic's constant folds.
+   The left child of && branches on false, of || on true; the right
+   child inherits the parent's polarity. */
 static void direct_expression_condition(int node, llvm_direct_block true_block,
-    llvm_direct_block false_block)
+    llvm_direct_block false_block, int branch_on_true)
 {
     int first, second;
     llvm_direct_block next;
@@ -4555,11 +4562,12 @@ static void direct_expression_condition(int node, llvm_direct_block true_block,
         }
         next = llvm_direct_new_block();
         if (ET[node].operator_number == LOGAND_OP)
-            direct_expression_condition(first, next, false_block);
+            direct_expression_condition(first, next, false_block, FALSE);
         else
-            direct_expression_condition(first, true_block, next);
+            direct_expression_condition(first, true_block, next, TRUE);
         llvm_direct_bind_block(next);
-        direct_expression_condition(second, true_block, false_block);
+        direct_expression_condition(second, true_block, false_block,
+            branch_on_true);
         return;
     }
     if ((ET[node].operator_number == HAS_OP
@@ -4568,9 +4576,27 @@ static void direct_expression_condition(int node, llvm_direct_block true_block,
         (void)direct_attribute_test(node, true_block, false_block);
         return;
     }
-    value = direct_expression_value(node);
-    if (value)
-        llvm_direct_branch(value, true_block, false_block);
+    /* A bare value in condition context arrives wrapped in
+       NONZERO_OP ("expression used as condition"; ZERO_OP when
+       negated). Classic emits jz/jnz of the child, which
+       assembleg_1_branch folds for a plain constant -- look through
+       the wrapper so the parser-state model can mirror the fold. */
+    {   const assembly_operand *leaf = NULL;
+        int negated = FALSE;
+        if (ET[node].down == -1)
+            leaf = &ET[node].value;
+        else if ((ET[node].operator_number == ZERO_OP
+                || ET[node].operator_number == NONZERO_OP)
+            && ET[ET[node].down].down == -1
+            && ET[ET[node].down].right == -1) {
+            leaf = &ET[ET[node].down].value;
+            negated = (ET[node].operator_number == ZERO_OP);
+        }
+        value = direct_expression_value(node);
+        if (value)
+            llvm_direct_branch_leaf(leaf, value, true_block, false_block,
+                branch_on_true, negated);
+    }
 }
 
 extern void llvm_direct_return_expression(assembly_operand AO)
@@ -4625,11 +4651,13 @@ extern void llvm_direct_condition_expression(assembly_operand AO, int label)
         false_block = branch_block;
     }
     if (AO.type == EXPRESSION_OT)
-        direct_expression_condition(AO.value, true_block, false_block);
+        direct_expression_condition(AO.value, true_block, false_block,
+            label == -3 || label == -4);
     else {
         llvm_direct_value value = direct_operand_value(AO);
         if (value)
-            llvm_direct_branch(value, true_block, false_block);
+            llvm_direct_branch_leaf(&AO, value, true_block, false_block,
+                label == -3 || label == -4, FALSE);
     }
     if (label == -3 || label == -4) {
         llvm_direct_bind_block(branch_block);

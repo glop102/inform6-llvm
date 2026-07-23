@@ -86,6 +86,10 @@ typedef struct routine_unit_s {
     int            local_count;
     LLVMBasicBlockRef *labels;
     int            label_count;
+    LLVMBasicBlockRef *entered;   /* parser-state model: blocks classic's
+                                     stream actually transfers into (branch
+                                     targets and decided folds)             */
+    int            entered_count, entered_cap;
     int            suspended;
     const char    *reason;
     LLVMValueRef  *symstack;
@@ -94,6 +98,8 @@ typedef struct routine_unit_s {
     int            spilled;      /* values our code left on the real stack */
     int            stack_entry;  /* C0 routine: sp operands are real ops    */
     int            routine_symbol;
+    int            model_unreach; /* parser-state model: execution cannot
+                                     reach the current source position      */
 } routine_unit;
 
 /* The one routine currently being built. */
@@ -103,6 +109,167 @@ static LLVMValueRef direct_opaque_call_ex(const char *name,
     LLVMValueRef *args, int count, int void_return);
 
 static int direct_symstack_spill(void);
+
+/* ------------------------------------------------------------------------- */
+/*   The parser-state model and the single-writer flip                        */
+/*                                                                            */
+/*   The parser reads two pieces of assembler state while still parsing the   */
+/*   rest of the routine: execution_never_reaches_here (implicit returns,     */
+/*   unreachable-statement handling) and labeluse[] (materializing forward    */
+/*   labels). Today classic generation writes both as a side effect of each   */
+/*   suppressed instruction (shadow_note_instruction in asm.c). To remove     */
+/*   classic generation, the direct backend must be able to answer the same   */
+/*   questions from its own build, so it maintains a parallel model here:     */
+/*                                                                            */
+/*   - model_unreach mirrors classic's rule (Rf opcodes make the position     */
+/*     unreachable, label definitions make it reachable) driven by direct     */
+/*     events: returns, jumps and noreturn opcodes set it; binding a label    */
+/*     or a continuation block clears it.                                     */
+/*   - label_branched[] answers "was source label L the target of an          */
+/*     explicit branch" (classic's labeluse[] is read only as a boolean at    */
+/*     parse time; the exact counts matter only to the emission-time          */
+/*     recount, which the replay rebuilds from scratch).                      */
+/*                                                                            */
+/*   Sequence points are deliberately out of scope: they only feed shadow     */
+/*   event snapshots, and debug builds never capture.                         */
+/*                                                                            */
+/*   The model is CROSS-CHECKED against the classic-written globals at the    */
+/*   parser's real decision points -- statement dispatch, forward-label       */
+/*   resolution, and the routine-end fallthrough decision. Any mismatch       */
+/*   prints a loud diagnostic line the tests assert absent.                   */
+/*                                                                            */
+/*   I6_LLVM_PARSER_WRITER=direct flips the writer: while the direct build    */
+/*   is active, classic's bookkeeping writes (shadow_note_instruction and     */
+/*   asm_parser_note_label) are disabled and the model writes the globals     */
+/*   instead. Shadow retention is forced off in that mode: the shadow event   */
+/*   snapshots assume classic-timed writes, so a fallback replay would be     */
+/*   unsound. The mode exists to prove byte-identical output with the         */
+/*   direct backend as sole parse-time writer.                                */
+/* ------------------------------------------------------------------------- */
+
+static int crosscheck_mismatches;
+
+/* Is the writer flip requested at all (env, cached)? */
+extern int llvm_parser_writer_flipped(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("I6_LLVM_PARSER_WRITER");
+        cached = (v && strcmp(v, "direct") == 0);
+    }
+    return cached;
+}
+
+/* Is the direct backend the parser-state writer right now? TRUE only in
+   flip mode while a routine is actively building; on rejection or between
+   routines the classic stubs resume writing. */
+extern int llvm_direct_is_parser_writer(void)
+{
+    return llvm_parser_writer_flipped()
+        && direct_ru.state == DIRECT_BUILDING && !direct_ru.suspended;
+}
+
+/* Push the model into the parser-visible global (flip mode only). A
+   transition to reachable clears every bit, as asm_parser_note_label
+   does; while unreachable, the parser-owned NOWARN/ENTIRE bits are
+   preserved. */
+static void direct_writer_sync(void)
+{
+    if (!llvm_direct_is_parser_writer())
+        return;
+    if (!direct_ru.model_unreach)
+        execution_never_reaches_here = EXECSTATE_REACHABLE;
+    else if (!execution_never_reaches_here)
+        execution_never_reaches_here = EXECSTATE_UNREACHABLE;
+}
+
+static void direct_model_close(void)
+{
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
+        return;
+    direct_ru.model_unreach = TRUE;
+    direct_writer_sync();
+}
+
+static void direct_model_open(void)
+{
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
+        return;
+    direct_ru.model_unreach = FALSE;
+    direct_writer_sync();
+}
+
+/* Is bb in the classically-entered set? */
+static int direct_model_entered(LLVMBasicBlockRef bb)
+{
+    int i;
+    if (!bb) return FALSE;
+    for (i = 0; i < direct_ru.entered_count; i++)
+        if (direct_ru.entered[i] == bb) return TRUE;
+    return FALSE;
+}
+
+/* Record that classic's stream transfers into bb (a branch target, or
+   the decided side of a folded constant condition). If bb is a source
+   label's block, this is also the labeluse[] boolean; in flip mode the
+   real counter is fed here, as classic's branches feed it today. */
+static void direct_model_branch_block(LLVMBasicBlockRef bb)
+{
+    int i;
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended || !bb)
+        return;
+    if (!direct_model_entered(bb)) {
+        if (direct_ru.entered_count >= direct_ru.entered_cap) {
+            int nc = direct_ru.entered_cap ? direct_ru.entered_cap * 2 : 32;
+            LLVMBasicBlockRef *n = realloc(direct_ru.entered,
+                (size_t)nc * sizeof(*n));
+            if (!n)
+                fatalerror("Out of memory growing entered-block set");
+            direct_ru.entered = n;
+            direct_ru.entered_cap = nc;
+        }
+        direct_ru.entered[direct_ru.entered_count++] = bb;
+    }
+    if (llvm_direct_is_parser_writer() && direct_ru.labels)
+        for (i = 0; i < direct_ru.label_count; i++)
+            if (direct_ru.labels[i] == bb) {
+                asm_parser_note_branch(i);
+                return;
+            }
+}
+
+/* Record an explicit branch to source label n. */
+static void direct_model_branch_label(int n)
+{
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
+        return;
+    if (n >= 0 && n < direct_ru.label_count && direct_ru.labels)
+        direct_model_branch_block(direct_ru.labels[n]);
+}
+
+static void crosscheck_report(const char *site, int classic, int model)
+{
+    crosscheck_mismatches++;
+    if (crosscheck_mismatches <= 25)
+        printf("LLVM: parser-crosscheck mismatch routine=%s site=%s "
+               "classic=%d direct=%d\n",
+            llvm_current_routine_name(), site, classic, model);
+}
+
+/* Compare the model against the classic-written state. Runs only while
+   the classic stubs are the writer -- in flip mode the globals ARE the
+   model, so there is nothing independent to compare. */
+static void direct_crosscheck_reach(const char *site)
+{
+    int classic;
+    if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
+        return;
+    if (llvm_parser_writer_flipped())
+        return;
+    classic = (execution_never_reaches_here != 0);
+    if (classic != (direct_ru.model_unreach != 0))
+        crosscheck_report(site, classic, direct_ru.model_unreach != 0);
+}
 
 /* Escalate the routine to real-stack mode mid-build: once every
    pending symbolic value is spilled, the real VM stack holds exactly
@@ -511,6 +678,9 @@ static void direct_dispose_ir(void)
     direct_ru.locals = NULL;
     free(direct_ru.labels);
     direct_ru.labels = NULL;
+    free(direct_ru.entered);
+    direct_ru.entered = NULL;
+    direct_ru.entered_count = direct_ru.entered_cap = 0;
     free(direct_ru.symstack);
     direct_ru.symstack = NULL;
     direct_ru.local_count = 0;
@@ -537,6 +707,7 @@ extern void llvm_direct_routine_begin(const char *name, int local_count,
     direct_ru.suspended = 0;
     direct_ru.symstack_depth = 0;
     direct_ru.spilled = 0;
+    direct_ru.model_unreach = FALSE;   /* routine entry is reachable */
     /* Stack-argument (C0) routines: the header pops the caller's count
        into _vararg_count (local 1, so param 0 models it like any other
        initial local value) and the arguments stay on the VM stack, so
@@ -596,6 +767,12 @@ extern void llvm_direct_routine_finish(int embedded_flag,
     LLVMBasicBlockRef bb;
     if (direct_ru.state != DIRECT_BUILDING)
         return;
+    /* The implicit-return decision: classic answered from
+       execution_never_reaches_here before emitting the return. */
+    if (!direct_ru.suspended && !llvm_parser_writer_flipped()
+        && (fallthrough_reachable != 0) != (direct_ru.model_unreach == 0))
+        crosscheck_report("routine-end", fallthrough_reachable != 0,
+            direct_ru.model_unreach == 0);
     bb = LLVMGetInsertBlock(direct_ru.bld);
     if (fallthrough_reachable) {
         if (!bb || LLVMGetBasicBlockTerminator(bb)) {
@@ -968,8 +1145,10 @@ extern llvm_direct_value llvm_direct_glulx_op(const char *opcode,
     result = direct_opaque_call_ex(name, args, count,
         !(flags & OPFLAG_STORE));
     /* Opcodes that never return (quit, restart...) end the block. */
-    if (flags & OPFLAG_RETURNS)
+    if (flags & OPFLAG_RETURNS) {
         LLVMBuildUnreachable(direct_ru.bld);
+        direct_model_close();
+    }
     return (flags & OPFLAG_STORE) ? result : (llvm_direct_value)direct_ru.fn;
 }
 
@@ -1062,12 +1241,14 @@ extern void llvm_direct_return_value(llvm_direct_value value)
     if (!direct_can_emit() || !value) return;
     direct_discard_symstack();
     LLVMBuildRet(direct_ru.bld, value);
+    direct_model_close();
 }
 
 extern void llvm_direct_note_statement(int statement_code)
 {
     if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
+    direct_crosscheck_reach("statement");
     if (statement_code != RETURN_CODE && statement_code != RTRUE_CODE
         && statement_code != RFALSE_CODE && statement_code != JUMP_CODE
         && statement_code != IF_CODE && statement_code != BREAK_CODE
@@ -1114,6 +1295,7 @@ extern void llvm_direct_return_constant(int32 value)
     if (!direct_can_emit()) return;
     direct_discard_symstack();
     LLVMBuildRet(direct_ru.bld, LLVMConstInt(i32t, (uint32_t)value, FALSE));
+    direct_model_close();
 }
 
 extern void llvm_direct_return_local(int source)
@@ -1127,6 +1309,7 @@ extern void llvm_direct_return_local(int source)
     value = LLVMBuildLoad2(direct_ru.bld, i32t, direct_ru.locals[source], "value");
     direct_discard_symstack();
     LLVMBuildRet(direct_ru.bld, value);
+    direct_model_close();
 }
 
 static LLVMBasicBlockRef direct_label_block(int label)
@@ -1176,6 +1359,11 @@ extern void llvm_direct_bind_block(llvm_direct_block block)
     if (current && !LLVMGetBasicBlockTerminator(current))
         LLVMBuildBr(direct_ru.bld, block);
     LLVMPositionBuilderAtEnd(direct_ru.bld, block);
+    /* Classic reaches this position by falling through (model open) or
+       because its stream transfers here; a continuation only entered
+       through folded-away branches stays unreachable. */
+    if (!direct_ru.model_unreach || direct_model_entered(block))
+        direct_model_open();
 }
 
 extern void llvm_direct_jump_block(llvm_direct_block block)
@@ -1183,6 +1371,8 @@ extern void llvm_direct_jump_block(llvm_direct_block block)
     if (!direct_can_emit() || !block)
         return;
     LLVMBuildBr(direct_ru.bld, block);
+    direct_model_branch_block(block);
+    direct_model_close();
 }
 
 extern void llvm_direct_branch(llvm_direct_value condition,
@@ -1194,6 +1384,40 @@ extern void llvm_direct_branch(llvm_direct_value condition,
     test = LLVMBuildICmp(direct_ru.bld, LLVMIntNE, condition,
         LLVMConstInt(i32t, 0, FALSE), "condition");
     LLVMBuildCondBr(direct_ru.bld, test, true_block, false_block);
+    direct_model_branch_block(true_block);
+    direct_model_branch_block(false_block);
+}
+
+/* As llvm_direct_branch, but for a condition leaf whose operand classic
+   may fold (assembleg_1_branch folds a plain constant: the branch side
+   becomes an unconditional @jump when taken, nothing when not). The IR
+   CondBr is identical either way; only the parser-state model follows
+   classic's fold. branch_on_true names the side classic branches to;
+   the other side is classic's fallthrough. */
+extern void llvm_direct_branch_leaf(const assembly_operand *leaf,
+    llvm_direct_value condition, llvm_direct_block true_block,
+    llvm_direct_block false_block, int branch_on_true, int negated)
+{
+    LLVMValueRef test;
+    int truth;
+    if (!direct_can_emit() || !condition || !true_block || !false_block)
+        return;
+    if (!leaf || leaf->marker != 0 || !is_constant_ot(leaf->type)) {
+        llvm_direct_branch(condition, true_block, false_block);
+        return;
+    }
+    test = LLVMBuildICmp(direct_ru.bld, LLVMIntNE, condition,
+        LLVMConstInt(i32t, 0, FALSE), "condition");
+    LLVMBuildCondBr(direct_ru.bld, test, true_block, false_block);
+    /* Classic's stream continues only into the decided side: as an
+       emitted @jump when that is the branch target (unreachable after),
+       or as plain fallthrough when it is not (nothing emitted). */
+    truth = (leaf->value != 0) != (negated != 0);
+    direct_model_branch_block(truth
+        ? (LLVMBasicBlockRef)true_block
+        : (LLVMBasicBlockRef)false_block);
+    if ((branch_on_true != 0) == truth)
+        direct_model_close();
 }
 
 extern llvm_direct_block llvm_direct_current_block(void)
@@ -1261,8 +1485,11 @@ extern void llvm_direct_jump(int label)
     if (!direct_can_emit()) return;
     if (!direct_symstack_spill()) return;
     target = direct_label_block(label);
-    if (target)
+    if (target) {
         LLVMBuildBr(direct_ru.bld, target);
+        direct_model_branch_label(label);
+        direct_model_close();
+    }
 }
 
 extern void llvm_direct_bind_label(int label)
@@ -1277,6 +1504,7 @@ extern void llvm_direct_bind_label(int label)
     if (current && !LLVMGetBasicBlockTerminator(current))
         LLVMBuildBr(direct_ru.bld, target);
     LLVMPositionBuilderAtEnd(direct_ru.bld, target);
+    direct_model_open();
 }
 
 extern void llvm_direct_resolve_label(int label, int used)
@@ -1285,6 +1513,15 @@ extern void llvm_direct_resolve_label(int label, int used)
     LLVMBuilderRef builder;
     if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
+    /* The shared materialization decision: classic answered from
+       labeluse[], the model from its own branch tracking. */
+    if (!llvm_parser_writer_flipped()) {
+        int model = (label >= 0 && label < direct_ru.label_count
+            && direct_ru.labels
+            && direct_model_entered(direct_ru.labels[label]));
+        if ((used != 0) != model)
+            crosscheck_report("forward-label", used != 0, model);
+    }
     if (used) {
         llvm_direct_bind_label(label);
         return;
@@ -1437,8 +1674,10 @@ static void direct_asm_opaque(const assembly_instruction *ai, int flags,
         !(flags & OPFLAG_STORE));
     if (flags & OPFLAG_STORE)
         direct_asm_store(&ai->operand[ai->operand_count - 1], result);
-    if (flags & OPFLAG_RETURNS)
+    if (flags & OPFLAG_RETURNS) {
         LLVMBuildUnreachable(direct_ru.bld);
+        direct_model_close();
+    }
 }
 
 static void direct_asm_binop(const assembly_instruction *ai, LLVMOpcode opc)
@@ -1468,6 +1707,7 @@ static void direct_asm_condbranch(const assembly_instruction *ai,
     else_bb = LLVMAppendBasicBlockInContext(llctx, direct_ru.fn, "asm.next");
     LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
     LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
+    direct_model_branch_label((int)target);
 }
 
 /* A branch opcode with no native compare form (jfeq, jdlt, jisnan...):
@@ -1499,6 +1739,7 @@ static void direct_asm_branch_opaque(const assembly_instruction *ai)
     else_bb = LLVMAppendBasicBlockInContext(llctx, direct_ru.fn, "asm.next");
     LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
     LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
+    direct_model_branch_label((int)target);
 }
 
 /* Verbatim emission for instructions whose operands must keep their
@@ -1595,6 +1836,7 @@ static void direct_asm_verbatim(const assembly_instruction *ai)
             "asm.next");
         LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
         LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
+        direct_model_branch_label((int)target);
         return;
     }
     result = direct_opaque_call_ex(name, args, n_args, !store_local);
@@ -1602,8 +1844,10 @@ static void direct_asm_verbatim(const assembly_instruction *ai)
         if (!result) return;
         direct_asm_store(&ai->operand[n_forms - 1], result);
     }
-    if (flags & OPFLAG_RETURNS)
+    if (flags & OPFLAG_RETURNS) {
         LLVMBuildUnreachable(direct_ru.bld);
+        direct_model_close();
+    }
 }
 
 /* If the operand is an unmarked integer constant, put its value in *v. */
@@ -1738,6 +1982,8 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
             target = direct_label_block((int)ai->operand[0].value);
             if (!target) return;
             LLVMBuildBr(direct_ru.bld, target);
+            direct_model_branch_label((int)ai->operand[0].value);
+            direct_model_close();
         }
         return;
     case jz_gc:   direct_asm_condbranch(ai, LLVMIntEQ,  TRUE);  return;
@@ -1760,6 +2006,7 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
             direct_ru.symstack_depth = 0;
             direct_ru.spilled = 0;
             LLVMBuildRet(direct_ru.bld, a);
+            direct_model_close();
         }
         return;
 
@@ -1818,8 +2065,10 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
             if (flags & OPFLAG_STORE)
                 direct_asm_store(&ai->operand[ai->operand_count - 1],
                     result);
-            if (flags & OPFLAG_RETURNS)
+            if (flags & OPFLAG_RETURNS) {
                 LLVMBuildUnreachable(direct_ru.bld);
+                direct_model_close();
+            }
         }
         return;
 
@@ -1863,6 +2112,7 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
                 "asm.next");
             LLVMBuildCondBr(direct_ru.bld, cond, then_bb, else_bb);
             LLVMPositionBuilderAtEnd(direct_ru.bld, else_bb);
+            direct_model_branch_label((int)target);
         }
         return;
 
@@ -2106,6 +2356,8 @@ extern int llvm_retain_direct_routine(int routine_symbol)
        finalized; only the function is needed to lower it later. */
     free(direct_ru.locals); direct_ru.locals = NULL; direct_ru.local_count = 0;
     free(direct_ru.labels); direct_ru.labels = NULL; direct_ru.label_count = 0;
+    free(direct_ru.entered); direct_ru.entered = NULL;
+    direct_ru.entered_count = direct_ru.entered_cap = 0;
     free(direct_ru.symstack); direct_ru.symstack = NULL;
     direct_ru.symstack_cap = 0;
     direct_ru.routine_symbol = routine_symbol;
@@ -2158,6 +2410,11 @@ extern void llvm_codegen_free(void)
             no_routines_direct_build_failed,
             no_routines_direct_lower_failed);
     }
+    if (crosscheck_mismatches) {
+        printf("LLVM: parser-crosscheck mismatches=%d\n",
+            crosscheck_mismatches);
+    }
+    crosscheck_mismatches = 0;
     no_routines_direct = 0;
     no_routines_direct_fallback = 0;
     no_routines_direct_build_failed = 0;

@@ -2436,9 +2436,9 @@ static void parse_statement_g(int break_label, int continue_label)
                  /* The "else" label (or end of statement, if there is no "else") */
                    labelexists = FALSE;
                    if (ln >= 0) {
-                       if (!pre_unreach)
-                           llvm_direct_bind_label(ln);
                        labelexists = assemble_forward_label_no(ln);
+                       if (!pre_unreach)
+                           llvm_direct_resolve_label(ln, labelexists);
                   }
 
                  if (flag)
@@ -2466,9 +2466,9 @@ static void parse_statement_g(int break_label, int continue_label)
 
                      /* The post-"else" label */
                        if (ln >= 0) {
+                           labelexists = assemble_forward_label_no(ln2);
                            if (!pre_unreach)
-                               llvm_direct_bind_label(ln2);
-                           assemble_forward_label_no(ln2);
+                               llvm_direct_resolve_label(ln2, labelexists);
                       }
                  }
                  else

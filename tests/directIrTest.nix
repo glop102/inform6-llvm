@@ -232,6 +232,21 @@ let
     ${lib.getExe inform6-llvm} -G '$LLVM=0' \
       ${../stories/direct-ir-limits.inf} "$out"
   '';
+  # Single-writer flip (I6_LLVM_PARSER_WRITER=direct): the direct
+  # backend writes the parser-visible state instead of classic
+  # generation; the fixtures must come out byte-identical.
+  phase1Flip = runCommand "direct-ir-writer-flip-phase1.ulx" { } ''
+    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${../stories/direct-ir-phase1.inf} "$out"
+  '';
+  memoryStrictFlip = runCommand "direct-ir-writer-flip-memory.ulx" { } ''
+    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${../stories/direct-ir-memory.inf} "$out"
+  '';
+  limitsFlip = runCommand "direct-ir-writer-flip-limits.ulx" { } ''
+    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${../stories/direct-ir-limits.inf} "$out"
+  '';
 in
 writeShellApplication {
   name = "inform6-llvm-test-direct-ir";
@@ -269,6 +284,30 @@ writeShellApplication {
     fi
     if ! cmp -s ${defaultMode}/story.ulx ${direct}/story.ulx; then
         echo "FAIL  direct-ir (default mode output differs from explicit direct mode)"
+        fail=1
+    fi
+
+    # The parser-state model must agree with classic's bookkeeping at
+    # every parser decision point (always-on crosscheck), and the
+    # single-writer flip must not change a byte.
+    for log in ${direct}/compile.log ${memoryStrictDirect}/compile.log \
+        ${memoryLooseDirect}/compile.log ${limitsDirect}/compile.log; do
+        if grep -aq 'parser-crosscheck' "$log"; then
+            echo "FAIL  direct-ir (parser-state crosscheck mismatches in $log)"
+            grep -a 'parser-crosscheck' "$log" | head -5
+            fail=1
+        fi
+    done
+    if ! cmp -s ${phase1Flip} ${direct}/story.ulx; then
+        echo "FAIL  direct-ir (single-writer flip changed phase1 bytes)"
+        fail=1
+    fi
+    if ! cmp -s ${memoryStrictFlip} ${memoryStrictDirect}/story.ulx; then
+        echo "FAIL  direct-ir (single-writer flip changed memory bytes)"
+        fail=1
+    fi
+    if ! cmp -s ${limitsFlip} ${limitsDirect}/story.ulx; then
+        echo "FAIL  direct-ir (single-writer flip changed limits bytes)"
         fail=1
     fi
 

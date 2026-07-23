@@ -2277,6 +2277,8 @@ extern int   llvm_direct_can_generate(void);
 extern void  llvm_direct_suspend(void);
 extern void  llvm_direct_resume(void);
 extern void  llvm_direct_note_statement(int statement_code);
+extern int   llvm_parser_writer_flipped(void);
+extern int   llvm_direct_is_parser_writer(void);
 typedef void *llvm_direct_value;
 typedef void *llvm_direct_block;
 extern llvm_direct_value llvm_direct_constant(int32 value, int marker,
@@ -2320,6 +2322,11 @@ extern void  llvm_direct_jump_block(llvm_direct_block block);
 extern void  llvm_direct_branch(llvm_direct_value condition,
                  llvm_direct_block true_block,
                  llvm_direct_block false_block);
+extern void  llvm_direct_branch_leaf(const assembly_operand *leaf,
+                 llvm_direct_value condition,
+                 llvm_direct_block true_block,
+                 llvm_direct_block false_block, int branch_on_true,
+                 int negated);
 extern llvm_direct_block llvm_direct_current_block(void);
 extern llvm_direct_value llvm_direct_phi(llvm_direct_value first,
                  llvm_direct_block first_block, llvm_direct_value second,

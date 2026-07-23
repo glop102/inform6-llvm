@@ -1773,6 +1773,20 @@ extern void assembleg_instruction(const assembly_instruction *AI)
 
     ASSERT_GLULX();
 
+    /* Single-writer flip (I6_LLVM_PARSER_WRITER=direct): while the direct
+       backend writes the parser state, the classic stream is neither
+       stored (shadow retention is forced off) nor gated on reachability --
+       the direct build has already advanced the state past this
+       instruction's source position, so the gate would misfire. */
+    if (cur_emit.capturing && !cur_emit.replaying
+        && llvm_direct_is_parser_writer()) {
+        if (LLVM_CODEGEN && AI->internal_number == jumpabs_gc)
+            warning("LLVM optimization does not preserve generated code "
+                "addresses used by @jumpabs");
+        llvm_shadow_instruction_count++;
+        return;
+    }
+
     if (execution_never_reaches_here) {
         if (!(execution_never_reaches_here & EXECSTATE_NOWARN)) {
             warning("This statement can never be reached");
@@ -2114,7 +2128,10 @@ extern void assemble_label_no(int n)
                 ((long int) zmachine_pc), n);
         set_label_offset(n, zmachine_pc);
     }
-    asm_parser_note_label();
+    /* Under the single-writer flip the direct backend's label binds set
+       reachability; classic's internal labels must not clobber it. */
+    if (!llvm_direct_is_parser_writer())
+        asm_parser_note_label();
 }
 
 /* This is the same as assemble_label_no, except we only set up the label
@@ -2555,6 +2572,11 @@ extern int32 assemble_routine_header(int routine_asterisked, char *name,
             && !debugfile_switch && !define_INFIX_switch) {
             cur_emit.capturing = TRUE;
             cur_emit.shadow_store = llvm_shadow_enabled();
+            /* The flip's direct-written state is synced at direct-build
+               time, not classic-emission time, so shadow event snapshots
+               would be skewed; a fallback replay would be unsound. */
+            if (llvm_parser_writer_flipped())
+                cur_emit.shadow_store = FALSE;
             cur_emit.event_count = 0;
             llvm_shadow_instruction_count = 0;
             cur_emit.header_ha_end = zcode_ha_size;
