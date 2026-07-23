@@ -2277,6 +2277,8 @@ extern int   llvm_direct_can_generate(void);
 extern void  llvm_direct_suspend(void);
 extern void  llvm_direct_resume(void);
 extern void  llvm_direct_note_statement(int statement_code);
+extern void  llvm_direct_code_bytes(int32 index);
+extern void  llvm_buffer_append_bytes(int n);
 extern int   llvm_parser_writer_flipped(void);
 extern int   llvm_direct_is_parser_writer(void);
 typedef void *llvm_direct_value;

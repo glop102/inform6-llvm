@@ -91,10 +91,11 @@ Measurement caveats that remain true:
 - **Shadow retention is permanent architecture.** The parser is
   streaming — a routine cannot be re-parsed — so the classic stream
   captured at parse time is the only way to emit a routine the
-  pipeline rejects. With the corpus at zero fallbacks the remaining
-  rejects are genuinely untranslatable or unmodeled shapes (raw code
-  byte arrays, unsupported statements), and the safety valve stays for
-  whatever user code does next.
+  pipeline rejects. With box and raw code-byte arrays now represented
+  (veneer call; verbatim blob anchors), the remaining rejects are bare
+  code blocks, degenerate statements, and tree shapes the direct
+  generators don't recognize, and the safety valve stays for whatever
+  user code does next.
 - **Classic generation stays.** It backs the fallback, debug/INFIX
   builds, and `$LLVM=0` bisection. The single-writer rule: direct
   hooks read parser state, classic generation is the sole writer (see

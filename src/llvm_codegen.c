@@ -2194,6 +2194,26 @@ extern void llvm_direct_glulx_macro(const assembly_instruction *ai,
     }
 }
 
+/* A raw code-byte array (@ -> ...): carried as an opaque full-barrier
+   anchor the lowerer re-emits verbatim in place. The bytes can do
+   anything -- address the stack, branch by fixed offsets over their
+   neighbors -- so the routine escalates to real-stack mode first
+   (pending symbolic values spill where classic's pushes sat) and the
+   unmarked declaration keeps every load, store and call on its own
+   side of the blob. Frame-offset assumptions inside the bytes remain
+   out of contract, as with catch tokens: lowering reassigns slots. */
+extern void llvm_direct_code_bytes(int32 index)
+{
+    char name[32];
+    if (!direct_can_emit()) return;
+    if (!direct_stack_escalate()) {
+        llvm_direct_reject("code bytes across pending stack");
+        return;
+    }
+    sprintf(name, "i6.codebytes.%ld", (long)index);
+    (void)direct_opaque_call_ex(name, NULL, 0, TRUE);
+}
+
 /* Dump the routine's IR when machine-readable diagnostics are enabled. */
 static void dump_fn(LLVMValueRef fn, const char *phase)
 {

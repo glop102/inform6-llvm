@@ -502,6 +502,12 @@ static void classify(LLVMValueRef in, valinfo *vi)
                     vi->kind = VK_SLOT;
                 return;
             }
+            if (name_has_prefix(name, "i6.codebytes.")) {
+                /* A raw code-byte blob anchor: no operands, no value. */
+                if (LLVMGetNumArgOperands(in) != 0)
+                    lfail("codebytes arg count");
+                return;
+            }
             {   int32 vopnum, vcode;
                 int vflags, vbr;
                 char vforms[10];
@@ -1537,6 +1543,12 @@ static void emit_instruction(LLVMValueRef in)
                         genop(vopnum, count, ops);
                     return;
                 }
+            }
+            if (name_has_prefix(name, "i6.codebytes.")) {
+                llvm_buffer_append_bytes(atoi(name + 13));
+                n_emitted++;
+                last_emit_noreturn = FALSE;
+                return;
             }
             if (strcmp(name, "i6.catchtok") == 0)
                 return;  /* the paired i6.catchflag emits the catch */

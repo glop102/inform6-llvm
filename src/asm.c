@@ -1094,7 +1094,9 @@ static void make_opcode_syntax_g(opcodeg opco)
    definition. */
 typedef struct llvm_event_s
 {   int is_label;           /* TRUE: label event; FALSE: instruction event   */
+    int is_bytes;           /* TRUE: raw code-byte blob event                */
     int label;              /* label number, for label events                */
+    int bytes_index;        /* blob index, for byte events                   */
     int exec_state;         /* execution_never_reaches_here at capture time  */
     int seq_point;          /* sequence_point_follows at capture time        */
     assembly_instruction ai;
@@ -1185,6 +1187,7 @@ static void llvm_capture_instruction(const assembly_instruction *AI)
     ensure_memory_list_available(&cur_emit.events_memlist, cur_emit.event_count+1);
     ev = &cur_emit.events[cur_emit.event_count++];
     ev->is_label = FALSE;
+    ev->is_bytes = FALSE;
     ev->label = -1;
     ev->exec_state = execution_never_reaches_here;
     ev->seq_point = sequence_point_follows;
@@ -1209,6 +1212,7 @@ static void llvm_capture_label(int n)
     ensure_memory_list_available(&cur_emit.events_memlist, cur_emit.event_count+1);
     ev = &cur_emit.events[cur_emit.event_count++];
     ev->is_label = TRUE;
+    ev->is_bytes = FALSE;
     ev->label = n;
     /* The strip-label check has already run (and declined to strip), so it
        must not fire again at replay time: clear the ENTIRE bit. The
@@ -1217,6 +1221,90 @@ static void llvm_capture_label(int n)
     ev->exec_state = execution_never_reaches_here & ~EXECSTATE_ENTIRE;
     ev->seq_point = FALSE;
 
+}
+
+/* Raw code-byte arrays (@ -> ... / @ --> ...), kept per blob in a
+   compile-lifetime side table so both the shadow stream and the lowered
+   stream can re-emit them verbatim. A word entry may carry a backpatch
+   marker on its first byte, exactly as classic emits it. */
+typedef struct code_byte_entry_s {
+    int32 value;
+    int   marker;
+    int   isword;
+} code_byte_entry;
+
+static code_byte_entry *code_byte_entries;
+static int32 code_byte_entry_count, code_byte_entry_cap;
+typedef struct code_byte_blob_s { int32 start; int32 count; } code_byte_blob;
+static code_byte_blob *code_byte_blobs;
+static int32 code_byte_blob_count, code_byte_blob_cap;
+
+static void code_byte_entry_add(int32 value, int marker, int isword)
+{
+    if (code_byte_entry_count >= code_byte_entry_cap) {
+        int32 nc = code_byte_entry_cap ? code_byte_entry_cap * 2 : 64;
+        code_byte_entry *n = realloc(code_byte_entries,
+            (size_t)nc * sizeof(*n));
+        if (!n) fatalerror("Out of memory storing code byte arrays");
+        code_byte_entries = n;
+        code_byte_entry_cap = nc;
+    }
+    code_byte_entries[code_byte_entry_count].value = value;
+    code_byte_entries[code_byte_entry_count].marker = marker;
+    code_byte_entries[code_byte_entry_count].isword = isword;
+    code_byte_entry_count++;
+}
+
+static int32 code_byte_blob_note(int32 start, int32 count)
+{
+    if (code_byte_blob_count >= code_byte_blob_cap) {
+        int32 nc = code_byte_blob_cap ? code_byte_blob_cap * 2 : 16;
+        code_byte_blob *n = realloc(code_byte_blobs, (size_t)nc * sizeof(*n));
+        if (!n) fatalerror("Out of memory storing code byte arrays");
+        code_byte_blobs = n;
+        code_byte_blob_cap = nc;
+    }
+    code_byte_blobs[code_byte_blob_count].start = start;
+    code_byte_blobs[code_byte_blob_count].count = count;
+    return code_byte_blob_count++;
+}
+
+/* Encode blob n at the current position, exactly as the classic parse
+   loop byteouts it. */
+static void emit_code_byte_blob(int32 n)
+{
+    int32 i;
+    code_byte_blob *blob;
+    if (n < 0 || n >= code_byte_blob_count) {
+        compiler_error("Code byte blob index out of range");
+        return;
+    }
+    blob = &code_byte_blobs[n];
+    for (i = 0; i < blob->count; i++) {
+        code_byte_entry *e = &code_byte_entries[blob->start + i];
+        if (!e->isword) {
+            byteout((e->value & 0xFF), 0);
+        }
+        else {
+            byteout(((e->value >> 24) & 0xFF), e->marker);
+            byteout(((e->value >> 16) & 0xFF), 0);
+            byteout(((e->value >> 8) & 0xFF), 0);
+            byteout((e->value & 0xFF), 0);
+        }
+    }
+}
+
+static void llvm_capture_bytes(int32 n)
+{   llvm_event *ev;
+
+    ensure_memory_list_available(&cur_emit.events_memlist, cur_emit.event_count+1);
+    ev = &cur_emit.events[cur_emit.event_count++];
+    ev->is_label = FALSE;
+    ev->is_bytes = TRUE;
+    ev->label = -1;
+    ev->bytes_index = n;
+    ev->exec_state = execution_never_reaches_here;
+    ev->seq_point = FALSE;
 }
 
 /* The parse-visible side effects of assembling one Glulx instruction,
@@ -1243,7 +1331,10 @@ static void llvm_replay_routine(void)
     for (i=0; i<cur_emit.event_count; i++) {
         llvm_event *ev = &cur_emit.events[i];
         execution_never_reaches_here = ev->exec_state;
-        if (ev->is_label) {
+        if (ev->is_bytes) {
+            emit_code_byte_blob(ev->bytes_index);
+        }
+        else if (ev->is_label) {
             /* assemble_label_no clears the label's symbol association
                (set by define_symbol_label after the capture stub ran),
                so preserve it across the call. */
@@ -1293,6 +1384,10 @@ extern void llvm_buffer_append_instruction(const assembly_instruction *AI2)
 extern void llvm_buffer_append_label(int n)
 {   llvm_capture_label(n);
     asm_parser_note_label();
+}
+
+extern void llvm_buffer_append_bytes(int n)
+{   llvm_capture_bytes(n);
 }
 
 /* Reverse lookup for the opaque-call naming scheme (@i6.<opcode name>). */
@@ -4452,8 +4547,7 @@ S (store), SS (two stores), R (execution never continues)");
         int32 start_pc = zcode_ha_size;
         int bytecount = 0;
         int isword = (token_value == DARROW_SEP);
-        /* Raw code bytes have no instruction-level meaning to translate. */
-        llvm_direct_reject("raw code bytes");
+        int32 blob_start = code_byte_entry_count;
         while (1) {
             assembly_operand AO;
             /* This isn't the start of a statement, but it's safe to
@@ -4475,27 +4569,38 @@ S (store), SS (two stores), R (execution never continues)");
             if (execution_never_reaches_here) {
                 continue;
             }
-            if (bytecount == 0 && asm_trace_level > 0) {
-                printf("%5d  +%05lx %3s %-12s", ErrorReport.line_number,
-                    ((long int) zmachine_pc), "   ",
-                    isword?"<words>":"<bytes>");
-            }
-            if (!isword) {
-                byteout((AO.value & 0xFF), 0);
-                bytecount++;
-                if (asm_trace_level > 0) {
-                    printf(" %02x", (AO.value & 0xFF));
-                }
+            code_byte_entry_add(AO.value, isword ? AO.marker : 0, isword);
+        }
+        if (code_byte_entry_count > blob_start) {
+            int32 blob = code_byte_blob_note(blob_start,
+                code_byte_entry_count - blob_start);
+            if (cur_emit.capturing && !cur_emit.replaying) {
+                /* The bytes ride both streams as a verbatim blob: a
+                   captured event for the shadow, and an opaque
+                   full-barrier anchor (i6.codebytes.<n>) in the IR that
+                   the lowerer re-emits in place. */
+                if (cur_emit.shadow_store)
+                    llvm_capture_bytes(blob);
+                llvm_direct_code_bytes(blob);
             }
             else {
-                byteout(((AO.value >> 24) & 0xFF), AO.marker);
-                byteout(((AO.value >> 16) & 0xFF), 0);
-                byteout(((AO.value >> 8) & 0xFF), 0);
-                byteout((AO.value & 0xFF), 0);
-                bytecount += 4;
+                int32 i;
+                if (asm_trace_level > 0)
+                    printf("%5d  +%05lx %3s %-12s", ErrorReport.line_number,
+                        ((long int) zmachine_pc), "   ",
+                        isword?"<words>":"<bytes>");
+                emit_code_byte_blob(blob);
+                for (i = blob_start; i < code_byte_entry_count; i++)
+                    bytecount += code_byte_entries[i].isword ? 4 : 1;
                 if (asm_trace_level > 0) {
-                    printf(" ");
-                    print_operand(&AO, TRUE);
+                    for (i = blob_start; i < code_byte_entry_count; i++) {
+                        if (!code_byte_entries[i].isword)
+                            printf(" %02x",
+                                (code_byte_entries[i].value & 0xFF));
+                        else
+                            printf(" %08x",
+                                code_byte_entries[i].value);
+                    }
                 }
             }
         }
@@ -4689,6 +4794,11 @@ extern void asm_allocate_arrays(void)
 
 extern void asm_free_arrays(void)
 {
+    free(code_byte_entries); code_byte_entries = NULL;
+    code_byte_entry_count = code_byte_entry_cap = 0;
+    free(code_byte_blobs); code_byte_blobs = NULL;
+    code_byte_blob_count = code_byte_blob_cap = 0;
+
     deallocate_memory_list(&variables_memlist);
 
     deallocate_memory_list(&labels_memlist);

@@ -78,6 +78,7 @@ extern void llvm_direct_glulx_macro(const assembly_instruction *ai,
     int macro_code)
 { (void)ai; (void)macro_code; }
 extern void llvm_direct_note_control_flow(void) { }
+extern void llvm_direct_code_bytes(int32 index) { (void)index; }
 extern llvm_direct_value llvm_direct_store_local_value(int destination,
     llvm_direct_value value)
 { (void)destination; (void)value; return NULL; }

@@ -200,18 +200,16 @@ classic fallback for whatever wild code triggers it.
 - `"unsupported statement"` — `llvm_direct_note_statement()` allowlist.
   Allowed: return/rtrue/rfalse, jump, if, break, continue, do, for,
   while, switch, print, print_ret, new_line, give, move, remove, font,
-  style, string, quit, objectloop, spaces, inversion. Rejected in
-  practice: **`box`** (its text table is compiled into the data area by
-  classic's statement handler during parsing — an ownership conflict;
-  the `random()` handoff is the template if it ever matters), plus the
-  degenerate/Z-only codes (sdefault, read, save, restore, stray
-  else/until).
+  style, string, quit, objectloop, spaces, inversion, box (its text
+  table is built once by the statement handler, so both backends call
+  Box__Routine on the same array). Rejected: only the degenerate/Z-only
+  codes (sdefault, read, save, restore, stray else/until).
 
 **Inline assembly (`src/asm.c`, `src/llvm_codegen.c:1257-1892`)**
 
-- `"raw code bytes"` (`asm.c:4434`) — `@ -> ...` / `@ --> ...` code
-  byte arrays: arbitrary bytes with no instruction-level meaning.
-  Excluded by design, permanently.
+- Raw code-byte arrays (`@ -> ...` / `@ --> ...`) no longer reject:
+  they ride the IR as verbatim blob anchors (`i6.codebytes.<n>`, full
+  barrier + real-stack escalation) re-emitted in place by the lowerer.
 - `"unsupported inline operand"` / `"unsupported inline store operand"`
   — an operand type outside constant/local/global/sp/dereference.
 - `"inline local out of range"`, `"inline operand count mismatch"`.

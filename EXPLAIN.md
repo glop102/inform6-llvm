@@ -174,10 +174,14 @@ story hardcoding classic frame depths, and the catch *values* all
 pass). What remains excluded:
 
 **By design**
-- Raw code-byte arrays (`@ -> ...`): arbitrary bytes with no
-  instruction-level meaning to translate.
-- `box` and a handful of unsupported statements: no representation
-  yet, nothing in the corpus needs one.
+- Bare code blocks (`{ ... }` as a statement) and the residual
+  degenerate statements: the only rejects left. `box` now emits its
+  veneer call directly (its text table was always built once by the
+  statement handler, so there was never a real ownership conflict),
+  and raw code-byte arrays ride the IR as verbatim blob anchors
+  (`i6.codebytes.<n>`, full barrier, real-stack escalation) that the
+  lowerer re-emits in place -- frame-offset assumptions inside the
+  bytes stay out of contract, as with catch tokens.
 
 **Design problems, not codegen problems**
 - Debug-file builds: sequence points must survive instruction

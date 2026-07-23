@@ -199,14 +199,12 @@ let
   # A story whose routines genuinely fall back cannot be emitted without
   # the retained shadow stream: the compile must fail cleanly, with the
   # retention error and no output file, never a silent empty routine.
-  # Raw code bytes are the one construct that always rejects direct IR
-  # (they have no instruction-level meaning to translate).
+  # A bare code block is the remaining construct that rejects direct IR.
   noShadowFallbackSource = writeText "direct-ir-no-shadow-fallback.inf" ''
-    [ RawBytes;
-        @ -> 0;    ! a nop, emitted as a raw code byte
-        return 7;
+    [ Blocky;
+        { return 7; }    ! bare code blocks reject direct IR
     ];
-    [ Main; @setiosys 2 0; print RawBytes(), "^"; ];
+    [ Main; @setiosys 2 0; print Blocky(), "^"; ];
   '';
   noShadowFallback = runCommand "direct-ir-no-shadow-fallback.compile.log" { } ''
     work=$(mktemp -d)
@@ -227,6 +225,37 @@ let
     I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
       ${../stories/direct-ir-limits.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
+  '';
+  # Raw code-byte arrays carry through the IR as verbatim blob anchors:
+  # hand-encoded instructions must execute identically to classic and
+  # build all-direct. $31 $01 $01 encodes "@return 1"; $31 $01 $2A
+  # "@return 42" mid-routine with live code on both sides.
+  rawBytesSource = writeText "direct-ir-raw-bytes.inf" ''
+    [ RawReturn;
+        @ -> $31 $01 $01;
+    ];
+    [ Mixed x;
+        x = 5;
+        @ -> $31 $01 $2A;
+        return x;
+    ];
+    [ Main win dummy;
+        @setiosys 2 0;
+        @copy 0 sp; @copy 3 sp; @copy 0 sp; @copy 0 sp; @copy 0 sp;
+        @glk $0023 5 win;
+        @copy win sp;
+        @glk $002F 1 dummy;
+        print "rawreturn=", RawReturn(), "^";
+        print "mixed=", Mixed(), "^";
+    ];
+  '';
+  rawBytesDirect = runCommand "direct-ir-raw-bytes" { } ''
+    mkdir "$out"
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${rawBytesSource} "$out/story.ulx" >"$out/compile.log" 2>&1
+  '';
+  rawBytesClassic = runCommand "direct-ir-raw-bytes-classic.ulx" { } ''
+    ${lib.getExe inform6-llvm} -G '$LLVM=0' ${rawBytesSource} "$out"
   '';
   limitsClassic = runCommand "direct-ir-limits-classic.ulx" { } ''
     ${lib.getExe inform6-llvm} -G '$LLVM=0' \
@@ -617,6 +646,25 @@ writeShellApplication {
     if ! od -An -v -tx1 ${limitsDirect}/story.ulx | tr -d ' \n' \
         | grep -q c104ff04; then
         echo "FAIL  direct-ir (limits story lacks a multi-pair locals frame)"
+        fail=1
+    fi
+
+    # Raw code bytes: all-direct, classic-identical execution.
+    if ! grep -aq '^LLVM: backends direct=5 fallback=0$' \
+        ${rawBytesDirect}/compile.log; then
+        echo "FAIL  direct-ir (raw-bytes story backend totals are incorrect)"
+        fail=1
+    fi
+    timeout 30 glulxe ${rawBytesDirect}/story.ulx </dev/null \
+        >"$work/rawbytes-direct.log" 2>&1 || fail=1
+    timeout 30 glulxe ${rawBytesClassic} </dev/null \
+        >"$work/rawbytes-classic.log" 2>&1 || fail=1
+    if ! cmp -s "$work/rawbytes-direct.log" "$work/rawbytes-classic.log"; then
+        echo "FAIL  direct-ir (raw-bytes transcripts differ)"
+        fail=1
+    fi
+    if ! grep -aq '^mixed=42$' "$work/rawbytes-direct.log"; then
+        echo "FAIL  direct-ir (raw-bytes story printed wrong results)"
         fail=1
     fi
 
