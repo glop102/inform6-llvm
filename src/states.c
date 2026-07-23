@@ -1996,6 +1996,20 @@ static void parse_statement_g(int break_label, int continue_label)
 
                  INITAO(&AO2);
                  AO2.value = ln2; set_constant_ot(&AO2);
+                 /* The text table above is built by this handler (once,
+                    at parse time), so both backends call the veneer on
+                    the same array: no ownership conflict. */
+                 {   assembly_operand vr = veneer_routine(Box__Routine_VR);
+                     llvm_direct_value dargs[2];
+                     llvm_direct_value fn = llvm_direct_constant(vr.value,
+                         vr.marker, vr.symindex);
+                     dargs[0] = llvm_direct_constant(AO2.value, AO2.marker,
+                         AO2.symindex);
+                     dargs[1] = llvm_direct_constant(AO3.value, AO3.marker,
+                         AO3.symindex);
+                     if (fn && dargs[0] && dargs[1])
+                         (void)llvm_direct_call(fn, dargs, 2);
+                 }
                  assembleg_call_2(veneer_routine(Box__Routine_VR),
                      AO2, AO3, zero_operand);
                  return;

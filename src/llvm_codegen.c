@@ -1249,7 +1249,8 @@ extern void llvm_direct_note_statement(int statement_code)
     if (direct_ru.state != DIRECT_BUILDING || direct_ru.suspended)
         return;
     direct_crosscheck_reach("statement");
-    if (statement_code != RETURN_CODE && statement_code != RTRUE_CODE
+    if (statement_code != RETURN_CODE && statement_code != BOX_CODE
+        && statement_code != RTRUE_CODE
         && statement_code != RFALSE_CODE && statement_code != JUMP_CODE
         && statement_code != IF_CODE && statement_code != BREAK_CODE
         && statement_code != CONTINUE_CODE && statement_code != DO_CODE
