@@ -1,8 +1,8 @@
 # The Single-Writer Rule, Backend Mixing, and the Path to IR-Only
 
 Notes from a design discussion at the close of the direct-IR migration
-(2026-07-20). Companion to the "Why Classic Generation Stays" section in
-`REVIEW.md`; this file goes deeper on the mechanics.
+(2026-07-20), updated as the flip landed. Companion to `REVIEW.md` (the
+forward plan); this file goes deeper on the mechanics.
 
 ## Background: generation is entangled with parsing
 
