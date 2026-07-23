@@ -218,6 +218,20 @@ let
     test "$status" -ne 0
     test ! -e "$work/story.ulx"
   '';
+  # Former fixed limits of the direct path, now dynamic: the fixture
+  # exceeds every old cap (symbolic-stack depth, call arity, switch
+  # nesting, lowered frame slots) and must still build all-direct and
+  # match the classic backend's transcript. See the story's header.
+  limitsDirect = runCommand "direct-ir-limits" { } ''
+    mkdir "$out"
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+      ${../stories/direct-ir-limits.inf} "$out/story.ulx" \
+      >"$out/compile.log" 2>&1
+  '';
+  limitsClassic = runCommand "direct-ir-limits-classic.ulx" { } ''
+    ${lib.getExe inform6-llvm} -G '$LLVM=0' \
+      ${../stories/direct-ir-limits.inf} "$out"
+  '';
 in
 writeShellApplication {
   name = "inform6-llvm-test-direct-ir";
@@ -538,6 +552,32 @@ writeShellApplication {
     mem_loose_direct=$COUNTED_RESULT
     if [ "$mem_loose_upstream" -ne 938 ] || [ "$mem_loose_direct" -gt 1265 ]; then
         echo "FAIL  direct-ir (unchecked memory dynamic bound: upstream $mem_loose_upstream, direct $mem_loose_direct)"
+        fail=1
+    fi
+
+    # Former fixed limits are dynamic: every old cap exceeded, zero
+    # fallbacks, classic-identical behavior, and the >250-slot routine
+    # carries a multi-pair locals format (C1 04 FF 04 ...).
+    if [ "$(grep -ac '^LLVM: backends direct=9 fallback=0$' \
+        ${limitsDirect}/compile.log)" -ne 1 ]; then
+        echo "FAIL  direct-ir (limits story backend totals are incorrect)"
+        fail=1
+    fi
+    timeout 30 glulxe ${limitsDirect}/story.ulx </dev/null \
+        >"$work/limits-direct.log" 2>&1 || fail=1
+    timeout 30 glulxe ${limitsClassic} </dev/null \
+        >"$work/limits-classic.log" 2>&1 || fail=1
+    if ! cmp -s "$work/limits-direct.log" "$work/limits-classic.log"; then
+        echo "FAIL  direct-ir (limits story transcripts differ)"
+        fail=1
+    fi
+    if ! grep -aq '^slotpressure=9090200$' "$work/limits-direct.log"; then
+        echo "FAIL  direct-ir (limits story printed wrong results)"
+        fail=1
+    fi
+    if ! od -An -v -tx1 ${limitsDirect}/story.ulx | tr -d ' \n' \
+        | grep -q c104ff04; then
+        echo "FAIL  direct-ir (limits story lacks a multi-pair locals frame)"
         fail=1
     fi
 

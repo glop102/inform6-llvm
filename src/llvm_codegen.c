@@ -73,7 +73,6 @@ enum direct_state_e {
    (@stkcopy and friends, calls with computed argument counts) emit
    verbatim. The opaque stack operations carry full side effects, so
    optimization preserves their order exactly as classic executed it. */
-#define DIRECT_SYMSTACK_MAX 64
 
 /* All per-routine IR-build state, gathered into one container. Exactly
    one routine is being built at a time (`direct_ru`, reset at each
@@ -89,7 +88,8 @@ typedef struct routine_unit_s {
     int            label_count;
     int            suspended;
     const char    *reason;
-    LLVMValueRef   symstack[DIRECT_SYMSTACK_MAX];
+    LLVMValueRef  *symstack;
+    int            symstack_cap;
     int            symstack_depth;
     int            spilled;      /* values our code left on the real stack */
     int            stack_entry;  /* C0 routine: sp operands are real ops    */
@@ -144,9 +144,14 @@ static void direct_sympush(LLVMValueRef v)
         (void)direct_opaque_call_ex("i6.stkpush", &v, 1, TRUE);
         return;
     }
-    if (direct_ru.symstack_depth >= DIRECT_SYMSTACK_MAX) {
-        llvm_direct_reject("symbolic stack overflow");
-        return;
+    if (direct_ru.symstack_depth >= direct_ru.symstack_cap) {
+        int nc = direct_ru.symstack_cap ? direct_ru.symstack_cap * 2 : 64;
+        LLVMValueRef *ns = realloc(direct_ru.symstack,
+            (size_t)nc * sizeof(*ns));
+        if (!ns)
+            fatalerror("Out of memory growing direct symbolic stack");
+        direct_ru.symstack = ns;
+        direct_ru.symstack_cap = nc;
     }
     direct_ru.symstack[direct_ru.symstack_depth++] = v;
 }
@@ -289,13 +294,24 @@ static void mark_opaque_fn_attrs(LLVMValueRef f, const char *opname)
    every candidate global with either the new value or its own current
    value.  Extra reads/rewrites of plain VM globals are unobservable. */
 
-#define UNMERGE_MAX 24
+static LLVMValueRef *unm_nodes;    /* ptr selects and phis */
+static LLVMValueRef *unm_tags;     /* their i32 mirrors */
+static int unm_node_count, unm_node_cap, unm_tag_cap;
+static LLVMValueRef *unm_globals;  /* distinct leaf globals */
+static int unm_global_count, unm_global_cap;
 
-static LLVMValueRef unm_nodes[UNMERGE_MAX];    /* ptr selects and phis */
-static LLVMValueRef unm_tags[UNMERGE_MAX];     /* their i32 mirrors */
-static int unm_node_count;
-static LLVMValueRef unm_globals[UNMERGE_MAX];  /* distinct leaf globals */
-static int unm_global_count;
+static void unm_grow(LLVMValueRef **list, int *cap, int need)
+{
+    LLVMValueRef *n;
+    int nc = *cap ? *cap : 24;
+    if (need <= *cap) return;
+    while (nc < need) nc *= 2;
+    n = realloc(*list, (size_t)nc * sizeof(*n));
+    if (!n)
+        fatalerror("Out of memory growing unmerge network");
+    *list = n;
+    *cap = nc;
+}
 
 static int unm_node_index(LLVMValueRef p)
 {
@@ -323,7 +339,7 @@ static int unm_validate(LLVMValueRef p)
         const char *name = LLVMGetValueName2(p, &len);
         if (!name || strncmp(name, "i6.g", 4) != 0) return FALSE;
         if (unm_global_index(p) < 0) {
-            if (unm_global_count >= UNMERGE_MAX) return FALSE;
+            unm_grow(&unm_globals, &unm_global_cap, unm_global_count + 1);
             unm_globals[unm_global_count++] = p;
         }
         return TRUE;
@@ -331,7 +347,8 @@ static int unm_validate(LLVMValueRef p)
     if (!LLVMIsASelectInst(p) && !LLVMIsAPHINode(p)) return FALSE;
     idx = unm_node_index(p);
     if (idx >= 0) return TRUE;
-    if (unm_node_count >= UNMERGE_MAX) return FALSE;
+    unm_grow(&unm_nodes, &unm_node_cap, unm_node_count + 1);
+    unm_grow(&unm_tags, &unm_tag_cap, unm_node_count + 1);
     idx = unm_node_count++;
     unm_nodes[idx] = p;
     unm_tags[idx] = NULL;
@@ -494,8 +511,12 @@ static void direct_dispose_ir(void)
     direct_ru.locals = NULL;
     free(direct_ru.labels);
     direct_ru.labels = NULL;
+    free(direct_ru.symstack);
+    direct_ru.symstack = NULL;
     direct_ru.local_count = 0;
     direct_ru.label_count = 0;
+    direct_ru.symstack_cap = 0;
+    direct_ru.symstack_depth = 0;
 }
 
 extern void llvm_direct_reject(const char *reason)
@@ -753,16 +774,27 @@ extern llvm_direct_value llvm_direct_binary(int operator_number,
     }
 }
 
+/* Scratch for opaque-call parameter types, grown on demand and reused
+   across calls (freed in llvm_codegen_free). */
+static LLVMTypeRef *opaque_params;
+static int opaque_params_cap;
+
 static LLVMValueRef direct_opaque_call_ex(const char *name, LLVMValueRef *args,
     int count, int void_return)
 {
-    LLVMTypeRef params[40], ft;
+    LLVMTypeRef *params, ft;
     LLVMValueRef f;
     int i, is_new;
-    if (count > 40) {
-        llvm_direct_reject("too many opaque call operands");
-        return NULL;
+    if (count > opaque_params_cap) {
+        int nc = opaque_params_cap ? opaque_params_cap : 40;
+        while (nc < count) nc *= 2;
+        params = realloc(opaque_params, (size_t)nc * sizeof(*params));
+        if (!params)
+            fatalerror("Out of memory growing opaque call parameters");
+        opaque_params = params;
+        opaque_params_cap = nc;
     }
+    params = opaque_params;
     /* Almost always i32 values; verbatim-form calls also carry global
        POINTERS so the instruction can access the global's memory. */
     for (i = 0; i < count; i++)
@@ -872,26 +904,32 @@ extern llvm_direct_value llvm_direct_call(llvm_direct_value function,
 {
     static const char *const direct_call_names[4] =
         { "i6.callf", "i6.callfi", "i6.callfii", "i6.callfiii" };
-    LLVMValueRef args[34];
+    LLVMValueRef stackargs[6], *args, result;
     int i;
     if (!direct_can_emit() || !function) return NULL;
-    if (count < 0 || count > 32) {
+    if (count < 0) {
         llvm_direct_reject("unsupported call arity");
         return NULL;
     }
     for (i = 0; i < count; i++)
         if (!arguments[i]) return NULL;
     if (count <= 3) {
+        args = stackargs;
         args[0] = function;
         for (i = 0; i < count; i++)
             args[1 + i] = arguments[i];
         return direct_opaque_call(direct_call_names[count], args, count + 1);
     }
+    args = malloc((size_t)(count + 2) * sizeof(*args));
+    if (!args)
+        fatalerror("Out of memory building direct call arguments");
     args[0] = function;
     args[1] = LLVMConstInt(i32t, (uint32_t)count, FALSE);
     for (i = 0; i < count; i++)
         args[2 + i] = arguments[i];
-    return direct_opaque_call("i6.call.s", args, count + 2);
+    result = direct_opaque_call("i6.call.s", args, count + 2);
+    free(args);
+    return result;
 }
 
 /* A Glulx opcode with no native IR form, emitted as a typed opaque call
@@ -983,14 +1021,20 @@ extern void llvm_direct_adjust_variable(int variable, int amount)
    to reuse instead of building duplicates. Direct build strictly
    precedes classic generation per statement, and an aborted direct
    build stops before pushing, so consumption stays aligned. */
-#define DIRECT_RANDOM_ARRAY_MAX 16
-static int32 direct_random_arrays[DIRECT_RANDOM_ARRAY_MAX];
-static int direct_random_array_count;
+static int32 *direct_random_arrays;
+static int direct_random_array_count, direct_random_array_cap;
 
 extern void llvm_direct_random_array_set(int32 addr)
 {
-    if (direct_random_array_count < DIRECT_RANDOM_ARRAY_MAX)
-        direct_random_arrays[direct_random_array_count++] = addr;
+    if (direct_random_array_count >= direct_random_array_cap) {
+        int nc = direct_random_array_cap ? direct_random_array_cap * 2 : 16;
+        int32 *n = realloc(direct_random_arrays, (size_t)nc * sizeof(*n));
+        if (!n)
+            fatalerror("Out of memory growing random array queue");
+        direct_random_arrays = n;
+        direct_random_array_cap = nc;
+    }
+    direct_random_arrays[direct_random_array_count++] = addr;
 }
 
 extern int32 llvm_direct_random_array_take(void)
@@ -1728,11 +1772,11 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
                arguments already sit on the real stack (sp pushes were
                real), so any count -- constant or computed -- emits
                verbatim and the opcode consumes them at runtime. */
-            LLVMValueRef args[2 + DIRECT_SYMSTACK_MAX], result;
+            LLVMValueRef *args, result;
             const assembly_operand *cntop = &ai->operand[1];
             char name[64];
             int32 cnt;
-            int i;
+            int i, bad = FALSE;
             if (direct_ru.stack_entry) {
                 direct_asm_opaque(ai, flags, NULL, 0);
                 return;
@@ -1748,21 +1792,29 @@ extern void llvm_direct_glulx_assembly(const assembly_instruction *ai)
                 direct_asm_opaque(ai, flags, NULL, 0);
                 return;
             }
+            args = malloc((size_t)(2 + cnt) * sizeof(*args));
+            if (!args)
+                fatalerror("Out of memory building direct call arguments");
             /* Both sources decode before the arguments pop, so evaluate
                them first (the address itself may be an sp read), then
                peel the arguments in runtime pop order (the first
                argument was pushed last). */
             args[0] = direct_asm_operand(&ai->operand[0]);
             args[1] = direct_asm_operand(&ai->operand[1]);
-            if (!args[0] || !args[1]) return;
-            for (i = 0; i < cnt; i++) {
+            bad = !args[0] || !args[1];
+            for (i = 0; i < cnt && !bad; i++) {
                 args[2 + i] = direct_sympop();
-                if (!args[2 + i]) return;
+                if (!args[2 + i]) bad = TRUE;
+            }
+            if (bad) {
+                free(args);
+                return;
             }
             sprintf(name, "i6.%.32s%s",
                 glulx_opcode_name(ai->internal_number), cnt ? ".s" : "");
             result = direct_opaque_call_ex(name, args, 2 + cnt,
                 !(flags & OPFLAG_STORE));
+            free(args);
             if (flags & OPFLAG_STORE)
                 direct_asm_store(&ai->operand[ai->operand_count - 1],
                     result);
@@ -2054,6 +2106,8 @@ extern int llvm_retain_direct_routine(int routine_symbol)
        finalized; only the function is needed to lower it later. */
     free(direct_ru.locals); direct_ru.locals = NULL; direct_ru.local_count = 0;
     free(direct_ru.labels); direct_ru.labels = NULL; direct_ru.label_count = 0;
+    free(direct_ru.symstack); direct_ru.symstack = NULL;
+    direct_ru.symstack_cap = 0;
     direct_ru.routine_symbol = routine_symbol;
     retained_units[retained_unit_count] = direct_ru;  /* move ownership */
     memset(&direct_ru, 0, sizeof direct_ru);
@@ -2084,6 +2138,17 @@ extern void llvm_codegen_free(void)
     free(retained_units);
     retained_units = NULL;
     retained_unit_count = retained_unit_cap = 0;
+    free(opaque_params);
+    opaque_params = NULL;
+    opaque_params_cap = 0;
+    free(unm_nodes); unm_nodes = NULL;
+    free(unm_tags); unm_tags = NULL;
+    free(unm_globals); unm_globals = NULL;
+    unm_node_cap = unm_tag_cap = unm_global_cap = 0;
+    unm_node_count = unm_global_count = 0;
+    free(direct_random_arrays);
+    direct_random_arrays = NULL;
+    direct_random_array_cap = direct_random_array_count = 0;
     if (no_routines_direct || no_routines_direct_fallback) {
         printf("LLVM: backends direct=%d fallback=%d\n",
             no_routines_direct, no_routines_direct_fallback);

@@ -3299,17 +3299,34 @@ static int direct_attribute_needs_branches(int node);
 static llvm_direct_value direct_attribute_test(int node,
     llvm_direct_block true_block, llvm_direct_block false_block);
 
-#define DIRECT_CALL_CHILDREN 34
+/* Collect an operator node's children into a freshly allocated list;
+   the caller frees *nodes_out (always allocated, even when empty). */
+static int direct_collect_children(int first, int **nodes_out)
+{
+    int child, count = 0;
+    int *nodes;
+    for (child = first; child != -1; child = ET[child].right)
+        count++;
+    nodes = malloc((size_t)(count ? count : 1) * sizeof(*nodes));
+    if (!nodes)
+        fatalerror("Out of memory collecting direct call children");
+    count = 0;
+    for (child = first; child != -1; child = ET[child].right)
+        nodes[count++] = child;
+    *nodes_out = nodes;
+    return count;
+}
 
-/* Collect an operator node's children, or -1 if there are too many. */
-static int direct_collect_children(int first, int *nodes, int max)
+/* Collect exactly n children into the caller's buffer; FALSE if the
+   node has any other number. */
+static int direct_collect_exactly(int first, int *nodes, int n)
 {
     int child, count = 0;
     for (child = first; child != -1; child = ET[child].right) {
-        if (count >= max) return -1;
+        if (count >= n) return FALSE;
         nodes[count++] = child;
     }
-    return count;
+    return count == n;
 }
 
 /* Evaluate an operand list the way classic Glulx generation does:
@@ -3401,28 +3418,12 @@ static llvm_direct_value direct_random_call(int argument_node,
    function selector), the rest are arguments. Classic Glulx generation
    evaluates every child right to left, with the function address last;
    mirror that order so side effects in arguments match upstream. */
-static llvm_direct_value direct_function_call(int node)
+static llvm_direct_value direct_function_call_1(int sysfun,
+    const int *nodes, llvm_direct_value *values, int count)
 {
-    int first = ET[node].down;
-    int nodes[DIRECT_CALL_CHILDREN];
-    llvm_direct_value values[DIRECT_CALL_CHILDREN];
     llvm_direct_value function;
-    int count, sysfun = -1, field = -1;
+    int field = -1;
     int address_index = 0, argument_start = 1, veneer = -1;
-
-    if (first == -1) {
-        llvm_direct_reject("invalid call tree");
-        return NULL;
-    }
-    if (ET[first].down == -1 && ET[first].value.type == SYSFUN_OT)
-        sysfun = ET[first].value.value;
-
-    count = direct_collect_children(
-        sysfun == -1 ? first : ET[first].right, nodes, DIRECT_CALL_CHILDREN);
-    if (count < 0) {
-        llvm_direct_reject("unsupported call arity");
-        return NULL;
-    }
 
     switch (sysfun) {
     case -1:
@@ -3564,6 +3565,31 @@ static llvm_direct_value direct_function_call(int node)
         function = direct_veneer_value(veneer);
     return llvm_direct_call(function, values + argument_start,
         count - argument_start);
+}
+
+static llvm_direct_value direct_function_call(int node)
+{
+    int first = ET[node].down;
+    int *nodes;
+    llvm_direct_value *values, result;
+    int count, sysfun = -1;
+
+    if (first == -1) {
+        llvm_direct_reject("invalid call tree");
+        return NULL;
+    }
+    if (ET[first].down == -1 && ET[first].value.type == SYSFUN_OT)
+        sysfun = ET[first].value.value;
+
+    count = direct_collect_children(
+        sysfun == -1 ? first : ET[first].right, &nodes);
+    values = malloc((size_t)(count ? count : 1) * sizeof(*values));
+    if (!values)
+        fatalerror("Out of memory evaluating direct call children");
+    result = direct_function_call_1(sysfun, nodes, values, count);
+    free(nodes);
+    free(values);
+    return result;
 }
 
 /* Mirror of access_memory_g's bounds table for an array recognized from
@@ -3872,24 +3898,16 @@ static int direct_attribute_needs_branches(int node)
    (false for has, true for hasnt), while an invalid attribute number
    falls through the final branch - into the true continuation in
    condition context, but reading as false in value context. */
-static llvm_direct_value direct_attribute_test(int node,
-    llvm_direct_block true_block, llvm_direct_block false_block)
+static llvm_direct_value direct_attribute_test_1(int node,
+    llvm_direct_block true_block, llvm_direct_block false_block,
+    const int *nodes, llvm_direct_value *values,
+    llvm_direct_value *phi_values, llvm_direct_block *phi_blocks, int count)
 {
-    int nodes[DIRECT_CALL_CHILDREN];
-    llvm_direct_value values[DIRECT_CALL_CHILDREN];
-    llvm_direct_value phi_values[3 * DIRECT_CALL_CHILDREN];
-    llvm_direct_block phi_blocks[3 * DIRECT_CALL_CHILDREN];
     int is_hasnt = ET[node].operator_number == HASNT_OP;
     int cond_form = (true_block != NULL);
-    int count, i, n_phi = 0, need_check;
+    int i, n_phi = 0, need_check;
     llvm_direct_block join = NULL;
 
-    count = direct_collect_children(ET[node].down, nodes,
-        DIRECT_CALL_CHILDREN);
-    if (count < 2) {
-        llvm_direct_reject("invalid attribute test");
-        return NULL;
-    }
     if (!direct_evaluate_children(nodes, values, count)) return NULL;
     need_check = direct_object_check_needed(
         ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL);
@@ -3997,9 +4015,39 @@ static llvm_direct_value direct_attribute_test(int node,
     return llvm_direct_phi_list(phi_values, phi_blocks, n_phi);
 }
 
-#define DIRECT_SWITCH_DEPTH 32
-static llvm_direct_value direct_switch_values[DIRECT_SWITCH_DEPTH];
-static int direct_switch_depth;
+static llvm_direct_value direct_attribute_test(int node,
+    llvm_direct_block true_block, llvm_direct_block false_block)
+{
+    int *nodes;
+    llvm_direct_value *values, *phi_values, result;
+    llvm_direct_block *phi_blocks;
+    int count;
+
+    count = direct_collect_children(ET[node].down, &nodes);
+    if (count < 2) {
+        llvm_direct_reject("invalid attribute test");
+        free(nodes);
+        return NULL;
+    }
+    /* Each alternative contributes at most three phi edges in value
+       form (object-check failure, attribute-range failure, the test
+       itself). */
+    values = malloc((size_t)count * sizeof(*values));
+    phi_values = malloc((size_t)(3 * count) * sizeof(*phi_values));
+    phi_blocks = malloc((size_t)(3 * count) * sizeof(*phi_blocks));
+    if (!values || !phi_values || !phi_blocks)
+        fatalerror("Out of memory evaluating direct attribute test");
+    result = direct_attribute_test_1(node, true_block, false_block,
+        nodes, values, phi_values, phi_blocks, count);
+    free(nodes);
+    free(values);
+    free(phi_values);
+    free(phi_blocks);
+    return result;
+}
+
+static llvm_direct_value *direct_switch_values;
+static int direct_switch_depth, direct_switch_cap;
 
 extern void llvm_direct_expression_reset(void)
 {
@@ -4203,7 +4251,7 @@ static llvm_direct_value direct_expression_value(int node)
             llvm_direct_value values[2];
             int oc = (ET[node].operator_number == ARROW_OP)
                 ? aloadb_gc : aload_gc;
-            if (direct_collect_children(first, nodes, 2) != 2) {
+            if (!direct_collect_exactly(first, nodes, 2)) {
                 llvm_direct_reject("invalid array read");
                 return NULL;
             }
@@ -4219,7 +4267,7 @@ static llvm_direct_value direct_expression_value(int node)
             llvm_direct_value values[3];
             int oc = (ET[node].operator_number == ARROW_SETEQUALS_OP)
                 ? astoreb_gc : astore_gc;
-            if (direct_collect_children(first, nodes, 3) != 3) {
+            if (!direct_collect_exactly(first, nodes, 3)) {
                 llvm_direct_reject("invalid array assignment");
                 return NULL;
             }
@@ -4249,7 +4297,7 @@ static llvm_direct_value direct_expression_value(int node)
                 || opnum == ARROW_POST_DEC_OP || opnum == DARROW_POST_INC_OP
                 || opnum == DARROW_POST_DEC_OP);
             assembly_operand unmarked;
-            if (direct_collect_children(first, nodes, 2) != 2) {
+            if (!direct_collect_exactly(first, nodes, 2)) {
                 llvm_direct_reject("invalid array update");
                 return NULL;
             }
@@ -4270,8 +4318,8 @@ static llvm_direct_value direct_expression_value(int node)
 
     case HAS_OP:
     case HASNT_OP:
-        {   int nodes[DIRECT_CALL_CHILDREN];
-            llvm_direct_value values[DIRECT_CALL_CHILDREN];
+        {   int *nodes;
+            llvm_direct_value *values;
             llvm_direct_value attribute, bit, r, result, args[2];
             int is_hasnt = ET[node].operator_number == HASNT_OP;
             int count, i;
@@ -4282,14 +4330,20 @@ static llvm_direct_value direct_expression_value(int node)
             /* No strict guards are needed, so every alternative is a
                pure aloadbit: evaluate them all and combine, like the
                comparison or-lists above. */
-            count = direct_collect_children(first, nodes,
-                DIRECT_CALL_CHILDREN);
+            count = direct_collect_children(first, &nodes);
             if (count < 2) {
                 llvm_direct_reject("invalid attribute test");
+                free(nodes);
                 return NULL;
             }
-            if (!direct_evaluate_children(nodes, values, count))
+            values = malloc((size_t)count * sizeof(*values));
+            if (!values)
+                fatalerror("Out of memory evaluating direct attribute test");
+            if (!direct_evaluate_children(nodes, values, count)) {
+                free(nodes);
+                free(values);
                 return NULL;
+            }
             result = NULL;
             for (i = 1; i < count; i++) {
                 if (direct_attr_constant(nodes[i]))
@@ -4307,29 +4361,38 @@ static llvm_direct_value direct_expression_value(int node)
                 result = result == NULL ? r : llvm_direct_binary(
                     is_hasnt ? ARTAND_OP : ARTOR_OP, result, r);
             }
+            free(nodes);
+            free(values);
             return result;
         }
 
     case IN_OP:
     case NOTIN_OP:
-        {   int nodes[DIRECT_CALL_CHILDREN];
-            llvm_direct_value values[DIRECT_CALL_CHILDREN];
+        {   int *nodes;
+            llvm_direct_value *values;
             llvm_direct_value parent, args[2], result, r;
             int is_notin = ET[node].operator_number == NOTIN_OP;
             int strict = runtime_error_checking_switch && !veneer_mode;
             llvm_direct_block false_block, join, result_from;
             int need_check, count, i;
 
-            count = direct_collect_children(first, nodes,
-                DIRECT_CALL_CHILDREN);
+            count = direct_collect_children(first, &nodes);
             if (count < 2) {
                 llvm_direct_reject("invalid containment test");
+                free(nodes);
                 return NULL;
             }
-            if (!direct_evaluate_children(nodes, values, count))
+            values = malloc((size_t)count * sizeof(*values));
+            if (!values)
+                fatalerror("Out of memory evaluating direct containment");
+            if (!direct_evaluate_children(nodes, values, count)) {
+                free(nodes);
+                free(values);
                 return NULL;
+            }
             need_check = strict && direct_object_check_needed(
                 ET[nodes[0]].down == -1 ? &ET[nodes[0]].value : NULL);
+            free(nodes);
             if (need_check) {
                 llvm_direct_block failed_from;
                 false_block = llvm_direct_new_block();
@@ -4352,6 +4415,7 @@ static llvm_direct_value direct_expression_value(int node)
                 result = result == NULL ? r : llvm_direct_binary(
                     is_notin ? ARTAND_OP : ARTOR_OP, result, r);
             }
+            free(values);
             if (!need_check) return result;
             result_from = llvm_direct_current_block();
             llvm_direct_jump_block(join);
@@ -4372,7 +4436,7 @@ static llvm_direct_value direct_expression_value(int node)
             int positive = (opnum == OFCLASS_OP || opnum == PROVIDES_OP);
             int vr = (opnum == OFCLASS_OP || opnum == NOTOFCLASS_OP)
                 ? OC__Cl_VR : OP__Pr_VR;
-            if (direct_collect_children(first, nodes, 2) != 2) {
+            if (!direct_collect_exactly(first, nodes, 2)) {
                 llvm_direct_reject("invalid class test");
                 return NULL;
             }
@@ -4415,7 +4479,7 @@ static llvm_direct_value direct_expression_value(int node)
             default:
                 vr = DA__Pr_VR; break;
             }
-            if (direct_collect_children(first, nodes, 2) != 2) {
+            if (!direct_collect_exactly(first, nodes, 2)) {
                 llvm_direct_reject("invalid property expression");
                 return NULL;
             }
@@ -4429,7 +4493,7 @@ static llvm_direct_value direct_expression_value(int node)
             llvm_direct_value values[3];
             int vr = (runtime_error_checking_switch && !veneer_mode)
                 ? RT__ChPS_VR : WV__Pr_VR;
-            if (direct_collect_children(first, nodes, 3) != 3) {
+            if (!direct_collect_exactly(first, nodes, 3)) {
                 llvm_direct_reject("invalid property assignment");
                 return NULL;
             }
@@ -4439,16 +4503,26 @@ static llvm_direct_value direct_expression_value(int node)
 
     case PROP_CALL_OP:
     case MESSAGE_CALL_OP:
-        {   int nodes[DIRECT_CALL_CHILDREN];
-            llvm_direct_value values[DIRECT_CALL_CHILDREN];
-            int count = direct_collect_children(first, nodes,
-                DIRECT_CALL_CHILDREN);
+        {   int *nodes;
+            llvm_direct_value *values, result;
+            int count = direct_collect_children(first, &nodes);
             if (count < 2) {
                 llvm_direct_reject("invalid property call");
+                free(nodes);
                 return NULL;
             }
-            if (!direct_evaluate_children(nodes, values, count)) return NULL;
-            return direct_veneer_call(CA__Pr_VR, values, count);
+            values = malloc((size_t)count * sizeof(*values));
+            if (!values)
+                fatalerror("Out of memory evaluating direct property call");
+            if (!direct_evaluate_children(nodes, values, count)) {
+                free(nodes);
+                free(values);
+                return NULL;
+            }
+            result = direct_veneer_call(CA__Pr_VR, values, count);
+            free(nodes);
+            free(values);
+            return result;
         }
 
     case FCALL_OP:
@@ -4568,9 +4642,14 @@ extern void llvm_direct_switch_begin(assembly_operand AO)
 {
     llvm_direct_value value;
     llvm_direct_note_control_flow();
-    if (direct_switch_depth >= DIRECT_SWITCH_DEPTH) {
-        llvm_direct_reject("direct switch nesting too deep");
-        return;
+    if (direct_switch_depth >= direct_switch_cap) {
+        int nc = direct_switch_cap ? direct_switch_cap * 2 : 32;
+        llvm_direct_value *n = realloc(direct_switch_values,
+            (size_t)nc * sizeof(*n));
+        if (!n)
+            fatalerror("Out of memory growing direct switch stack");
+        direct_switch_values = n;
+        direct_switch_cap = nc;
     }
     value = NULL;
     if (llvm_direct_can_generate())

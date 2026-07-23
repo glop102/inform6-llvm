@@ -29,10 +29,12 @@
 
 #include <llvm-c/Core.h>
 
-/* The most local slots a lowered routine may use. The locals format and
-   operand encodings go well beyond this (two-byte frame offsets, multiple
-   format pairs); 250 keeps frames within one format pair. */
-#define MAX_LOWER_SLOTS 250
+/* The most local slots a lowered routine may use: the format ceiling,
+   not an implementation choice. A Glulx local-variable operand addresses
+   the frame by byte offset in at most two bytes, so slot numbers must
+   keep (slot-1)*4 within 0xFFFF; the locals-format list (repeated 4/255
+   pairs) and the header patcher already handle any count up to that. */
+#define MAX_LOWER_SLOTS 16384
 
 /* ------------------------------------------------------------------------- */
 /*   Lowering state                                                          */
@@ -852,7 +854,12 @@ static void assign_slots(void)
 {
     int p, s;
     int pool_base, n_pool = 0;
-    int pool_last[MAX_LOWER_SLOTS];
+    int *pool_last;
+
+    /* The pool never outgrows the value count: each block-local value
+       occupies at most one pool slot. */
+    pool_last = my_calloc(sizeof(int), n_vals ? n_vals : 1,
+        "llvm lower slot pool");
 
     next_slot = n_params + 1;
 
@@ -883,16 +890,12 @@ static void assign_slots(void)
             continue;
         for (s = 0; s < n_pool; s++)
             if (pool_last[s] < vi->pos) break;
-        if (s == n_pool) {
-            if (pool_base + n_pool > MAX_LOWER_SLOTS) {
-                lfail("too many local slots");
-                return;
-            }
+        if (s == n_pool)
             n_pool++;
-        }
         pool_last[s] = vi->last_use;
         vi->slot = pool_base + s;
     }
+    my_free(&pool_last, "llvm lower slot pool");
 
     next_slot += n_pool;
     if (next_slot - 1 > MAX_LOWER_SLOTS)

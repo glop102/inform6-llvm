@@ -199,13 +199,16 @@ single dispatch.
 **Removing the shadow stream buys no code quality.** Proven, not
 guessed: `I6_LLVM_SHADOW=0` is byte-identical on any zero-fallback
 story. The shadow stream is write-only and never constrains the IR.
-Removal buys ~5% compile time. Meanwhile the safety valve has an
-underrated second job: it gracefully absorbs *limit* overflows
-(symbolic-stack depth, slot pressure, connective depth) and
-LLVM-version shape drift on arbitrary wild code. Dropping it converts
-those from silent classic degradation into compile failures of
-someone's game; dynamic limits and a much broader fuzz corpus should
-precede any such move.
+Removal buys ~5% compile time. The safety valve used to have a second
+job — absorbing fixed-limit overflows — but the direct path's limits
+are dynamic as of 2026-07-22: the symbolic stack, call arity, switch
+nesting, unmerge networks, and the random-array queue all grow on
+demand, and lowered frames are bounded only by Glulx's own two-byte
+local-offset addressing (16384 slots, emitted as a multi-pair locals
+format; `stories/direct-ir-limits.inf` pins all of this past every old
+cap). What the valve still absorbs is LLVM-version shape drift on
+arbitrary wild code and the genuinely unrepresented constructs; a much
+broader fuzz corpus should precede dropping it.
 
 **The real medium/long-horizon prize is selective inlining.** Cloak's
 own profile makes the case: `Z__Region` is 17% of all self-ops at 2,776
