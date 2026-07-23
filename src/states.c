@@ -1923,7 +1923,8 @@ static void parse_statement_g(int break_label, int continue_label)
 
     if ((token_type == SEP_TT) && (token_value == OPEN_BRACE_SEP))
     {
-        llvm_direct_reject("code block");
+        /* A bare code block: its statements parse through the normal
+           dispatch, so every direct hook fires as usual. */
         put_token_back();
         parse_code_block(break_label, continue_label, 0);
         return;

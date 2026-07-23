@@ -196,8 +196,6 @@ classic fallback for whatever wild code triggers it.
 
 **Statements (`src/states.c`, `src/llvm_codegen.c:1023`)**
 
-- `"code block"` (`states.c:1926`) — a bare `{ ... }` braces block used
-  as a statement.
 - `"unsupported statement"` — `llvm_direct_note_statement()` allowlist.
   Allowed: return/rtrue/rfalse, jump, if, break, continue, do, for,
   while, switch, print, print_ret, new_line, give, move, remove, font,

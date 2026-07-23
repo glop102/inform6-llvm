@@ -95,11 +95,11 @@ Measurement caveats that remain true:
 - **Shadow retention is permanent architecture.** The parser is
   streaming — a routine cannot be re-parsed — so the classic stream
   captured at parse time is the only way to emit a routine the
-  pipeline rejects. With box and raw code-byte arrays now represented
-  (veneer call; verbatim blob anchors), the remaining rejects are bare
-  code blocks, degenerate statements, and tree shapes the direct
-  generators don't recognize, and the safety valve stays for whatever
-  user code does next.
+  pipeline rejects. With box, raw code-byte arrays, and bare code
+  blocks now all direct, the remaining rejects are custom two-store
+  opcode shapes, degenerate statements, and tree shapes the direct
+  generators don't recognize, and the classic-writer mode stays for
+  whatever user code does next.
 - **Classic generation stays.** It backs the fallback, debug/INFIX
   builds, and `$LLVM=0` bisection. The single-writer rule: direct
   hooks read parser state, classic generation is the sole writer (see

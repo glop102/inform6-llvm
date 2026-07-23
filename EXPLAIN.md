@@ -180,8 +180,10 @@ story hardcoding classic frame depths, and the catch *values* all
 pass). What remains excluded:
 
 **By design**
-- Bare code blocks (`{ ... }` as a statement) and the residual
-  degenerate statements: the only rejects left. `box` now emits its
+- Custom two-store opcode shapes and the residual degenerate
+  statements: the only rejects left (bare code blocks turned out to
+  need nothing at all -- their statements parse through the normal
+  dispatch, so removing the day-one reject was the whole fix). `box` now emits its
   veneer call directly (its text table was always built once by the
   statement handler, so there was never a real ownership conflict),
   and raw code-byte arrays ride the IR as verbatim blob anchors

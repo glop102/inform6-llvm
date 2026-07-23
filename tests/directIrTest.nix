@@ -188,14 +188,16 @@ let
       ${../stories/direct-ir-memory.inf} "$out"
   '';
   # A story whose routines genuinely fall back cannot be emitted without
-  # the retained shadow stream: the compile must fail cleanly, with the
-  # retention error and no output file, never a silent empty routine.
-  # A bare code block is the remaining construct that rejects direct IR.
+  # a retained shadow stream: the compile must fail cleanly, with the
+  # actionable error and no output file, never a silent empty routine.
+  # A custom two-store opcode is the remaining verbatim shape that
+  # rejects direct IR.
   noShadowFallbackSource = writeText "direct-ir-no-shadow-fallback.inf" ''
-    [ Blocky;
-        { return 7; }    ! bare code blocks reject direct IR
+    [ TwoStore x y;
+        @"SS4:359" 1 2 x y;    ! custom two-store opcodes reject direct IR
+        return x + y;
     ];
-    [ Main; @setiosys 2 0; print Blocky(), "^"; ];
+    [ Main; @setiosys 2 0; print TwoStore(0, 0), "^"; ];
   '';
   noShadowFallback = runCommand "direct-ir-no-shadow-fallback.compile.log" { } ''
     work=$(mktemp -d)
@@ -247,6 +249,52 @@ let
   '';
   rawBytesClassic = runCommand "direct-ir-raw-bytes-classic.ulx" { } ''
     ${lib.getExe inform6-llvm} -G '$LLVM=0' ${rawBytesSource} "$out"
+  '';
+  # Bare code blocks: their statements parse through the normal
+  # dispatch, so they build direct IR like any other statement --
+  # including nested blocks, break/continue through a block, a return
+  # inside one, and loops within.
+  codeBlockSource = writeText "direct-ir-code-blocks.inf" ''
+    Global g = 0;
+    [ Blocky x;
+        { x = 3; { x = x + 4; } }
+        return x;
+    ];
+    [ BlockFlow x i;
+        for (i = 0: i < 5: i++) {
+            { if (i == 3) break; { x = x + i; continue; } }
+        }
+        { return x; }
+    ];
+    [ BlockReturn x;
+        { x = 1; return 9; }
+        x = 2;
+        return x;
+    ];
+    [ BlockLoop x;
+        { do { x++; } until (x == 4); }
+        { g = g + x; }
+        return g;
+    ];
+    [ Main win dummy;
+        @setiosys 2 0;
+        @copy 0 sp; @copy 3 sp; @copy 0 sp; @copy 0 sp; @copy 0 sp;
+        @glk $0023 5 win;
+        @copy win sp;
+        @glk $002F 1 dummy;
+        print "blocky=", Blocky(0), "^";
+        print "blockflow=", BlockFlow(0, 0), "^";
+        print "blockreturn=", BlockReturn(0), "^";
+        print "blockloop=", BlockLoop(0), "^";
+    ];
+  '';
+  codeBlockDirect = runCommand "direct-ir-code-blocks" { } ''
+    mkdir "$out"
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G \
+      ${codeBlockSource} "$out/story.ulx" >"$out/compile.log" 2>&1
+  '';
+  codeBlockUpstream = runCommand "direct-ir-code-blocks-upstream.ulx" { } ''
+    ${lib.getExe inform6-upstream} -G ${codeBlockSource} "$out"
   '';
   limitsClassic = runCommand "direct-ir-limits-classic.ulx" { } ''
     ${lib.getExe inform6-llvm} -G '$LLVM=0' \
@@ -591,6 +639,25 @@ writeShellApplication {
     if ! od -An -v -tx1 ${limitsDirect}/story.ulx | tr -d ' \n' \
         | grep -q c104ff04; then
         echo "FAIL  direct-ir (limits story lacks a multi-pair locals frame)"
+        fail=1
+    fi
+
+    # Bare code blocks: all-direct, upstream-identical execution.
+    if ! grep -aq '^LLVM: backends direct=7 fallback=0$' \
+        ${codeBlockDirect}/compile.log; then
+        echo "FAIL  direct-ir (code-block story backend totals are incorrect)"
+        fail=1
+    fi
+    timeout 30 glulxe ${codeBlockDirect}/story.ulx </dev/null \
+        >"$work/blocks-direct.log" 2>&1 || fail=1
+    timeout 30 glulxe ${codeBlockUpstream} </dev/null \
+        >"$work/blocks-upstream.log" 2>&1 || fail=1
+    if ! cmp -s "$work/blocks-direct.log" "$work/blocks-upstream.log"; then
+        echo "FAIL  direct-ir (code-block transcripts differ)"
+        fail=1
+    fi
+    if ! grep -aq '^blockflow=3$' "$work/blocks-direct.log"; then
+        echo "FAIL  direct-ir (code-block story printed wrong results)"
         fail=1
     fi
 
