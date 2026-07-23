@@ -10,7 +10,7 @@ let
   cloakArgs = "+include_path=${inform6lib} +language_name=english";
   cloakDirect = runCommand "corpus-cloak-direct" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${cloakArgs} ${../stories/cloak.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
@@ -20,14 +20,14 @@ let
   '';
   glulxerciseDirect = runCommand "corpus-glulxercise-direct" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/glulxercise.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
   debugDirect = runCommand "corpus-debug-direct" { } ''
     mkdir "$out"
     cd "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G -k '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G -k '$LLVM=1' \
       ${../stories/direct-ir-phase1.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
@@ -45,7 +45,7 @@ let
   '';
   tracedDirect = runCommand "corpus-traced-direct" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${tracedSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   tracedUpstream = runCommand "corpus-traced-upstream.ulx" { } ''

@@ -89,13 +89,13 @@ let
   '';
   direct = runCommand "direct-ir-build" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/direct-ir-phase1.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
   quietDirect = runCommand "direct-ir-quiet-build" { } ''
     mkdir "$out"
-    ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/direct-ir-phase1.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
@@ -112,7 +112,7 @@ let
   compileError = runCommand "direct-ir-error.compile.log" { } ''
     work=$(mktemp -d)
     set +e
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/direct-ir-error.inf} "$work/error.ulx" >"$out" 2>&1
     status=$?
     set -e
@@ -121,7 +121,7 @@ let
   '';
   divisionOverflowDirect = runCommand "direct-ir-division-overflow" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${divisionOverflowSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   divisionOverflowUpstream = runCommand "direct-ir-division-overflow-upstream.ulx" { } ''
@@ -129,7 +129,7 @@ let
   '';
   remainderOverflowDirect = runCommand "direct-ir-remainder-overflow" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${remainderOverflowSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   remainderOverflowUpstream = runCommand "direct-ir-remainder-overflow-upstream.ulx" { } ''
@@ -137,7 +137,7 @@ let
   '';
   uncheckedDivisionDirect = runCommand "direct-ir-unchecked-division" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -~S -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -~S -G '$LLVM=1' \
       ${uncheckedDivisionSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   uncheckedDivisionUpstream = runCommand "direct-ir-unchecked-division-upstream.ulx" { } ''
@@ -145,7 +145,7 @@ let
   '';
   uncheckedRemainderDirect = runCommand "direct-ir-unchecked-remainder" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -~S -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -~S -G '$LLVM=1' \
       ${uncheckedRemainderSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   uncheckedRemainderUpstream = runCommand "direct-ir-unchecked-remainder-upstream.ulx" { } ''
@@ -153,7 +153,7 @@ let
   '';
   deferredTimingDirect = runCommand "direct-ir-deferred-timing" { } ''
     mkdir "$out"
-    ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${deferredTimingSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   deferredTimingUpstream = runCommand "direct-ir-deferred-timing-upstream.ulx" { } ''
@@ -161,7 +161,7 @@ let
   '';
   autogenCollisionDirect = runCommand "direct-ir-autogen-collision" { } ''
     mkdir "$out"
-    ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${autogenCollisionSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   autogenCollisionUpstream = runCommand "direct-ir-autogen-collision-upstream.ulx" { } ''
@@ -169,7 +169,7 @@ let
   '';
   memoryStrictDirect = runCommand "direct-ir-memory-strict" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/direct-ir-memory.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
@@ -179,7 +179,7 @@ let
   '';
   memoryLooseDirect = runCommand "direct-ir-memory-loose" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -~S -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -~S -G '$LLVM=1' \
       ${../stories/direct-ir-memory.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
@@ -200,7 +200,7 @@ let
   noShadowFallback = runCommand "direct-ir-no-shadow-fallback.compile.log" { } ''
     work=$(mktemp -d)
     set +e
-    I6_LLVM_SHADOW=0 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_SHADOW=0 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${noShadowFallbackSource} "$work/story.ulx" >"$out" 2>&1
     status=$?
     set -e
@@ -213,7 +213,7 @@ let
   # match the classic backend's transcript. See the story's header.
   limitsDirect = runCommand "direct-ir-limits" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/direct-ir-limits.inf} "$out/story.ulx" \
       >"$out/compile.log" 2>&1
   '';
@@ -242,7 +242,7 @@ let
   '';
   rawBytesDirect = runCommand "direct-ir-raw-bytes" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${rawBytesSource} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   rawBytesClassic = runCommand "direct-ir-raw-bytes-classic.ulx" { } ''
@@ -281,7 +281,7 @@ writeShellApplication {
     fi
 
     # Phase 5: a plain compile (no $LLVM setting) selects the direct
-    # backend and produces the same bytes as an explicit $LLVM=4 compile.
+    # backend and produces the same bytes as an explicit $LLVM=1 compile.
     if [ "$(grep -ac '^LLVM: backends direct=74 fallback=0$' \
         ${defaultMode}/compile.log)" -ne 1 ]; then
         echo "FAIL  direct-ir (default mode did not select the direct backend)"

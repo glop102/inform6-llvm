@@ -51,7 +51,7 @@ option (Glulx only) and is **on by default**:
 ./inform6-llvm -G '$LLVM=0' game.inf game.ulx    # classic upstream codegen
 ```
 
-The default, `$LLVM=4`, generates LLVM IR directly from expression and
+The default, `$LLVM=1`, generates LLVM IR directly from expression and
 statement parsing, optimizes it, and lowers it to Glulx bytecode. Zero selects
 classic generation; any nonzero value selects direct IR. Set
 `I6_LLVM_DIAGNOSTICS=1` for per-routine backend records and IR dumps.

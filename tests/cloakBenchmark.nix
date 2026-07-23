@@ -21,7 +21,7 @@ let
   '';
   directBuild = runCommand "cloak-bench-direct" { } ''
     mkdir "$out"
-    ${lib.getExe inform6-llvm} -G '$LLVM=4' '$!asm' ${cloakArgs} \
+    ${lib.getExe inform6-llvm} -G '$LLVM=1' '$!asm' ${cloakArgs} \
       ${../stories/cloak.inf} "$out/story.ulx" >"$out/asm.log" 2>&1
   '';
 in

@@ -5,7 +5,7 @@ let
   classic = compiledStories.classic.life;
   directBuild = runCommand "life-direct" { } ''
     mkdir "$out"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/life.inf} "$out/story.ulx" >"$out/compile.log" 2>&1
   '';
   direct = "${directBuild}/story.ulx";

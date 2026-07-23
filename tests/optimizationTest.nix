@@ -5,13 +5,13 @@ let
   compileLog = runCommand "optimization-llvm.compile.log" { } ''
     work=$(mktemp -d)
     cd "$work"
-    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/optimization-regressions.inf} opt.ulx >"$out" 2>&1
   '';
   jumpabsLlvmLog = runCommand "jumpabs-warning-llvm.compile.log" { } ''
     work=$(mktemp -d)
     cd "$work"
-    ${lib.getExe inform6-llvm} -G '$LLVM=4' \
+    ${lib.getExe inform6-llvm} -G '$LLVM=1' \
       ${../stories/jumpabs-warning.inf} jumpabs.ulx >"$out" 2>&1
   '';
   jumpabsClassicLog = runCommand "jumpabs-warning-classic.compile.log" { } ''

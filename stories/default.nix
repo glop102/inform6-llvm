@@ -22,7 +22,7 @@ let
     };
     direct = {
       compiler = inform6-llvm;
-      llvmMode = 4;
+      llvmMode = 1;
     };
   };
   mkStory = mode: name:

@@ -405,14 +405,15 @@ static optiont alloptions[] = {
         "\
   LLVM routes routine code generation through LLVM IR so that LLVM's \n\
   optimization passes can be applied before bytecode is emitted (Glulx \n\
-  only). Zero compiles classically; any nonzero value (the default is 4) \n\
-  generates LLVM IR directly from expression and statement parsing, \n\
-  optimizes it, and lowers it to Glulx bytecode. Ignored when a debug file \n\
-  is being generated. Set I6_LLVM_DIAGNOSTICS=1 for IR dumps and \n\
-  per-routine machine-readable backend records.\n",
+  only). Zero compiles classically; one (the default) generates LLVM IR \n\
+  directly from expression and statement parsing, optimizes it, and \n\
+  lowers it to Glulx bytecode. Higher historical values clamp to one. \n\
+  Ignored when a debug file is being generated. Set \n\
+  I6_LLVM_DIAGNOSTICS=1 for IR dumps and per-routine machine-readable \n\
+  backend records.\n",
         OPTUSE_GLULX,
-        { OPTLIM_TOMAX, 4 },
-        DEFAULTVALS(0, 4),
+        { OPTLIM_TOMAX, 1 },
+        DEFAULTVALS(0, 1),
     },
 
     /* obsolete options run past OPT_OPTIONS_COUNT */

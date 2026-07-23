@@ -28,7 +28,7 @@ let
   '';
   directBuild = runCommand "advent-bench-direct" { } ''
     mkdir "$out"
-    ${lib.getExe inform6-llvm} -G '$LLVM=4' '$!asm' ${adventArgs} \
+    ${lib.getExe inform6-llvm} -G '$LLVM=1' '$!asm' ${adventArgs} \
       ${adventSrc} "$out/story.ulx" >"$out/asm.log" 2>&1
   '';
 in
