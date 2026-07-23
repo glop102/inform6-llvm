@@ -92,10 +92,11 @@ the direct backend must *become* the single writer. **This flip now
 exists**: the direct backend keeps a parser-state model (reachability +
 classically-entered blocks, `src/llvm_codegen.c`), an always-on
 cross-check compares it with classic's writes at every parser decision
-point (pinned clean over the corpus), and `I6_LLVM_PARSER_WRITER=direct`
-disables classic's bookkeeping writes and lets the model drive the
-globals — byte-identical output, pinned in the tests. See EXPLAIN.md
-("Is single-writer a blocker") for the mechanics.
+point (pinned clean over the corpus before defaulting), and the direct
+writer is now the DEFAULT — classic's bookkeeping writes are disabled
+and the model drives the globals; `I6_LLVM_PARSER_WRITER=classic`
+restores the old arrangement (shadow + fallback + cross-check). See
+EXPLAIN.md ("Is single-writer a blocker") for the mechanics.
 
 ### 1.4 Deferred lowering — replay out of parse order
 

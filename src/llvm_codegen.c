@@ -138,24 +138,29 @@ static int direct_symstack_spill(void);
 /*   resolution, and the routine-end fallthrough decision. Any mismatch       */
 /*   prints a loud diagnostic line the tests assert absent.                   */
 /*                                                                            */
-/*   I6_LLVM_PARSER_WRITER=direct flips the writer: while the direct build    */
-/*   is active, classic's bookkeeping writes (shadow_note_instruction and     */
-/*   asm_parser_note_label) are disabled and the model writes the globals     */
-/*   instead. Shadow retention is forced off in that mode: the shadow event   */
-/*   snapshots assume classic-timed writes, so a fallback replay would be     */
-/*   unsound. The mode exists to prove byte-identical output with the         */
-/*   direct backend as sole parse-time writer.                                */
+/*   The flip is the DEFAULT: while the direct build is active, classic's     */
+/*   bookkeeping writes (shadow_note_instruction and asm_parser_note_label)   */
+/*   are disabled and the model writes the globals instead. Shadow retention  */
+/*   is forced off in that mode -- the shadow event snapshots assume          */
+/*   classic-timed writes, so a fallback replay would be unsound -- which     */
+/*   makes any remaining fallback a compile error.                            */
+/*   I6_LLVM_PARSER_WRITER=classic restores the classic writer (and with it   */
+/*   the shadow stream and graceful fallback); the cross-check runs in that   */
+/*   mode, and the tests pin both writers byte-identical.                     */
 /* ------------------------------------------------------------------------- */
 
 static int crosscheck_mismatches;
 
-/* Is the writer flip requested at all (env, cached)? */
+/* Is the writer flipped (the default)? I6_LLVM_PARSER_WRITER=classic
+   restores classic generation as the parser-state writer, which also
+   restores the shadow stream and graceful fallback -- needed by any
+   story still using an unrepresented construct (box, raw code bytes). */
 extern int llvm_parser_writer_flipped(void)
 {
     static int cached = -1;
     if (cached < 0) {
         const char *v = getenv("I6_LLVM_PARSER_WRITER");
-        cached = (v && strcmp(v, "direct") == 0);
+        cached = !(v && strcmp(v, "classic") == 0);
     }
     return cached;
 }

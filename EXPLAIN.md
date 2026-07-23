@@ -142,15 +142,21 @@ classically-entered block set answering the labeluse[] boolean. An
 always-on cross-check compares the model against classic's writes at
 every parser decision point (statement dispatch, forward-label
 resolution, the routine-end fallthrough decision) and prints a
-`parser-crosscheck` line on mismatch; the corpus is pinned clean. With
-`I6_LLVM_PARSER_WRITER=direct` the writer actually flips: classic's
-bookkeeping (shadow_note_instruction and asm_parser_note_label) is
-disabled while the direct build is active and the model writes the
-globals — byte-identical output on every zero-fallback story, pinned
-for cloak, glulxercise, and the fixtures. The mode forces shadow
-retention off (event snapshots assume classic-timed writes), so a
-fallback under it is a compile error — which is exactly the IR-only
-contract it rehearses.
+`parser-crosscheck` line on mismatch; the corpus was pinned clean
+before the flip became the default. **The direct writer is now the
+default** (2026-07-22, after `box` and raw code-byte arrays gained
+representations): classic's bookkeeping (shadow_note_instruction and
+asm_parser_note_label) is disabled while the direct build is active and
+the model writes the globals — proven byte-identical on the whole
+corpus before defaulting. The default forces shadow retention off
+(event snapshots assume classic-timed writes), so a routine that
+rejects direct IR is a compile error; `I6_LLVM_PARSER_WRITER=classic`
+restores the classic writer, the shadow stream, graceful fallback, and
+the cross-check. One measurement artifact: classic generation under the
+flip reads direct-timed reachability mid-statement and emits fewer
+instructions into its (discarded) stream, so the per-routine `input=`
+diagnostic shrinks for condition-materialization shapes — output bytes
+are unaffected.
 
 The subtleties the cross-check flushed out, for the record: classic
 folds constant conditions in `assembleg_1_branch` (a plain-constant

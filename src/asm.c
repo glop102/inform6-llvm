@@ -2458,8 +2458,10 @@ extern void emit_deferred_routines(void)
         {   int lowered = (d->ir_handle >= 0)
                 ? llvm_lower_retained_routine(d->ir_handle) : FALSE;
             if (!lowered && !cur_emit.shadow_store) {
-                error_named("Routine fell back to classic generation with "
-                    "shadow retention disabled (I6_LLVM_SHADOW=0):", d->name);
+                error_named("Routine fell back to classic generation but no "
+                    "shadow stream was retained (set "
+                    "I6_LLVM_PARSER_WRITER=classic to allow fallback):",
+                    d->name);
                 cur_emit.event_count = 0;
             } else {
                 llvm_replay_routine();
@@ -2840,8 +2842,9 @@ void assemble_routine_end(int embedded_flag, debug_locations locations)
             if (!llvm_pipeline_routine() && !cur_emit.shadow_store) {
                 /* The shadow stream was not retained (I6_LLVM_SHADOW=0), so
                    the routine cannot be emitted classically. */
-                error_named("Routine fell back to classic generation with "
-                    "shadow retention disabled (I6_LLVM_SHADOW=0):",
+                error_named("Routine fell back to classic generation but no "
+                    "shadow stream was retained (set "
+                    "I6_LLVM_PARSER_WRITER=classic to allow fallback):",
                     current_routine_name.data);
                 cur_emit.capturing = FALSE;
                 cur_emit.event_count = 0;

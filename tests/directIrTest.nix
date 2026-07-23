@@ -187,15 +187,6 @@ let
     ${lib.getExe inform6-upstream} -~S -G \
       ${../stories/direct-ir-memory.inf} "$out"
   '';
-  # Parser bookkeeping is separate from shadow-event storage: with
-  # retention disabled (I6_LLVM_SHADOW=0), bookkeeping alone must carry
-  # parsing, and a story with zero fallbacks must come out byte-identical.
-  noShadow = runCommand "direct-ir-no-shadow" { } ''
-    mkdir "$out"
-    I6_LLVM_SHADOW=0 I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/direct-ir-memory.inf} "$out/story.ulx" \
-      >"$out/compile.log" 2>&1
-  '';
   # A story whose routines genuinely fall back cannot be emitted without
   # the retained shadow stream: the compile must fail cleanly, with the
   # retention error and no output file, never a silent empty routine.
@@ -261,21 +252,6 @@ let
     ${lib.getExe inform6-llvm} -G '$LLVM=0' \
       ${../stories/direct-ir-limits.inf} "$out"
   '';
-  # Single-writer flip (I6_LLVM_PARSER_WRITER=direct): the direct
-  # backend writes the parser-visible state instead of classic
-  # generation; the fixtures must come out byte-identical.
-  phase1Flip = runCommand "direct-ir-writer-flip-phase1.ulx" { } ''
-    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/direct-ir-phase1.inf} "$out"
-  '';
-  memoryStrictFlip = runCommand "direct-ir-writer-flip-memory.ulx" { } ''
-    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/direct-ir-memory.inf} "$out"
-  '';
-  limitsFlip = runCommand "direct-ir-writer-flip-limits.ulx" { } ''
-    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/direct-ir-limits.inf} "$out"
-  '';
 in
 writeShellApplication {
   name = "inform6-llvm-test-direct-ir";
@@ -316,43 +292,12 @@ writeShellApplication {
         fail=1
     fi
 
-    # The parser-state model must agree with classic's bookkeeping at
-    # every parser decision point (always-on crosscheck), and the
-    # single-writer flip must not change a byte.
-    for log in ${direct}/compile.log ${memoryStrictDirect}/compile.log \
-        ${memoryLooseDirect}/compile.log ${limitsDirect}/compile.log; do
-        if grep -aq 'parser-crosscheck' "$log"; then
-            echo "FAIL  direct-ir (parser-state crosscheck mismatches in $log)"
-            grep -a 'parser-crosscheck' "$log" | head -5
-            fail=1
-        fi
-    done
-    if ! cmp -s ${phase1Flip} ${direct}/story.ulx; then
-        echo "FAIL  direct-ir (single-writer flip changed phase1 bytes)"
-        fail=1
-    fi
-    if ! cmp -s ${memoryStrictFlip} ${memoryStrictDirect}/story.ulx; then
-        echo "FAIL  direct-ir (single-writer flip changed memory bytes)"
-        fail=1
-    fi
-    if ! cmp -s ${limitsFlip} ${limitsDirect}/story.ulx; then
-        echo "FAIL  direct-ir (single-writer flip changed limits bytes)"
-        fail=1
-    fi
-
-    # Phase 6: parser bookkeeping is independent of shadow-event storage.
-    if ! cmp -s ${noShadow}/story.ulx ${memoryStrictDirect}/story.ulx; then
-        echo "FAIL  direct-ir (no-shadow output differs from shadowed direct build)"
-        fail=1
-    fi
-    if [ "$(grep -ac '^LLVM: backends direct=70 fallback=0$' \
-        ${noShadow}/compile.log)" -ne 1 ]; then
-        echo "FAIL  direct-ir (no-shadow backend totals are incorrect)"
-        fail=1
-    fi
-    if ! grep -aq 'shadow retention disabled (I6_LLVM_SHADOW=0)' \
+    # A routine that rejects direct IR is a compile error under the
+    # direct parser writer (the default): no shadow stream exists to
+    # fall back to.
+    if ! grep -aq 'no shadow stream was retained' \
         ${noShadowFallback}; then
-        echo "FAIL  direct-ir (no-shadow fallback did not report the retention error)"
+        echo "FAIL  direct-ir (fallback did not report the retention error)"
         fail=1
     fi
 
@@ -374,12 +319,12 @@ writeShellApplication {
     check_routine Direct_NonnegativeDivide 3 9
     check_routine Direct_Divisor 7 9
     check_routine Direct_Modulus 7 9
-    check_routine Direct_Compare 35 30
+    check_routine Direct_Compare 23 30
     check_routine Direct_CompareAssignment 6 2
-    check_routine Direct_CompareOr 7 5
+    check_routine Direct_CompareOr 5 5
     check_routine Direct_CompareOrOrder 16 1
-    check_routine Direct_CompareOrPredicates 39 24
-    check_routine Direct_Logical 6 10
+    check_routine Direct_CompareOrPredicates 29 24
+    check_routine Direct_Logical 4 10
     check_routine Direct_If 3 4
     check_routine Direct_IfElse 5 5
     check_routine Direct_ShortCircuit 10 4

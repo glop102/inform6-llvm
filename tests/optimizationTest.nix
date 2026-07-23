@@ -73,7 +73,7 @@ writeShellApplication {
     }
 
     check_routine Opt_StoreFusion 7 10
-    check_routine Opt_CompareReturn 5 4
+    check_routine Opt_CompareReturn 3 4
     check_routine Opt_SelectReturn 5 4
     check_routine Opt_BooleanTree 5 15
     check_routine Opt_LoopPhi 9 13

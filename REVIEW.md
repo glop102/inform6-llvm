@@ -28,11 +28,15 @@ The division of labor is strict:
   constructs Glulx lacks (unsigned division, funnel shifts,
   min/max/abs). It makes no profitability decisions.
 
-Diagnostics: `I6_LLVM_DIAGNOSTICS=1` emits per-routine `LLVM-BACKEND`
-TSV records plus IR dumps to `inform6-llvm-dump.ll`; ordinary compiles
-print only the aggregate `LLVM: backends` counter lines, which the
-tests pin. `I6_LLVM_SHADOW=0` disables shadow retention to prove
-parsing never depends on the stored stream.
+Diagnostics and modes: `I6_LLVM_DIAGNOSTICS=1` emits per-routine
+`LLVM-BACKEND` TSV records plus IR dumps to `inform6-llvm-dump.ll`;
+ordinary compiles print only the aggregate `LLVM: backends` counter
+lines, which the tests pin. The direct backend is the parser-state
+writer by default (no shadow stream; a rejected routine is a compile
+error); `I6_LLVM_PARSER_WRITER=classic` restores classic as the writer
+with shadow retention and graceful fallback, and enables the always-on
+parser-state cross-check. `I6_LLVM_SHADOW=0` additionally disables
+retention in that classic-writer mode.
 
 ## Cost model (for future optimization work)
 

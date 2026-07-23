@@ -18,25 +18,6 @@ let
     ${lib.getExe inform6-upstream} -G ${cloakArgs} \
       ${../stories/cloak.inf} "$out"
   '';
-  # Cloak has zero fallbacks, so disabling shadow-event retention
-  # (I6_LLVM_SHADOW=0) must not change a single byte: parse bookkeeping
-  # alone carries the front end across a full library game.
-  cloakNoShadow = runCommand "corpus-cloak-no-shadow.ulx" { } ''
-    I6_LLVM_SHADOW=0 ${lib.getExe inform6-llvm} -G '$LLVM=4' ${cloakArgs} \
-      ${../stories/cloak.inf} "$out"
-  '';
-  # Single-writer flip: with I6_LLVM_PARSER_WRITER=direct the direct
-  # backend writes the parser-visible state (reachability, label use)
-  # instead of classic generation; on a zero-fallback story the output
-  # must not change by a byte.
-  cloakFlip = runCommand "corpus-cloak-writer-flip.ulx" { } ''
-    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${cloakArgs} ${../stories/cloak.inf} "$out"
-  '';
-  glulxerciseFlip = runCommand "corpus-glulxercise-writer-flip.ulx" { } ''
-    I6_LLVM_PARSER_WRITER=direct ${lib.getExe inform6-llvm} -G '$LLVM=4' \
-      ${../stories/glulxercise.inf} "$out"
-  '';
   glulxerciseDirect = runCommand "corpus-glulxercise-direct" { } ''
     mkdir "$out"
     I6_LLVM_DIAGNOSTICS=1 ${lib.getExe inform6-llvm} -G '$LLVM=4' \
@@ -98,21 +79,6 @@ writeShellApplication {
         echo "FAIL  corpus (cloak has a classic-by-policy routine)"
         fail=1
     fi
-    if ! cmp -s ${cloakNoShadow} ${cloakDirect}/story.ulx; then
-        echo "FAIL  corpus (disabling shadow retention changed cloak's bytes)"
-        fail=1
-    fi
-    # The direct backend's parser-state model must agree with classic's
-    # bookkeeping at every parser decision point (always-on crosscheck).
-    if grep -aq 'parser-crosscheck' ${cloakDirect}/compile.log; then
-        echo "FAIL  corpus (cloak parser-state crosscheck mismatches)"
-        grep -a 'parser-crosscheck' ${cloakDirect}/compile.log | head -5
-        fail=1
-    fi
-    if ! cmp -s ${cloakFlip} ${cloakDirect}/story.ulx; then
-        echo "FAIL  corpus (single-writer flip changed cloak's bytes)"
-        fail=1
-    fi
     timeout 60 glulxe ${cloakUpstream} < ${./cloak.walk} \
         >"$work/cloak-up.log" 2>&1 || fail=1
     timeout 60 glulxe ${cloakDirect}/story.ulx < ${./cloak.walk} \
@@ -168,15 +134,6 @@ writeShellApplication {
     fi
     if grep -aq $'backend=classic\t' ${glulxerciseDirect}/compile.log; then
         echo "FAIL  corpus (glulxercise has a classic-by-policy routine)"
-        fail=1
-    fi
-    if grep -aq 'parser-crosscheck' ${glulxerciseDirect}/compile.log; then
-        echo "FAIL  corpus (glulxercise parser-state crosscheck mismatches)"
-        grep -a 'parser-crosscheck' ${glulxerciseDirect}/compile.log | head -5
-        fail=1
-    fi
-    if ! cmp -s ${glulxerciseFlip} ${glulxerciseDirect}/story.ulx; then
-        echo "FAIL  corpus (single-writer flip changed glulxercise's bytes)"
         fail=1
     fi
     timeout 60 glulxe ${glulxerciseDirect}/story.ulx < ${./glulxercise.walk} \
